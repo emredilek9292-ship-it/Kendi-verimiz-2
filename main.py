@@ -41,7 +41,6 @@ import sqlite3
 import secrets
 import hashlib
 import hmac
-import gzip
 import urllib.request
 import urllib.error
 
@@ -118,35 +117,6 @@ TURKEY_TZ = ZoneInfo("Europe/Istanbul")
 
 VIP_REPORT_HOUR = 9
 VIP_REPORT_MINUTE = 0
-
-# ============================================================
-# RENDER BANDWIDTH KORUMASI
-# ============================================================
-try:
-    MINIAPP_POLL_SECONDS = max(
-        5,
-        int(os.environ.get("MINIAPP_POLL_SECONDS", "10"))
-    )
-except Exception:
-    MINIAPP_POLL_SECONDS = 10
-
-try:
-    RADAR_API_LIMIT = max(
-        10,
-        int(os.environ.get("RADAR_API_LIMIT", "50"))
-    )
-except Exception:
-    RADAR_API_LIMIT = 50
-
-try:
-    HTTP_GZIP_MIN_BYTES = max(
-        256,
-        int(os.environ.get("HTTP_GZIP_MIN_BYTES", "512"))
-    )
-except Exception:
-    HTTP_GZIP_MIN_BYTES = 512
-
-RADAR_VERSION = 0
 
 
 # ============================================================
@@ -2208,20 +2178,6 @@ def add_to_radar(data):
             return False
 
     target[room] = data
-
-    global RADAR_VERSION
-    RADAR_VERSION += 1
-
-    # Uzun çalışmada RAM'in sınırsız büyümesini engelle.
-    if len(target) > 500:
-        oldest_room = min(
-            target,
-            key=lambda k: safe_int(
-                target[k].get("detected_at")
-            )
-        )
-        if oldest_room != room:
-            target.pop(oldest_room, None)
 
     try:
 
@@ -4504,16 +4460,7 @@ function renderRadar(){
 }
 
 
-let radarEtag = "";
-let radarLoading = false;
-
 async function loadRadar(){
-
- if(radarLoading){
-  return;
- }
-
- radarLoading = true;
 
  try{
 
@@ -4538,12 +4485,7 @@ async function loadRadar(){
 
   }
 
-  if(radarEtag){
-  headers["If-None-Match"] =
-   radarEtag;
- }
-
- const response =
+  const response =
    await fetch(
     url,
     {
@@ -4552,12 +4494,7 @@ async function loadRadar(){
     }
    );
 
-  if(response.status === 304){
-  radarLoading = false;
-  return;
- }
-
- if(!response.ok){
+  if(!response.ok){
 
    if(
     response.status === 401
@@ -4606,7 +4543,6 @@ async function loadRadar(){
   renderRadar();
 
   firstLoad = false;
-  radarLoading = false;
 
  }
  catch(error){
@@ -4627,7 +4563,6 @@ async function loadRadar(){
   status.textContent =
    "🔴 " + error.message;
 
-  radarLoading = false;
  }
 
 }
@@ -4683,7 +4618,7 @@ document
 
 setInterval(
  loadRadar,
- __MINIAPP_POLL_SECONDS__ * 1000
+ 2000
 );
 
 loadRadar();
@@ -4694,11 +4629,6 @@ loadRadar();
 </html>
 """
 
-MINI_APP_HTML = MINI_APP_HTML.replace(
-    "__MINIAPP_POLL_SECONDS__",
-    str(MINIAPP_POLL_SECONDS)
-)
-
 
 # ============================================================
 # WEB
@@ -4706,81 +4636,20 @@ MINI_APP_HTML = MINI_APP_HTML.replace(
 
 async def radar_page(request):
 
-    response = web.Response(
+    return web.Response(
         text=MINI_APP_HTML,
         content_type="text/html",
         charset="utf-8"
     )
-    response.headers["Cache-Control"] = (
-        "public, max-age=300, must-revalidate"
-    )
-    return response
 
 
 async def miniapp_page(request):
 
-    response = web.Response(
+    return web.Response(
         text=MINI_APP_HTML,
         content_type="text/html",
         charset="utf-8"
     )
-    response.headers["Cache-Control"] = (
-        "public, max-age=300, must-revalidate"
-    )
-    return response
-
-
-# ============================================================
-# HTTP GZIP / BANDWIDTH TASARRUFU
-# ============================================================
-
-@web.middleware
-async def gzip_middleware(
-    request,
-    handler
-):
-    response = await handler(request)
-
-    if response.status in (204, 304):
-        return response
-
-    if "gzip" not in request.headers.get(
-        "Accept-Encoding",
-        ""
-    ).lower():
-        return response
-
-    if response.headers.get("Content-Encoding"):
-        return response
-
-    body = getattr(response, "body", None)
-
-    if not body or len(body) < HTTP_GZIP_MIN_BYTES:
-        return response
-
-    try:
-        compressed = gzip.compress(
-            body,
-            compresslevel=6
-        )
-
-        if len(compressed) >= len(body):
-            return response
-
-        response.body = compressed
-        response.headers["Content-Encoding"] = "gzip"
-        response.headers["Content-Length"] = str(
-            len(compressed)
-        )
-        response.headers["Vary"] = "Accept-Encoding"
-
-    except Exception as e:
-        print(
-            "[GZIP HATASI]",
-            repr(e)
-        )
-
-    return response
 
 
 # ============================================================
@@ -4832,22 +4701,11 @@ async def cors_middleware(
 # API
 # ============================================================
 
-def _recent_radar_items(items, limit=None):
-    if limit is None:
-        limit = RADAR_API_LIMIT
-
-    result = list(items)
-    result.sort(
-        key=lambda item: safe_int(
-            item.get("detected_at")
-        ),
-        reverse=True
-    )
-
-    return result[:limit]
-
-
 def normalize_radar_item_links(items):
+    """
+    Radar verisindeki live alanını bozmadan korur.
+    Eski kayıtta live yoksa kullanıcı adından son çare link üretir.
+    """
     result = []
 
     for item in items:
@@ -4869,107 +4727,64 @@ def normalize_radar_item_links(items):
     return result
 
 
-def _etag_for(*parts):
-    raw = "|".join(
-        str(x)
-        for x in parts
-    ).encode("utf-8", "ignore")
-
-    return '"' + hashlib.sha256(raw).hexdigest()[:24] + '"'
-
-
-def _not_modified(request, etag):
-    return (
-        request.headers.get("If-None-Match", "").strip()
-        == etag
-    )
-
-
-def _json_response(request, payload, etag=None):
-    if etag and _not_modified(request, etag):
-        response = web.Response(status=304)
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = "no-cache"
-        return response
-
-    response = web.json_response(payload)
-
-    if etag:
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = "no-cache"
-
-    return response
-
-
 async def api_boxes(request):
-    items = normalize_radar_item_links(
-        _recent_radar_items(
+
+    return web.json_response(
+        normalize_radar_item_links(
             LIVE_CHESTS.values()
         )
-    )
-
-    return _json_response(
-        request,
-        items,
-        _etag_for("boxes", RADAR_VERSION)
     )
 
 
 async def api_goody_bags(request):
-    items = normalize_radar_item_links(
-        _recent_radar_items(
+
+    return web.json_response(
+        normalize_radar_item_links(
             LIVE_GOODY_BAGS.values()
         )
-    )
-
-    return _json_response(
-        request,
-        items,
-        _etag_for("goody", RADAR_VERSION)
     )
 
 
 async def api_status(request):
-    return _json_response(
-        request,
-        {
-            "status": "online",
-            "chests": len(LIVE_CHESTS),
-            "goody_bags": len(LIVE_GOODY_BAGS),
-            "server_time": int(time.time()),
-        },
-        _etag_for(
-            "status",
-            RADAR_VERSION,
+
+    return web.json_response({
+
+        "status":
+            "online",
+
+        "chests":
             len(LIVE_CHESTS),
-            len(LIVE_GOODY_BAGS)
-        )
-    )
+
+        "goody_bags":
+            len(LIVE_GOODY_BAGS),
+
+        "server_time":
+            int(time.time()),
+
+    })
 
 
 async def api_all(request):
-    chests = normalize_radar_item_links(
-        _recent_radar_items(
-            LIVE_CHESTS.values()
-        )
-    )
 
-    goody_bags = normalize_radar_item_links(
-        _recent_radar_items(
-            LIVE_GOODY_BAGS.values()
-        )
-    )
+    return web.json_response({
 
-    return _json_response(
-        request,
-        {
-            "status": "online",
-            "server_time": int(time.time()),
-            "chests": chests,
-            "goody_bags": goody_bags,
-        },
-        _etag_for("all", RADAR_VERSION)
-    )
+        "status":
+            "online",
+
+        "server_time":
+            int(time.time()),
+
+        "chests":
+            normalize_radar_item_links(
+                LIVE_CHESTS.values()
+            ),
+
+        "goody_bags":
+            normalize_radar_item_links(
+                LIVE_GOODY_BAGS.values()
+            ),
+
+    })
 
 
 # ============================================================
@@ -5047,19 +4862,6 @@ async def api_miniapp_data(request):
 
     # Geçerli Telegram doğrulaması geldiğinde oturumu yenile.
     # Böylece TikTok'a gidip geri dönüldüğünde VIP erişimi korunur.
-    etag = _etag_for(
-        "miniapp",
-        user_id,
-        vip["expires_at"],
-        RADAR_VERSION
-    )
-
-    if _not_modified(request, etag):
-        response = web.Response(status=304)
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = "no-cache"
-        return response
-
     response = web.json_response({
 
         "ok":
@@ -5085,25 +4887,18 @@ async def api_miniapp_data(request):
 
         "chests":
             normalize_radar_item_links(
-                _recent_radar_items(
-                    LIVE_CHESTS.values()
-                )
+                LIVE_CHESTS.values()
             ),
 
         "goody_bags":
             normalize_radar_item_links(
-                _recent_radar_items(
-                    LIVE_GOODY_BAGS.values()
-                )
+                LIVE_GOODY_BAGS.values()
             ),
 
         "server_time":
             int(time.time()),
 
     })
-
-    response.headers["ETag"] = etag
-    response.headers["Cache-Control"] = "no-cache"
 
     response.set_cookie(
         MINI_APP_SESSION_COOKIE,
@@ -5126,7 +4921,6 @@ async def start_http_server():
 
     app = web.Application(
         middlewares=[
-            gzip_middleware,
             cors_middleware
         ]
     )
@@ -5201,13 +4995,20 @@ async def start_http_server():
 
 def vip_keyboard():
 
+    # NOT: Daha once burada web_app=WebAppInfo(...) kullaniliyordu.
+    # BASE_URL bicimsel olarak gecersiz/eski oldugunda (https degil,
+    # sonda fazladan karakter, servis tasindiktan sonra guncellenmemis
+    # vb.) Telegram TUM mesaji reddediyor ve bot hicbir seye cevap
+    # vermiyormus gibi görünüyordu (/start sessiz kaliyordu).
+    # Normal url= butonu cok daha toleranslidir: Telegram sadece
+    # gecerli bir URL bicimi bekler, mesaj asla sessizce dusmez ve
+    # buton tarayicida acilir.
+
     return InlineKeyboardMarkup(
         [[
             InlineKeyboardButton(
                 "🌐 VIP RADARI AÇ",
-                web_app=WebAppInfo(
-                    url=f"{BASE_URL}/miniapp"
-                )
+                url=f"{BASE_URL}/miniapp"
             )
         ]]
     )
@@ -5302,10 +5103,20 @@ async def start_cmd(
 
     if vip:
 
-        await update.message.reply_text(
-            vip_permissions_text(vip),
-            reply_markup=vip_keyboard()
-        )
+        try:
+
+            await update.message.reply_text(
+                vip_permissions_text(vip),
+                reply_markup=vip_keyboard()
+            )
+
+        except Exception as e:
+
+            print("[START BUTON HATASI]", repr(e))
+
+            await update.message.reply_text(
+                vip_permissions_text(vip)
+            )
 
         return
 
@@ -5344,7 +5155,7 @@ async def start_cmd(
                 user.id
             )
 
-            await update.message.reply_text(
+            welcome_text = (
 
                 "🎉 HOŞ GELDİN!\n\n"
 
@@ -5355,11 +5166,23 @@ async def start_cmd(
                 +
                 vip_permissions_text(
                     vip
-                ),
-
-                reply_markup=vip_keyboard()
-
+                )
             )
+
+            try:
+
+                await update.message.reply_text(
+                    welcome_text,
+                    reply_markup=vip_keyboard()
+                )
+
+            except Exception as e:
+
+                print("[START BUTON HATASI]", repr(e))
+
+                await update.message.reply_text(
+                    welcome_text
+                )
 
             try:
 
@@ -6598,14 +6421,15 @@ async def main():
         "🏆 ÖDÜL AVCISI BAŞLIYOR"
     )
 
+    print("=" * 70)
+
     print(
-        "[RENDER BANDWIDTH]",
-        f"Mini App polling: {MINIAPP_POLL_SECONDS}s",
-        f"| API limit: {RADAR_API_LIMIT}",
-        f"| GZIP min: {HTTP_GZIP_MIN_BYTES}B"
+        "[KONFIG] BASE_URL =", BASE_URL
     )
 
-    print("=" * 70)
+    print(
+        "[KONFIG] BOT_USERNAME =", BOT_USERNAME
+    )
 
     init_db()
 
