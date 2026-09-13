@@ -82,7 +82,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 BASE_URL = os.environ.get(
     "BASE_URL",
-    "https://kendi-verimiz.onrender.com"
+    "https://kendi-verimiz-2.onrender.com"
 ).rstrip("/")
 
 BOT_USERNAME = os.environ.get(
