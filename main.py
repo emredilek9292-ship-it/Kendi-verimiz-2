@@ -146,6 +146,13 @@ DUPLICATE_COOLDOWN = 60
 LIVE_GOODY_BAGS = {}
 LIVE_CHESTS = {}
 
+# Bu iki sozluk hicbir zaman temizlenmiyordu; saatler ilerledikce
+# icinde binlerce kayit birikip her 2 saniyede bir TAMAMI her acik
+# Mini App'e tekrar tekrar gonderiliyordu. Render'daki "5GB bandwidth"
+# limitinin asil sebebi buydu. Artik en fazla MAX_LIVE_ITEMS kadar
+# en yeni kayit tutuluyor, gerisi otomatik atiliyor.
+MAX_LIVE_ITEMS = 150
+
 processed_messages = set()
 processed_event_keys = set()
 last_event_notification = {}
@@ -2289,6 +2296,22 @@ def add_to_radar(data):
             return False
 
     target[room] = data
+
+    if len(target) > MAX_LIVE_ITEMS:
+
+        # En eski kayitlardan baslayarak fazlalari at, RAM ve
+        # Mini App yanitini sinirli tut.
+        oldest_first = sorted(
+            target.items(),
+            key=lambda kv: safe_int(
+                kv[1].get("detected_at")
+            )
+        )
+
+        fazla = len(target) - MAX_LIVE_ITEMS
+
+        for old_room, _ in oldest_first[:fazla]:
+            target.pop(old_room, None)
 
     try:
 
@@ -4729,7 +4752,7 @@ document
 
 setInterval(
  loadRadar,
- 2000
+ 5000
 );
 
 loadRadar();
@@ -4804,6 +4827,28 @@ async def cors_middleware(
     response.headers[
         "Access-Control-Allow-Headers"
     ] = "*"
+
+    # Bandwidth tasarrufu: Render'da kotayi hizla tuketen sey
+    # buradan giden JSON/HTML gövdeleriydi. İstemci gzip
+    # destekliyorsa (tarayicilarin hemen hepsi destekler)
+    # gövdeyi sikistirip cok daha az byte gonder.
+    try:
+
+        accept_encoding = request.headers.get(
+            "Accept-Encoding", ""
+        )
+
+        if (
+            "gzip" in accept_encoding
+            and response.body
+            and len(response.body) > 512
+        ):
+
+            response.enable_compression()
+
+    except Exception as e:
+
+        print("[GZIP HATASI]", repr(e))
 
     return response
 
