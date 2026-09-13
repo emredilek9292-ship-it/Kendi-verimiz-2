@@ -176,6 +176,15 @@ UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/"
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 VIP_REMOTE_KEY = os.environ.get("VIP_REMOTE_KEY", "odul_avcisi:vip_users:v1")
 
+# RADAR (Goody Bag / Hazine Sandığı) KALICI DEPOLAMA
+# Mini App verileri LIVE_GOODY_BAGS / LIVE_CHESTS RAM'inden okunuyor.
+# RAM her restart/deploy'da sıfırlanır -> Mini App "0" gösterirdi.
+# Aynı Upstash bağlantısı üzerinden bu RAM state'i de periyodik
+# olarak yedeklenir ve açılışta geri yüklenir.
+RADAR_REMOTE_KEY = os.environ.get("RADAR_REMOTE_KEY", "odul_avcisi:radar_live:v1")
+RADAR_REMOTE_SYNC_SECONDS = 30
+RADAR_REMOTE_MAX_ITEMS = 300
+
 
 def db():
     return sqlite3.connect(
@@ -313,6 +322,104 @@ def _sync_vips_to_remote():
         print(f"[VIP KALICI DEPOLAMA] {len(vips)} VIP kayıt remote'a kaydedildi.")
 
 
+def _load_remote_radar():
+    if not _upstash_enabled():
+        return None
+
+    result = _upstash_command(["GET", RADAR_REMOTE_KEY])
+    if result in (None, ""):
+        return None
+
+    try:
+        data = json.loads(result)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception as e:
+        print("[RADAR REMOTE OKUMA HATASI]", repr(e))
+        return None
+
+
+def _save_remote_radar():
+    if not _upstash_enabled():
+        return False
+
+    try:
+        # En son N kaydı sakla, payload'u küçük tut.
+        goody_items = sorted(
+            LIVE_GOODY_BAGS.values(),
+            key=lambda d: safe_int(d.get("detected_at")),
+            reverse=True
+        )[:RADAR_REMOTE_MAX_ITEMS]
+
+        chest_items = sorted(
+            LIVE_CHESTS.values(),
+            key=lambda d: safe_int(d.get("detected_at")),
+            reverse=True
+        )[:RADAR_REMOTE_MAX_ITEMS]
+
+        payload = json.dumps(
+            {
+                "goody_bags": {
+                    item["room"]: item
+                    for item in goody_items
+                    if item.get("room")
+                },
+                "chests": {
+                    item["room"]: item
+                    for item in chest_items
+                    if item.get("room")
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
+        result = _upstash_command(["SET", RADAR_REMOTE_KEY, payload])
+        return result == "OK"
+
+    except Exception as e:
+        print("[RADAR REMOTE KAYIT HATASI]", repr(e))
+        return False
+
+
+def _restore_radar_from_remote():
+    if not _upstash_enabled():
+        return
+
+    remote = _load_remote_radar()
+    if not remote:
+        return
+
+    goody = remote.get("goody_bags") or {}
+    chests = remote.get("chests") or {}
+
+    if isinstance(goody, dict):
+        LIVE_GOODY_BAGS.update(goody)
+
+    if isinstance(chests, dict):
+        LIVE_CHESTS.update(chests)
+
+    print(
+        f"[RADAR KALICI DEPOLAMA] "
+        f"{len(goody)} goody bag, {len(chests)} hazine sandığı geri yüklendi."
+    )
+
+
+async def radar_remote_sync_loop():
+    # Mini App verisinin restart/deploy sonrası "0" görünmemesi için
+    # RAM state'ini periyodik olarak Upstash'e yedekler.
+    if not _upstash_enabled():
+        return
+
+    while True:
+        await asyncio.sleep(RADAR_REMOTE_SYNC_SECONDS)
+        try:
+            _save_remote_radar()
+        except Exception as e:
+            print("[RADAR REMOTE SYNC HATASI]", repr(e))
+
+
 def init_db():
 
     conn = db()
@@ -400,6 +507,10 @@ def init_db():
 
     # Render restart/deploy sonrası VIP kayıtlarını kalıcı depodan geri getir.
     _restore_vips_from_remote()
+
+    # Render restart/deploy sonrası Mini App radar verisini
+    # (Goody Bag / Hazine Sandığı) kalıcı depodan geri getir.
+    _restore_radar_from_remote()
 
 
 # ============================================================
@@ -4993,25 +5104,72 @@ async def start_http_server():
 # VIP KEYBOARD
 # ============================================================
 
-def vip_keyboard():
+def vip_keyboard(native=True):
 
-    # NOT: Daha once burada web_app=WebAppInfo(...) kullaniliyordu.
-    # BASE_URL bicimsel olarak gecersiz/eski oldugunda (https degil,
-    # sonda fazladan karakter, servis tasindiktan sonra guncellenmemis
-    # vb.) Telegram TUM mesaji reddediyor ve bot hicbir seye cevap
-    # vermiyormus gibi görünüyordu (/start sessiz kaliyordu).
-    # Normal url= butonu cok daha toleranslidir: Telegram sadece
-    # gecerli bir URL bicimi bekler, mesaj asla sessizce dusmez ve
-    # buton tarayicida acilir.
+    # native=True: Telegram Web App butonu -> linke basınca
+    # Telegram İÇİNDE (tarayıcıya çıkmadan) açılır. Bunun tek şartı
+    # BASE_URL'in gecerli bir https adresi olmasi.
+    # native=False: normal link butonu -> tarayicida acilir.
+    # BASE_URL bir sekilde gecersizse Telegram mesaji reddeder,
+    # bu yuzden gonderen kod (start_cmd) once native'i dener,
+    # basarisiz olursa native=False ile tekrar dener.
 
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(
-                "🌐 VIP RADARI AÇ",
+    if native:
+
+        button = InlineKeyboardButton(
+            "🌐 VIP RADARI AÇ",
+            web_app=WebAppInfo(
                 url=f"{BASE_URL}/miniapp"
             )
-        ]]
+        )
+
+    else:
+
+        button = InlineKeyboardButton(
+            "🌐 VIP RADARI AÇ",
+            url=f"{BASE_URL}/miniapp"
+        )
+
+    return InlineKeyboardMarkup(
+        [[button]]
     )
+
+
+async def send_vip_panel(update, text):
+
+    # 1) Once native (Telegram ici) Mini App butonuyla dener.
+    # 2) Basarisiz olursa (BASE_URL formatiyla ilgili bir sorun
+    #    varsa) normal link butonuyla dener.
+    # 3) O da olmazsa butonsuz duz metin gonderir.
+    # Boylece mesaj hicbir zaman sessizce kaybolmaz.
+
+    try:
+
+        await update.message.reply_text(
+            text,
+            reply_markup=vip_keyboard(native=True)
+        )
+
+        return
+
+    except Exception as e:
+
+        print("[START NATIVE BUTON HATASI]", repr(e))
+
+    try:
+
+        await update.message.reply_text(
+            text,
+            reply_markup=vip_keyboard(native=False)
+        )
+
+        return
+
+    except Exception as e:
+
+        print("[START LINK BUTON HATASI]", repr(e))
+
+    await update.message.reply_text(text)
 
 
 # ============================================================
@@ -5103,20 +5261,10 @@ async def start_cmd(
 
     if vip:
 
-        try:
-
-            await update.message.reply_text(
-                vip_permissions_text(vip),
-                reply_markup=vip_keyboard()
-            )
-
-        except Exception as e:
-
-            print("[START BUTON HATASI]", repr(e))
-
-            await update.message.reply_text(
-                vip_permissions_text(vip)
-            )
+        await send_vip_panel(
+            update,
+            vip_permissions_text(vip)
+        )
 
         return
 
@@ -5169,20 +5317,10 @@ async def start_cmd(
                 )
             )
 
-            try:
-
-                await update.message.reply_text(
-                    welcome_text,
-                    reply_markup=vip_keyboard()
-                )
-
-            except Exception as e:
-
-                print("[START BUTON HATASI]", repr(e))
-
-                await update.message.reply_text(
-                    welcome_text
-                )
+            await send_vip_panel(
+                update,
+                welcome_text
+            )
 
             try:
 
@@ -6435,8 +6573,11 @@ async def main():
 
     if _upstash_enabled():
         print("[VIP KALICI DEPOLAMA] Upstash aktif.")
+        print("[RADAR KALICI DEPOLAMA] Upstash aktif, her "
+              f"{RADAR_REMOTE_SYNC_SECONDS} saniyede bir senkronize edilecek.")
     else:
         print("[VIP KALICI DEPOLAMA] Upstash ayarlı değil; SQLite yerel depolama kullanılıyor.")
+        print("[RADAR KALICI DEPOLAMA] Upstash ayarlı değil; Mini App verisi restart sonrası sıfırlanacak.")
 
     http_session = (
         aiohttp.ClientSession()
@@ -6611,6 +6752,14 @@ async def main():
 
     asyncio.create_task(
         daily_vip_report_loop()
+    )
+
+    # ========================================================
+    # RADAR (MINI APP) KALICI DEPOLAMA SENKRONU
+    # ========================================================
+
+    asyncio.create_task(
+        radar_remote_sync_loop()
     )
 
     print(
