@@ -4634,13 +4634,9 @@ async function loadRadar(){
     response.status === 401
    ){
 
-    // VIP dogrulanamadi: hicbir sey gostermeden
-    // bos sayfaya yonlendir.
-    window.location.replace(
-     "/vip-yok"
+    throw new Error(
+     "VIP erişimi gerekli"
     );
-
-    return;
 
    }
 
@@ -4785,79 +4781,6 @@ async def miniapp_page(request):
 
     return web.Response(
         text=MINI_APP_HTML,
-        content_type="text/html",
-        charset="utf-8"
-    )
-
-
-# VIP olmayan / dogrulanamayan kullanicilarin yonlendirildigi
-# "VIP erisimi gerekli" sayfasi. Botla iletisime gecmeleri icin
-# bir buton icerir. VIP verildikten sonra Mini App'i tekrar
-# actiklarinda normal ekran acilir (VIP kontrolu zaten otomatik).
-VIP_BLANK_HTML = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VIP Erişimi Gerekli</title>
-<style>
-  body {{
-    margin: 0;
-    height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #0b0e14;
-    color: #e8e8e8;
-    font-family: -apple-system, system-ui, sans-serif;
-    text-align: center;
-    padding: 24px;
-    box-sizing: border-box;
-  }}
-  .box {{
-    max-width: 360px;
-  }}
-  .icon {{
-    font-size: 48px;
-    margin-bottom: 16px;
-  }}
-  h1 {{
-    font-size: 20px;
-    margin: 0 0 12px;
-  }}
-  p {{
-    font-size: 15px;
-    color: #9aa0ab;
-    line-height: 1.5;
-    margin: 0 0 24px;
-  }}
-  a.btn {{
-    display: inline-block;
-    background: #2ea6ff;
-    color: #fff;
-    text-decoration: none;
-    padding: 12px 28px;
-    border-radius: 10px;
-    font-weight: 600;
-    font-size: 15px;
-  }}
-</style>
-</head>
-<body>
-  <div class="box">
-    <div class="icon">🔒</div>
-    <h1>VIP Erişimi Gerekli</h1>
-    <p>Bu paneli kullanabilmek için VIP erişimin olması gerekiyor. Erişim almak için bota dön.</p>
-    <a class="btn" href="https://t.me/{BOT_USERNAME}">Bota Git</a>
-  </div>
-</body>
-</html>"""
-
-
-async def vip_blank_page(request):
-
-    return web.Response(
-        text=VIP_BLANK_HTML,
         content_type="text/html",
         charset="utf-8"
     )
@@ -5171,11 +5094,6 @@ async def start_http_server():
     app.router.add_get(
         "/miniapp",
         miniapp_page
-    )
-
-    app.router.add_get(
-        "/vip-yok",
-        vip_blank_page
     )
 
     app.router.add_get(
