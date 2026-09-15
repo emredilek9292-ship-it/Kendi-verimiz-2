@@ -1,3 +1,4 @@
+
 # ============================================================
 # main.py
 # ÖDÜL AVCISI
@@ -3362,8 +3363,8 @@ body{
  line-height:1;
  text-shadow:
  0 0 7px #fff,
- 0 0 18px #9d51ff,
- 0 0 35px #6425ff;
+ 0 0 18px #2dd4c8,
+ 0 0 35px #128f82;
 }
 
 .subtitle{
@@ -3393,8 +3394,8 @@ body{
  margin-bottom:10px;
  padding:11px;
  border-radius:18px;
- background:linear-gradient(145deg,#151927,#0b0e18);
- border:1px solid #353d51;
+ background:#10151c;
+ border:1px solid #1d2b2c;
 }
 
 .latest-title{
@@ -3414,11 +3415,11 @@ body{
 }
 
 .latest-card.goody{
- border-color:#6f35a8;
+ border-color:#2dd4c8;
 }
 
 .latest-card.chest{
- border-color:#806d29;
+ border-color:#2dd4c8;
 }
 
 .latest-card.alarm{
@@ -3477,12 +3478,17 @@ body{
  padding:13px 15px;
  margin-bottom:9px;
  border-radius:14px;
- border:1px solid #293044;
+ border:1px solid #1d3330;
  outline:none;
- background:#101420;
+ background:#0d1613;
  color:#fff;
  font-size:15px;
  font-weight:700;
+ transition:border-color .15s ease;
+}
+
+.search:focus{
+ border-color:#2dd4c8;
 }
 
 .search::placeholder{
@@ -3513,9 +3519,9 @@ body{
 }
 
 .filter.active{
- color:#fff;
- background:#20283b;
- border-color:#68748e;
+ color:#0a2e29;
+ background:#2dd4c8;
+ border-color:#2dd4c8;
 }
 
 .radar-grid{
@@ -3534,11 +3540,11 @@ body{
 }
 
 .panel.goody{
- border-color:rgba(157,81,255,.55);
+ border-color:rgba(45,212,200,.5);
 }
 
 .panel.chest{
- border-color:rgba(241,200,75,.45);
+ border-color:rgba(45,212,200,.5);
 }
 
 .panel-title{
@@ -3554,11 +3560,11 @@ body{
 }
 
 .goody .panel-name{
- color:#d8adff;
+ color:#7de8df;
 }
 
 .chest .panel-name{
- color:#ffe47b;
+ color:#7de8df;
 }
 
 .panel-count{
@@ -3577,8 +3583,8 @@ body{
  margin-bottom:7px;
  padding:9px;
  border-radius:13px;
- background:linear-gradient(145deg,#171c29,#0e121d);
- border:1px solid #293246;
+ background:#12161f;
+ border:1px solid #212a35;
 }
 
 .card:last-child{
@@ -3586,11 +3592,11 @@ body{
 }
 
 .goody .card{
- border-left:4px solid #9d51ff;
+ border-left:4px solid #2dd4c8;
 }
 
 .chest .card{
- border-left:4px solid #f1c84b;
+ border-left:4px solid #2dd4c8;
 }
 
 .card.alarm{
@@ -3607,13 +3613,13 @@ body{
  0%{
   opacity:1;
   transform:translateY(0);
-  box-shadow:0 0 0 rgba(160,80,255,0);
+  box-shadow:0 0 0 rgba(45,212,200,0);
  }
 
  50%{
   opacity:1;
   transform:translateY(0);
-  box-shadow:0 0 24px rgba(160,80,255,.38);
+  box-shadow:0 0 24px rgba(45,212,200,.38);
  }
 
  100%{
@@ -3673,6 +3679,32 @@ body{
  color:#fff;
  font-size:10px;
  font-weight:1000;
+}
+
+.countdown{
+ display:flex;
+ align-items:center;
+ gap:4px;
+ margin-top:5px;
+ font-size:10px;
+ font-weight:900;
+ color:#ffb454;
+}
+
+.countdown.expired{
+ color:#5b6472;
+}
+
+.countdown-dot{
+ width:5px;
+ height:5px;
+ border-radius:50%;
+ background:#ffb454;
+ flex-shrink:0;
+}
+
+.countdown.expired .countdown-dot{
+ background:#5b6472;
 }
 
 .alarm-badge{
@@ -3840,7 +3872,7 @@ body{
 <div class="latest-box">
 
  <div class="latest-title">
-  🔥 SON YAKALANAN
+  🏆 EN İYİ FIRSAT
  </div>
 
  <div id="latest"></div>
@@ -4142,10 +4174,15 @@ function filterItems(
  type
 ){
 
- let result =
-  latestFive(items);
+ const sorted =
+  Array.isArray(items)
+   ? [...items].sort(
+      (a,b)=>
+       timestamp(b)-timestamp(a)
+     )
+   : [];
 
- return result.filter(item=>{
+ const matched = sorted.filter(item=>{
 
   const username =
    String(
@@ -4191,6 +4228,13 @@ function filterItems(
   return true;
 
  });
+
+ // Arama yokken akışı son 5 kayıtla sınırlı tut;
+ // arama varken tüm eşleşmeleri göster (aksi halde
+ // en son 5 kayıt dışındaki kullanıcılar hiç bulunamaz).
+ return searchText
+  ? matched
+  : matched.slice(0,5);
 
 }
 
@@ -4252,7 +4296,7 @@ function renderLatest(){
 
  all.sort(
   (a,b)=>
-   timestamp(b)-timestamp(a)
+   numberValue(b.rate)-numberValue(a.rate)
  );
 
  if(!all.length){
@@ -4322,6 +4366,14 @@ function renderLatest(){
      <span>•</span>
      <span>👀 ${escapeHtml(item.view)}</span>
 
+    </div>
+
+    <div
+     class="countdown"
+     data-detected-at="${timestamp(item)}"
+    >
+     <span class="countdown-dot"></span>
+     <span class="countdown-text">—</span>
     </div>
 
    </div>
@@ -4475,6 +4527,14 @@ function renderItems(
 
       </div>
 
+     </div>
+
+     <div
+      class="countdown"
+      data-detected-at="${timestamp(item)}"
+     >
+      <span class="countdown-dot"></span>
+      <span class="countdown-text">—</span>
      </div>
 
      <div class="info-grid">
@@ -4758,6 +4818,78 @@ document
 setInterval(
  loadRadar,
  5000
+);
+
+const COUNTDOWN_DURATION_SECONDS = 90;
+
+function formatCountdown(remaining){
+
+ if(remaining <= 0)
+  return "SÜRESİ DOLDU";
+
+ if(remaining < 60)
+  return remaining + "s kaldı";
+
+ const m = Math.floor(remaining / 60);
+ const s = remaining % 60;
+
+ return m + "dk " + s + "s kaldı";
+
+}
+
+function updateCountdowns(){
+
+ const nowSeconds =
+  Math.floor(Date.now() / 1000);
+
+ document
+  .querySelectorAll("[data-detected-at]")
+  .forEach(function(el){
+
+   const detectedAt =
+    Number(
+     el.getAttribute("data-detected-at")
+    );
+
+   if(!detectedAt){
+
+    el.classList.add("expired");
+
+    const textEl =
+     el.querySelector(".countdown-text");
+
+    if(textEl)
+     textEl.textContent = "—";
+
+    return;
+
+   }
+
+   const elapsed =
+    nowSeconds - detectedAt;
+
+   const remaining =
+    COUNTDOWN_DURATION_SECONDS - elapsed;
+
+   const textEl =
+    el.querySelector(".countdown-text");
+
+   if(textEl)
+    textEl.textContent =
+     formatCountdown(remaining);
+
+   if(remaining <= 0)
+    el.classList.add("expired");
+   else
+    el.classList.remove("expired");
+
+  });
+
+}
+
+setInterval(
+ updateCountdowns,
+ 1000
 );
 
 loadRadar();
