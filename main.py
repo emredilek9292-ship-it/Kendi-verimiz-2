@@ -1,4 +1,3 @@
-
 # ============================================================
 # main.py
 # ÖDÜL AVCISI
@@ -138,6 +137,18 @@ SOURCE_CHATS = [
 
 COIN_ALARM_LIMIT = 100
 PEOPLE_ALARM_LIMIT = 5
+
+# Ana Telegram kanalina (grup) dusuk degerli yakalamalarin
+# gonderilmesini kesmek icin minimum coin esigi. Bant genisligi
+# tuketimini azaltmak icin eklendi - Mini App ve kisisel
+# alarm/takip bildirimlerini ETKILEMEZ, sadece ana kanal
+# yayinini filtreler.
+MIN_BROADCAST_COINS = int(
+    os.environ.get(
+        "MIN_BROADCAST_COINS",
+        "50"
+    )
+)
 DUPLICATE_COOLDOWN = 60
 
 
@@ -2800,10 +2811,34 @@ async def notify_event(data):
             last_event_notification.clear()
 
     # ANA RADAR BİLDİRİMİ ÖNCE GÖNDERİLİR.
-    # Kişisel alarm ve takip bildirimleri ana kuyruğu bloklamaz.
-    await send_telegram_message(
-        data
+    # Bant genişliğini korumak için düşük değerli yakalamalar
+    # ana kanala gönderilmez (Mini App'te ve kişisel/takip
+    # bildirimlerinde hâlâ görünürler, bu filtre yalnızca
+    # ana grup yayınını etkiler).
+    coins_value = safe_int(
+        data.get("coins")
     )
+
+    should_broadcast = (
+        coins_value >= MIN_BROADCAST_COINS
+        or
+        is_smart_alarm(data)
+    )
+
+    if should_broadcast:
+
+        # Kişisel alarm ve takip bildirimleri ana kuyruğu bloklamaz.
+        await send_telegram_message(
+            data
+        )
+
+    else:
+
+        print(
+            "[ANA KANAL ATLANDI - DÜŞÜK DEĞER]",
+            data.get("username"),
+            coins_value
+        )
 
     # Bu iki işlem eski kodda burada await edildiği için, çok sayıda VIP
     # veya takipçi olduğunda sonraki radar olayları Telegram kuyruğunda
@@ -4817,7 +4852,7 @@ document
 
 setInterval(
  loadRadar,
- 5000
+ 10000
 );
 
 const COUNTDOWN_DURATION_SECONDS = 90;
