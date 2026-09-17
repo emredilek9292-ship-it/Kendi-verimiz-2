@@ -2020,13 +2020,6 @@ def parse_source_message(event):
     )
 
     if is_chest is None:
-        print(
-            "[DEBUG TANINMADI]",
-            "chat_id=", event.chat_id,
-            "| text=", repr(text)[:500],
-            "| token=", repr(token)[:300],
-            "| token_data=", repr(token_data)[:500]
-        )
         return None
 
     # Çalışan kaynak kodundaki sırayı kullan:
@@ -3407,6 +3400,8 @@ html,body{
 
 body{
  padding:8px;
+ padding-top:calc(8px + env(safe-area-inset-top, 0px));
+ padding-bottom:calc(8px + env(safe-area-inset-bottom, 0px));
  overflow-x:hidden;
 }
 
@@ -3915,6 +3910,18 @@ const tg =
 if(tg){
  tg.ready();
  tg.expand();
+
+ try {
+  if (typeof tg.requestFullscreen === "function") {
+   tg.requestFullscreen();
+  }
+ } catch (e) {}
+
+ try {
+  if (typeof tg.disableVerticalSwipes === "function") {
+   tg.disableVerticalSwipes();
+  }
+ } catch (e) {}
 }
 
 let radarData = {
@@ -6493,8 +6500,6 @@ async def message_listener(event):
 
     global queue_counter
 
-    print(f"[DEBUG] Mesaj geldi | chat_id={event.chat_id}")
-
     try:
 
         key = (
@@ -6522,25 +6527,7 @@ async def message_listener(event):
         if not data:
             return
 
-        print(
-            "[DEBUG PARSED]",
-            "chat_id=", event.chat_id,
-            "| room=", data.get("room"),
-            "| event_key=", data.get("event_key"),
-            "| coins=", data.get("coins"),
-            "| people=", data.get("people"),
-            "| username=", data.get("username")
-        )
-
-        radar_result = add_to_radar(data)
-
-        print(
-            "[DEBUG ADD_TO_RADAR SONUC]",
-            "chat_id=", event.chat_id,
-            "| result=", radar_result
-        )
-
-        if radar_result:
+        if add_to_radar(data):
 
             priority = (
                 0
