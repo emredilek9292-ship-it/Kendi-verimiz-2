@@ -3390,7 +3390,7 @@ MINI_APP_HTML = r"""
 html,body{
  margin:0;
  padding:0;
- min-height:100%;
+ min-height: var(--tg-vh, 100%);
  background:#080a12;
  color:#fff;
  font-family:Arial,Helvetica,sans-serif;
@@ -3898,12 +3898,22 @@ const tg =
 
 if(tg){
  tg.ready();
- tg.expand();
+
+ function applyViewportHeight(){
+  const h = tg.viewportStableHeight || tg.viewportHeight || window.innerHeight;
+  document.documentElement.style.setProperty("--tg-vh", h + "px");
+  document.body.style.minHeight = h + "px";
+ }
 
  function goFullscreen(){
 
   try {
-   if (typeof tg.requestFullscreen === "function") {
+   if (
+    tg.isVersionAtLeast &&
+    tg.isVersionAtLeast("8.0") &&
+    typeof tg.requestFullscreen === "function" &&
+    !tg.isFullscreen
+   ) {
     tg.requestFullscreen();
    }
   } catch (e) {}
@@ -3931,7 +3941,17 @@ if(tg){
    tg.expand();
   } catch (e) {}
 
+  applyViewportHeight();
+
  }
+
+ // Telegram ekranı her yeniden boyutlandırdığında (TikTok'tan
+ // geri dönüş, klavye açılıp kapanması, video/PIP kapanması vb.)
+ // tam ekranı ve yüksekliği yeniden uygula. Eski kod sadece
+ // açılışta birkaç kez çalışıyordu, bu yüzden geri dönüşlerde
+ // yarım ekranda kalıyordu.
+ tg.onEvent("viewportChanged", goFullscreen);
+ tg.onEvent("fullscreenChanged", applyViewportHeight);
 
  goFullscreen();
 
@@ -3939,6 +3959,7 @@ if(tg){
  // gelebiliyor; kısa bir gecikmeyle tekrar deniyoruz.
  setTimeout(goFullscreen, 300);
  setTimeout(goFullscreen, 1000);
+ setTimeout(goFullscreen, 2500);
 
  try {
   if (typeof tg.disableVerticalSwipes === "function") {
