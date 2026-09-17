@@ -143,7 +143,7 @@ PEOPLE_ALARM_LIMIT = 5
 MIN_BROADCAST_COINS = int(
     os.environ.get(
         "MIN_BROADCAST_COINS",
-        "50"
+        "20"
     )
 )
 DUPLICATE_COOLDOWN = 60
@@ -3860,16 +3860,6 @@ body{
 
 </div>
 
-<div class="latest-box">
-
- <div class="latest-title">
-  🏆 EN İYİ FIRSAT
- </div>
-
- <div id="latest"></div>
-
-</div>
-
 <div class="radar-grid">
 
 <div class="panel chest">
@@ -3910,11 +3900,45 @@ if(tg){
  tg.ready();
  tg.expand();
 
- try {
-  if (typeof tg.requestFullscreen === "function") {
-   tg.requestFullscreen();
-  }
- } catch (e) {}
+ function goFullscreen(){
+
+  try {
+   if (typeof tg.requestFullscreen === "function") {
+    tg.requestFullscreen();
+   }
+  } catch (e) {}
+
+  try {
+   if (typeof tg.postEvent === "function") {
+    tg.postEvent("web_app_request_fullscreen");
+   } else if (
+    typeof tg.WebApp === "object" &&
+    typeof tg.WebApp.postEvent === "function"
+   ) {
+    tg.WebApp.postEvent("web_app_request_fullscreen");
+   } else if (
+    window.Telegram &&
+    typeof window.Telegram.WebView === "object" &&
+    typeof window.Telegram.WebView.postEvent === "function"
+   ) {
+    window.Telegram.WebView.postEvent(
+     "web_app_request_fullscreen"
+    );
+   }
+  } catch (e) {}
+
+  try {
+   tg.expand();
+  } catch (e) {}
+
+ }
+
+ goFullscreen();
+
+ // Bazı istemciler fullscreen isteğini ilk anda görmezden
+ // gelebiliyor; kısa bir gecikmeyle tekrar deniyoruz.
+ setTimeout(goFullscreen, 300);
+ setTimeout(goFullscreen, 1000);
 
  try {
   if (typeof tg.disableVerticalSwipes === "function") {
@@ -4506,8 +4530,6 @@ function renderRadar(){
   seenChest,
   newChest
  );
-
- renderLatest();
 
  renderItems(
   radarData.chests,
