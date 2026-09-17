@@ -125,6 +125,7 @@ VIP_REPORT_MINUTE = 0
 SOURCE_CHATS = [
     -1003965749742,
     -1004427105311,
+    -1004304990185,
 ]
 
 
@@ -3705,7 +3706,7 @@ body{
  }
 
  .radar-grid{
-  grid-template-columns:1fr;
+  grid-template-columns:1fr 1fr;
   gap:6px;
  }
 
