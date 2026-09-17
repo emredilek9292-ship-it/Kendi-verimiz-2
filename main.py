@@ -1499,6 +1499,7 @@ def extract_username_from_text(text):
     patterns = [
         r'^\s*##\s*T\d+\s*[›>:]\s*([^\s\n]+)',
         r'^\s*T\d+\s*[›>:]\s*([^\s\n]+)',
+        r'gönderen\s*:\s*([^\s\n\r]+)',
     ]
 
     for pattern in patterns:
@@ -1657,6 +1658,15 @@ def extract_viewers(text):
         text
     )
 
+    if m:
+        return safe_int(m.group(1))
+
+    m = re.search(
+        r'izleyici\s*:\s*(\d+)',
+        text,
+        re.I
+    )
+
     return (
         safe_int(m.group(1))
         if m
@@ -1677,6 +1687,18 @@ def extract_rate(
 
         m = re.search(
             r'Rate\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+            text,
+            re.I
+        )
+
+        if m:
+
+            return safe_float(
+                m.group(1)
+            )
+
+        m = re.search(
+            r'oran\s*:\s*([0-9]+(?:\.[0-9]+)?)',
             text,
             re.I
         )
@@ -1737,6 +1759,13 @@ def detect_type(
         return True
 
     if "🟡" in text:
+        return True
+
+    if (
+        re.search(r'GÖNDEREN\s*:', upper)
+        and
+        re.search(r'JETON\s*:', upper)
+    ):
         return True
 
     if token_data:
@@ -1836,6 +1865,26 @@ def calculate_target_time(
                 60
                 +
                 safe_int(m.group(2))
+            )
+
+            if duration > 0:
+
+                return now + duration
+
+        m = re.search(
+            r'kalan\s*süre\s*:\s*(\d+):(\d+):(\d+)',
+            text,
+            re.I
+        )
+
+        if m:
+
+            duration = (
+                safe_int(m.group(1)) * 3600
+                +
+                safe_int(m.group(2)) * 60
+                +
+                safe_int(m.group(3))
             )
 
             if duration > 0:
@@ -2008,6 +2057,24 @@ def parse_source_message(event):
         or "bilinmiyor"
     )
 
+    # Bazı kaynaklar mesajda doğrudan gerçek TikTok canlı linkini
+    # veriyor (örn. "Link: https://www.tiktok.com/@ad/live"). Token
+    # yoksa bu link, "gönderen" gibi alanlardan daha güvenilir olduğu
+    # için kullanıcı adı ve canlı link için önceliklidir.
+    direct_link_url = None
+
+    if not token_data:
+
+        m = re.search(
+            r'(https?://(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]+)/live)',
+            text,
+            re.I
+        )
+
+        if m:
+            direct_link_url = m.group(1)
+            username = m.group(2)
+
     # Kullanıcı adını link için temizle.
     username_for_link = (
         str(username)
@@ -2174,7 +2241,8 @@ def parse_source_message(event):
             room,
 
         "live":
-            get_live_link(
+            direct_link_url
+            or get_live_link(
                 username_for_link,
                 room,
                 token_data
