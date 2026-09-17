@@ -6418,6 +6418,8 @@ async def message_listener(event):
 
     global queue_counter
 
+    print(f"[DEBUG] Mesaj geldi | chat_id={event.chat_id}")
+
     try:
 
         key = (
