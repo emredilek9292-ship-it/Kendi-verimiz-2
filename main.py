@@ -502,6 +502,15 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS blocks (
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(user_id, username)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -1294,6 +1303,93 @@ def get_followers(username):
         FROM follows
         WHERE username=?
     """, (username,))
+
+    rows = [
+        row[0]
+        for row in cur.fetchall()
+    ]
+
+    conn.close()
+
+    return rows
+
+
+# ============================================================
+# ENGELLE (BLOCK)
+# ============================================================
+
+def add_block(user_id, username):
+
+    username = normalize_username(
+        username
+    )
+
+    if not username:
+        return False
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR IGNORE INTO blocks
+        (
+            user_id,
+            username,
+            created_at
+        )
+        VALUES (?, ?, ?)
+    """, (
+        user_id,
+        username,
+        int(time.time())
+    ))
+
+    changed = cur.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return changed
+
+
+def remove_block(user_id, username):
+
+    username = normalize_username(
+        username
+    )
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM blocks
+        WHERE
+            user_id=?
+            AND username=?
+    """, (
+        user_id,
+        username
+    ))
+
+    changed = cur.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return changed
+
+
+def get_blocks(user_id):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT username
+        FROM blocks
+        WHERE user_id=?
+        ORDER BY username ASC
+    """, (user_id,))
 
     rows = [
         row[0]
@@ -3603,29 +3699,34 @@ body{
 }
 
 .card.new-card{
- animation:newCard .8s ease-out;
+ animation:newCard .6s cubic-bezier(.22,.9,.3,1);
 }
 
 @keyframes newCard{
 
  0%{
-  opacity:1;
-  transform:translateY(0);
+  opacity:0;
+  transform:translateY(40px) scale(.94);
   box-shadow:0 0 0 rgba(45,212,200,0);
  }
 
- 50%{
+ 55%{
   opacity:1;
-  transform:translateY(0);
-  box-shadow:0 0 24px rgba(45,212,200,.38);
+  transform:translateY(-4px) scale(1.02);
+  box-shadow:0 0 24px rgba(45,212,200,.45);
  }
 
  100%{
   opacity:1;
-  transform:translateY(0);
+  transform:translateY(0) scale(1);
   box-shadow:none;
  }
 
+}
+
+/* Liste güncellenirken kartlar hafif yukarı kayar */
+#chests{
+ transition: none;
 }
 .user-row{
  display:flex;
@@ -3677,6 +3778,24 @@ body{
  color:#fff;
  font-size:10px;
  font-weight:1000;
+}
+
+.block-btn{
+ flex-shrink:0;
+ border:0;
+ padding:5px 7px;
+ border-radius:7px;
+ background:#3a1f24;
+ color:#ff8a8a;
+ font-size:10px;
+ font-weight:1000;
+ cursor:pointer;
+}
+
+.block-btn:active{
+ transform:scale(.95);
+ background:#5a252c;
+ color:#fff;
 }
 
 .countdown{
@@ -3992,6 +4111,8 @@ const seenChest = new Set();
 
 const newChest = new Set();
 
+const blockedUsers = new Set();
+
 
 function escapeHtml(value){
 
@@ -4078,7 +4199,79 @@ function isAlarm(item){
 }
 
 
-async function copyUsername(username, el){
+async function blockUsername(username, btn){
+
+ username = String(username || "")
+  .replace(/^@+/, "")
+  .toLowerCase()
+  .trim();
+
+ if(!username)
+  return;
+
+ if(
+  !confirm(
+   "@" + username + " engellensin mi?\n\nBu yayıncının hazineleri artık radarında görünmez."
+  )
+ )
+  return;
+
+ try{
+
+  const headers = {
+   "Content-Type": "application/json"
+  };
+
+  if(tg && tg.initData){
+   headers["X-Telegram-Init-Data"] = tg.initData;
+  }
+
+  const response = await fetch(
+   "/api/miniapp-block",
+   {
+    method: "POST",
+    headers: headers,
+    body: JSON.stringify({
+     username: username,
+     action: "block"
+    })
+   }
+  );
+
+  const data = await response.json();
+
+  if(!data.ok){
+   alert(data.error || "Engellenemedi");
+   return;
+  }
+
+  blockedUsers.add(username);
+
+  if(Array.isArray(data.blocked)){
+   blockedUsers.clear();
+   data.blocked.forEach(u =>
+    blockedUsers.add(
+     String(u).replace(/^@+/, "").toLowerCase()
+    )
+   );
+  }
+
+  // Kartı anında listeden çıkar ve yeniden çiz
+  renderRadar();
+
+  if(tg && tg.HapticFeedback){
+   try{ tg.HapticFeedback.notificationOccurred("success"); }catch(e){}
+  }
+
+ }catch(e){
+  console.error(e);
+  alert("Engelleme başarısız");
+ }
+
+}
+
+
+function copyUsername(username, el){
 
  const cleanName =
   String(username ?? "")
@@ -4180,14 +4373,21 @@ function filterItems(
 
  const sorted =
   Array.isArray(items)
-   ? [...items].sort(
-      (a,b)=>
-       timestamp(b)-timestamp(a)
-     )
+   ? [...items]
+      .filter(item=>{
+       const u = String(item.username ?? "")
+        .replace(/^@+/, "")
+        .toLowerCase();
+       return u && !blockedUsers.has(u);
+      })
+      .sort(
+       (a,b)=>
+        timestamp(b)-timestamp(a)
+      )
    : [];
 
- // Arama/filtre kaldırıldı; akış her zaman
- // son 5 kayıtla sınırlı tutulur.
+ // Akış her zaman son 5 kayıtla sınırlı tutulur.
+ // Yeni gelince en eski düşer, yeni alttan yukarı kayarak girer.
  return sorted.slice(0,5);
 
 }
@@ -4437,6 +4637,7 @@ function renderItems(
       <div style="
        display:flex;
        gap:4px;
+       align-items:center;
       ">
 
        ${
@@ -4462,6 +4663,15 @@ function renderItems(
         :
         ""
        }
+
+       <button
+        type="button"
+        class="block-btn"
+        title="Bu yayıncıyı engelle"
+        onclick='blockUsername(${JSON.stringify(username)}, this)'
+       >
+        🚫
+       </button>
 
       </div>
 
@@ -4632,6 +4842,15 @@ async function loadRadar(){
     : []
 
   };
+
+  if(Array.isArray(data.blocked)){
+   blockedUsers.clear();
+   data.blocked.forEach(u =>
+    blockedUsers.add(
+     String(u).replace(/^@+/, "").toLowerCase()
+    )
+   );
+  }
 
   const status =
    document.getElementById(
@@ -5068,6 +5287,18 @@ async def api_miniapp_data(request):
 
     # Geçerli Telegram doğrulaması geldiğinde oturumu yenile.
     # Böylece TikTok'a gidip geri dönüldüğünde VIP erişimi korunur.
+    blocked = set(get_blocks(user_id))
+
+    all_chests = normalize_radar_item_links(
+        LIVE_CHESTS.values()
+    )
+
+    # Engellenen yayıncıları listeden çıkar
+    visible_chests = [
+        item for item in all_chests
+        if normalize_username(item.get("username") or "") not in blocked
+    ]
+
     response = web.json_response({
 
         "ok":
@@ -5092,9 +5323,10 @@ async def api_miniapp_data(request):
             vip["expires_at"],
 
         "chests":
-            normalize_radar_item_links(
-                LIVE_CHESTS.values()
-            ),
+            visible_chests,
+
+        "blocked":
+            list(blocked),
 
         "server_time":
             int(time.time()),
@@ -5112,6 +5344,88 @@ async def api_miniapp_data(request):
     )
 
     return response
+
+
+async def _miniapp_auth_user(request):
+
+    init_data = request.headers.get(
+        "X-Telegram-Init-Data",
+        ""
+    )
+
+    user = validate_telegram_init_data(
+        init_data
+    )
+
+    session_user_id = validate_miniapp_session(
+        request.cookies.get(
+            MINI_APP_SESSION_COOKIE,
+            ""
+        )
+    )
+
+    if user:
+        user_id = safe_int(user.get("id"))
+    elif session_user_id:
+        user_id = session_user_id
+    else:
+        return None
+
+    if not user_id:
+        return None
+
+    if not get_vip(user_id):
+        return None
+
+    return user_id
+
+
+async def api_miniapp_block(request):
+
+    user_id = await _miniapp_auth_user(request)
+
+    if not user_id:
+        return web.json_response(
+            {"ok": False, "error": "Yetkisiz"},
+            status=401
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    username = normalize_username(
+        body.get("username") or ""
+    )
+
+    action = str(body.get("action") or "block").lower()
+
+    if not username:
+        return web.json_response(
+            {"ok": False, "error": "Kullanıcı adı gerekli"},
+            status=400
+        )
+
+    if action == "unblock":
+        remove_block(user_id, username)
+        blocked = get_blocks(user_id)
+        return web.json_response({
+            "ok": True,
+            "action": "unblock",
+            "username": username,
+            "blocked": blocked,
+        })
+
+    add_block(user_id, username)
+    blocked = get_blocks(user_id)
+
+    return web.json_response({
+        "ok": True,
+        "action": "block",
+        "username": username,
+        "blocked": blocked,
+    })
 
 
 # ============================================================
@@ -5164,6 +5478,11 @@ async def start_http_server():
     app.router.add_get(
         "/api/miniapp-data",
         api_miniapp_data
+    )
+
+    app.router.add_post(
+        "/api/miniapp-block",
+        api_miniapp_block
     )
 
     runner = web.AppRunner(
