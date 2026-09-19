@@ -3647,7 +3647,7 @@ body{
  padding:3px 5px;
  margin:0;
  border-radius:8px;
- font-size:14px;
+ font-size:15px;
  font-weight:1000;
  text-align:left;
  cursor:pointer;
@@ -3723,20 +3723,21 @@ body{
 
 .info{
  min-width:0;
- padding:7px;
- border-radius:8px;
+ padding:8px 6px;
+ border-radius:10px;
  background:#151a27;
  color:#a3aec2;
- font-size:11px;
+ font-size:12px;
  font-weight:900;
- line-height:1.15;
+ line-height:1.2;
+ text-align:center;
 }
 
 .info b{
  display:block;
- margin-top:3px;
+ margin-top:4px;
  color:#fff;
- font-size:14px;
+ font-size:18px;
  font-weight:1000;
  overflow:hidden;
  text-overflow:ellipsis;
@@ -3746,13 +3747,13 @@ body{
 .live-button{
  display:block;
  margin-top:8px;
- padding:10px 5px;
- border-radius:9px;
+ padding:11px 5px;
+ border-radius:10px;
  text-align:center;
  text-decoration:none;
  color:#fff;
  background:#e31850;
- font-size:11px;
+ font-size:13px;
  font-weight:1000;
 }
 
@@ -3787,7 +3788,7 @@ body{
  }
 
  .panel-name{
-  font-size:12px;
+  font-size:13px;
  }
 
  #chests{
@@ -3796,26 +3797,26 @@ body{
  }
 
  .card{
-  padding:7px;
+  padding:8px;
  }
 
  .copy-user{
-  font-size:12px;
+  font-size:13px;
   max-width:72%;
  }
 
  .info{
-  padding:5px;
-  font-size:9px;
+  padding:7px 4px;
+  font-size:11px;
  }
 
  .info b{
-  font-size:12px;
+  font-size:16px;
  }
 
  .live-button{
-  font-size:10px;
-  padding:8px 2px;
+  font-size:12px;
+  padding:10px 2px;
  }
 
 }
@@ -3823,24 +3824,24 @@ body{
 @media(max-width:390px){
 
  .panel-name{
-  font-size:11px;
+  font-size:12px;
  }
 
  .copy-user{
-  font-size:11px;
+  font-size:12px;
  }
 
  .info{
-  font-size:8px;
+  font-size:10px;
  }
 
  .info b{
-  font-size:11px;
+  font-size:15px;
  }
 
  .live-button{
-  font-size:9px;
-  padding:7px 2px;
+  font-size:11px;
+  padding:9px 2px;
  }
 
  #chests{
@@ -4487,11 +4488,6 @@ function renderItems(
       </div>
 
       <div class="info">
-       🙋 KATILAN
-       <b>${escapeHtml(item.joined)}</b>
-      </div>
-
-      <div class="info">
        📈 ORAN
        <b>${escapeHtml(item.rate)}</b>
       </div>
@@ -4499,13 +4495,6 @@ function renderItems(
       <div class="info">
        👀 İZLENME
        <b>${escapeHtml(item.view)}</b>
-      </div>
-
-      <div class="info">
-       🏠 ODA
-       <b title="${escapeHtml(item.room)}">
-        ${escapeHtml(item.room)}
-       </b>
       </div>
 
      </div>
