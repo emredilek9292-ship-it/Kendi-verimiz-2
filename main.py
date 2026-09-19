@@ -3669,9 +3669,9 @@ body{
 }
 
 #chests{
- display:flex;
- flex-direction:column;
- gap:10px;
+ display:grid;
+ grid-template-columns:1fr 1fr;
+ gap:8px;
  width:100%;
  overflow:hidden;
 }
@@ -3681,8 +3681,8 @@ body{
  overflow:hidden;
  width:100%;
  margin-bottom:0;
- padding:12px;
- border-radius:14px;
+ padding:9px;
+ border-radius:13px;
  background:#12161f;
  border:1px solid #212a35;
 }
@@ -3905,8 +3905,8 @@ body{
  }
 
  #chests{
-  flex-direction:column;
-  gap:8px;
+  grid-template-columns:1fr 1fr;
+  gap:6px;
  }
 
  .card{
@@ -3958,7 +3958,8 @@ body{
  }
 
  #chests{
-  gap:8px;
+  grid-template-columns:1fr 1fr;
+  gap:6px;
  }
 
 }
@@ -4166,7 +4167,7 @@ function latestFive(items){
    (a,b)=>
     timestamp(b)-timestamp(a)
   )
-  .slice(0,5);
+  .slice(0,4);
 
 }
 
@@ -4375,9 +4376,9 @@ function filterItems(
       )
    : [];
 
- // Akış her zaman son 5 kayıtla sınırlı tutulur.
+ // Akış her zaman son 4 kayıtla sınırlı tutulur.
  // Yeni gelince en eski düşer, yeni alttan yukarı kayarak girer.
- return sorted.slice(0,5);
+ return sorted.slice(0,4);
 
 }
 
