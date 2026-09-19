@@ -3669,9 +3669,9 @@ body{
 }
 
 #chests{
- display:grid;
- grid-template-columns:1fr 1fr;
- gap:8px;
+ display:flex;
+ flex-direction:column;
+ gap:10px;
  width:100%;
  overflow:visible;
 }
@@ -3679,9 +3679,10 @@ body{
 .card{
  position:relative;
  overflow:hidden;
- margin-bottom:7px;
- padding:9px;
- border-radius:13px;
+ width:100%;
+ margin-bottom:0;
+ padding:12px;
+ border-radius:14px;
  background:#12161f;
  border:1px solid #212a35;
 }
@@ -3700,7 +3701,7 @@ body{
 }
 
 .card.new-card{
- animation:newCard .7s cubic-bezier(.2,.85,.3,1);
+ animation:newCard .75s cubic-bezier(.2,.85,.3,1);
  will-change:transform,opacity;
  z-index:5;
 }
@@ -3709,7 +3710,7 @@ body{
 
  0%{
   opacity:0;
-  transform:translateY(120%);
+  transform:translateY(100%);
  }
 
  100%{
@@ -3752,7 +3753,7 @@ body{
  padding:3px 5px;
  margin:0;
  border-radius:8px;
- font-size:15px;
+ font-size:16px;
  font-weight:1000;
  text-align:left;
  cursor:pointer;
@@ -3860,7 +3861,7 @@ body{
  display:block;
  margin-top:4px;
  color:#fff;
- font-size:18px;
+ font-size:20px;
  font-weight:1000;
  overflow:hidden;
  text-overflow:ellipsis;
@@ -3869,14 +3870,14 @@ body{
 
 .live-button{
  display:block;
- margin-top:8px;
- padding:11px 5px;
+ margin-top:10px;
+ padding:12px 5px;
  border-radius:10px;
  text-align:center;
  text-decoration:none;
  color:#fff;
  background:#e31850;
- font-size:13px;
+ font-size:14px;
  font-weight:1000;
 }
 
@@ -3915,12 +3916,12 @@ body{
  }
 
  #chests{
-  grid-template-columns:1fr 1fr;
-  gap:6px;
+  flex-direction:column;
+  gap:8px;
  }
 
  .card{
-  padding:8px;
+  padding:11px;
  }
 
  .copy-user{
@@ -3968,7 +3969,7 @@ body{
  }
 
  #chests{
-  gap:5px;
+  gap:8px;
  }
 
 }
