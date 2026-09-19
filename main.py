@@ -3673,6 +3673,7 @@ body{
  grid-template-columns:1fr 1fr;
  gap:8px;
  width:100%;
+ overflow:visible;
 }
 
 .card{
@@ -3699,15 +3700,16 @@ body{
 }
 
 .card.new-card{
- animation:newCard .65s cubic-bezier(.22,.9,.3,1);
+ animation:newCard .7s cubic-bezier(.2,.85,.3,1);
  will-change:transform,opacity;
+ z-index:5;
 }
 
 @keyframes newCard{
 
  0%{
   opacity:0;
-  transform:translateY(36px);
+  transform:translateY(120%);
  }
 
  100%{
@@ -3715,6 +3717,15 @@ body{
   transform:translateY(0);
  }
 
+}
+
+.card.leaving{
+ animation:cardLeave .35s ease-in forwards;
+}
+
+@keyframes cardLeave{
+ 0%{ opacity:1; transform:translateY(0) scale(1); }
+ 100%{ opacity:0; transform:translateY(-12px) scale(.96); }
 }
 
 /* Liste güncellenirken kartlar hafif yukarı kayar */
@@ -4546,86 +4557,20 @@ function renderLatest(){
 }
 
 
-function renderItems(
- originalItems,
- elementId,
- counterId,
- icon,
- type
-){
+function buildCardHtml(item, icon, isNew, alarm){
 
- const container =
-  document.getElementById(
-   elementId
-  );
+ const username =
+  String(item.username ?? "")
+   .replace(/^@+/,"");
 
- const counter =
-  document.getElementById(
-   counterId
-  );
+ const key = itemKey(item);
 
- const items =
-  filterItems(
-   originalItems,
-   type
-  );
-
- counter.textContent =
-  items.length;
-
- if(!items.length){
-
-  lastRenderedKeys = "";
-  container.innerHTML =
-   '<div class="empty">⚡ Veri yok.</div>';
-
-  return;
-
- }
-
- // Aynı 5 kayıt ise DOM'u yeniden yazma → yanıp sönme yok
- const keysNow = items.map(itemKey).join("|");
- const hasBrandNew = items.some(it => newChest.has(itemKey(it)));
-
- if(
-  keysNow === lastRenderedKeys
-  &&
-  !hasBrandNew
- ){
-  // Sadece countdown zaten ayrı interval ile güncelleniyor
-  return;
- }
-
- lastRenderedKeys = keysNow;
-
- const newSet = newChest;
-
- container.innerHTML =
-
-  items.map(item=>{
-
-   const key =
-    itemKey(item);
-
-   const isNew =
-    newSet.has(key);
-
-   const alarm =
-    isAlarm(item);
-
-   const username =
-    String(
-     item.username ?? ""
-    )
-     .replace(/^@+/,"");
-
-   return `
-
+ return `
     <div class="
      card
      ${isNew ? "new-card" : ""}
      ${alarm ? "alarm" : ""}
-    ">
+    " data-key="${escapeHtml(key)}">
 
      <div class="user-row">
 
@@ -4759,10 +4704,139 @@ function renderItems(
      }
 
     </div>
-
    `;
+}
 
-  }).join("");
+
+function renderItems(
+ originalItems,
+ elementId,
+ counterId,
+ icon,
+ type
+){
+
+ const container =
+  document.getElementById(
+   elementId
+  );
+
+ const counter =
+  document.getElementById(
+   counterId
+  );
+
+ const items =
+  filterItems(
+   originalItems,
+   type
+  );
+
+ counter.textContent =
+  items.length;
+
+ if(!items.length){
+
+  lastRenderedKeys = "";
+  container.innerHTML =
+   '<div class="empty">⚡ Veri yok.</div>';
+
+  return;
+
+ }
+
+ const keysNow = items.map(itemKey).join("|");
+ const newSet = newChest;
+ const hasBrandNew = items.some(it => newSet.has(itemKey(it)));
+
+ // Aynı liste + yeni yok → DOM'a dokunma (countdown ayrı çalışıyor)
+ if(keysNow === lastRenderedKeys && !hasBrandNew){
+  return;
+ }
+
+ const prevKeys = lastRenderedKeys
+  ? lastRenderedKeys.split("|").filter(Boolean)
+  : [];
+
+ lastRenderedKeys = keysNow;
+
+ // İlk yükleme veya büyük fark → full çiz
+ if(!prevKeys.length || prevKeys.length > 5){
+  container.innerHTML = items.map(item =>
+   buildCardHtml(
+    item,
+    icon,
+    newSet.has(itemKey(item)),
+    isAlarm(item)
+   )
+  ).join("");
+  return;
+ }
+
+ const nowKeys = items.map(itemKey);
+ const prevSet = new Set(prevKeys);
+ const nowSet = new Set(nowKeys);
+
+ // Düşen kartları (listeden çıkan) animasyonla kaldır
+ Array.from(container.querySelectorAll(".card")).forEach(el => {
+  const k = el.getAttribute("data-key");
+  if(k && !nowSet.has(k)){
+   el.classList.add("leaving");
+   setTimeout(() => {
+    if(el.parentNode) el.parentNode.removeChild(el);
+   }, 320);
+  }
+ });
+
+ // Yeni kartları BAŞA ekle — alttan yukarı kayarak gelsin
+ nowKeys.forEach((k, idx) => {
+  if(prevSet.has(k)) return;
+
+  const item = items[idx];
+  if(!item) return;
+
+  const wrap = document.createElement("div");
+  wrap.innerHTML = buildCardHtml(
+   item,
+   icon,
+   true,
+   isAlarm(item)
+  ).trim();
+
+  const node = wrap.firstElementChild;
+  if(!node) return;
+
+  // En üste ekle; CSS translateY(120%) → 0 ile YUKARI kayar
+  if(container.firstChild){
+   container.insertBefore(node, container.firstChild);
+  } else {
+   container.appendChild(node);
+  }
+ });
+
+ // Sıra bozulduysa (en yeni üstte olmalı) yeniden sırala ama
+ // mevcut node'ları taşı — yeniden yaratma (flash yok)
+ const byKey = {};
+ Array.from(container.querySelectorAll(".card")).forEach(el => {
+  const k = el.getAttribute("data-key");
+  if(k) byKey[k] = el;
+ });
+
+ nowKeys.forEach(k => {
+  const el = byKey[k];
+  if(el) container.appendChild(el); // sonda biriktirince doğru sıraya gelir
+ });
+
+ // 5'ten fazlaysa fazla olanları düşür
+ while(container.querySelectorAll(".card:not(.leaving)").length > 5){
+  const cards = container.querySelectorAll(".card:not(.leaving)");
+  const last = cards[cards.length - 1];
+  if(!last) break;
+  last.classList.add("leaving");
+  setTimeout(() => {
+   if(last.parentNode) last.parentNode.removeChild(last);
+  }, 320);
+ }
 
 }
 
