@@ -4147,18 +4147,11 @@ function timestamp(item){
 
 function itemKey(item){
 
- return String(
-  item.event_key ??
-  item.source_message_id ??
-  item.room ??
-  (
-   String(item.username ?? "")
-   +
-   "_"
-   +
-   String(item.detected_at ?? "")
-  )
- );
+ // Her yakalama benzersiz olsun (yeni bildirim gelsin)
+ const room = String(item.room ?? item.username ?? "");
+ const ts = String(item.detected_at ?? item.timestamp ?? 0);
+ const extra = String(item.event_key ?? item.source_message_id ?? "");
+ return room + "_" + ts + (extra ? "_" + extra : "");
 
 }
 
@@ -4421,6 +4414,12 @@ function detectNewItems(
   }
 
  });
+
+ // seenSet şişmesin
+ if(seenSet.size > 500){
+  const arr = Array.from(seenSet);
+  arr.slice(0, arr.length - 300).forEach(k => seenSet.delete(k));
+ }
 
 }
 
@@ -4739,7 +4738,7 @@ function renderItems(
  const newSet = newChest;
  const hasBrandNew = items.some(it => newSet.has(itemKey(it)));
 
- // Aynı liste → dokunma (countdown ayrı)
+ // Aynı kayıtlar → DOM'a dokunma (sadece countdown güncellenir)
  if(keysNow === lastRenderedKeys && !hasBrandNew){
   return;
  }
