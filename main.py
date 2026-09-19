@@ -4271,7 +4271,7 @@ async function blockUsername(username, btn){
 }
 
 
-function copyUsername(username, el){
+async function copyUsername(username, el){
 
  const cleanName =
   String(username ?? "")
