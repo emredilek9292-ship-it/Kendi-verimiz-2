@@ -3673,7 +3673,7 @@ body{
  flex-direction:column;
  gap:10px;
  width:100%;
- overflow:visible;
+ overflow:hidden;
 }
 
 .card{
@@ -3701,16 +3701,14 @@ body{
 }
 
 .card.new-card{
- animation:newCard .75s cubic-bezier(.2,.85,.3,1);
- will-change:transform,opacity;
- z-index:5;
+ animation:newCard .55s ease-out;
 }
 
 @keyframes newCard{
 
  0%{
   opacity:0;
-  transform:translateY(100%);
+  transform:translateY(18px);
  }
 
  100%{
@@ -3718,15 +3716,6 @@ body{
   transform:translateY(0);
  }
 
-}
-
-.card.leaving{
- animation:cardLeave .35s ease-in forwards;
-}
-
-@keyframes cardLeave{
- 0%{ opacity:1; transform:translateY(0) scale(1); }
- 100%{ opacity:0; transform:translateY(-12px) scale(.96); }
 }
 
 /* Liste güncellenirken kartlar hafif yukarı kayar */
@@ -4750,94 +4739,22 @@ function renderItems(
  const newSet = newChest;
  const hasBrandNew = items.some(it => newSet.has(itemKey(it)));
 
- // Aynı liste + yeni yok → DOM'a dokunma (countdown ayrı çalışıyor)
+ // Aynı liste → dokunma (countdown ayrı)
  if(keysNow === lastRenderedKeys && !hasBrandNew){
   return;
  }
 
- const prevKeys = lastRenderedKeys
-  ? lastRenderedKeys.split("|").filter(Boolean)
-  : [];
-
  lastRenderedKeys = keysNow;
 
- // İlk yükleme veya büyük fark → full çiz
- if(!prevKeys.length || prevKeys.length > 5){
-  container.innerHTML = items.map(item =>
-   buildCardHtml(
-    item,
-    icon,
-    newSet.has(itemKey(item)),
-    isAlarm(item)
-   )
-  ).join("");
-  return;
- }
-
- const nowKeys = items.map(itemKey);
- const prevSet = new Set(prevKeys);
- const nowSet = new Set(nowKeys);
-
- // Düşen kartları (listeden çıkan) animasyonla kaldır
- Array.from(container.querySelectorAll(".card")).forEach(el => {
-  const k = el.getAttribute("data-key");
-  if(k && !nowSet.has(k)){
-   el.classList.add("leaving");
-   setTimeout(() => {
-    if(el.parentNode) el.parentNode.removeChild(el);
-   }, 320);
-  }
- });
-
- // Yeni kartları BAŞA ekle — alttan yukarı kayarak gelsin
- nowKeys.forEach((k, idx) => {
-  if(prevSet.has(k)) return;
-
-  const item = items[idx];
-  if(!item) return;
-
-  const wrap = document.createElement("div");
-  wrap.innerHTML = buildCardHtml(
+ // Temiz tek seferde çiz — üst üste binme yok
+ container.innerHTML = items.map(item =>
+  buildCardHtml(
    item,
    icon,
-   true,
+   newSet.has(itemKey(item)),
    isAlarm(item)
-  ).trim();
-
-  const node = wrap.firstElementChild;
-  if(!node) return;
-
-  // En üste ekle; CSS translateY(120%) → 0 ile YUKARI kayar
-  if(container.firstChild){
-   container.insertBefore(node, container.firstChild);
-  } else {
-   container.appendChild(node);
-  }
- });
-
- // Sıra bozulduysa (en yeni üstte olmalı) yeniden sırala ama
- // mevcut node'ları taşı — yeniden yaratma (flash yok)
- const byKey = {};
- Array.from(container.querySelectorAll(".card")).forEach(el => {
-  const k = el.getAttribute("data-key");
-  if(k) byKey[k] = el;
- });
-
- nowKeys.forEach(k => {
-  const el = byKey[k];
-  if(el) container.appendChild(el); // sonda biriktirince doğru sıraya gelir
- });
-
- // 5'ten fazlaysa fazla olanları düşür
- while(container.querySelectorAll(".card:not(.leaving)").length > 5){
-  const cards = container.querySelectorAll(".card:not(.leaving)");
-  const last = cards[cards.length - 1];
-  if(!last) break;
-  last.classList.add("leaving");
-  setTimeout(() => {
-   if(last.parentNode) last.parentNode.removeChild(last);
-  }, 320);
- }
+  )
+ ).join("");
 
 }
 
