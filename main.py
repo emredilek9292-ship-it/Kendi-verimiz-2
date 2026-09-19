@@ -3699,27 +3699,20 @@ body{
 }
 
 .card.new-card{
- animation:newCard .6s cubic-bezier(.22,.9,.3,1);
+ animation:newCard .65s cubic-bezier(.22,.9,.3,1);
+ will-change:transform,opacity;
 }
 
 @keyframes newCard{
 
  0%{
   opacity:0;
-  transform:translateY(40px) scale(.94);
-  box-shadow:0 0 0 rgba(45,212,200,0);
- }
-
- 55%{
-  opacity:1;
-  transform:translateY(-4px) scale(1.02);
-  box-shadow:0 0 24px rgba(45,212,200,.45);
+  transform:translateY(36px);
  }
 
  100%{
   opacity:1;
-  transform:translateY(0) scale(1);
-  box-shadow:none;
+  transform:translateY(0);
  }
 
 }
@@ -4112,6 +4105,8 @@ const seenChest = new Set();
 const newChest = new Set();
 
 const blockedUsers = new Set();
+
+let lastRenderedKeys = "";
 
 
 function escapeHtml(value){
@@ -4580,12 +4575,28 @@ function renderItems(
 
  if(!items.length){
 
+  lastRenderedKeys = "";
   container.innerHTML =
    '<div class="empty">⚡ Veri yok.</div>';
 
   return;
 
  }
+
+ // Aynı 5 kayıt ise DOM'u yeniden yazma → yanıp sönme yok
+ const keysNow = items.map(itemKey).join("|");
+ const hasBrandNew = items.some(it => newChest.has(itemKey(it)));
+
+ if(
+  keysNow === lastRenderedKeys
+  &&
+  !hasBrandNew
+ ){
+  // Sadece countdown zaten ayrı interval ile güncelleniyor
+  return;
+ }
+
+ lastRenderedKeys = keysNow;
 
  const newSet = newChest;
 
@@ -4772,6 +4783,20 @@ function renderRadar(){
   "CHEST"
  );
 
+ // Animasyon bitince YENİ bayrağını ve new-card sınıfını temizle
+ // Böylece her poll'da yanıp sönme olmaz
+ if(newChest.size > 0){
+  setTimeout(function(){
+   newChest.clear();
+   document.querySelectorAll(".card.new-card").forEach(function(el){
+    el.classList.remove("new-card");
+   });
+   document.querySelectorAll(".new-badge").forEach(function(el){
+    el.remove();
+   });
+  }, 700);
+ }
+
 }
 
 
@@ -4893,7 +4918,7 @@ async function loadRadar(){
 
 setInterval(
  loadRadar,
- 10000
+ 4000
 );
 
 const COUNTDOWN_DURATION_SECONDS = 90;
