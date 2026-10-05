@@ -86,7 +86,7 @@ BASE_URL = os.environ.get(
 
 BOT_USERNAME = os.environ.get(
     "BOT_USERNAME",
-    "@goody_bag_jimin_bot"
+    "goody_bag_jimin_bot"
 )
 
 ADMIN_USER_ID = int(
