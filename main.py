@@ -86,7 +86,7 @@ BASE_URL = os.environ.get(
 
 BOT_USERNAME = os.environ.get(
     "BOT_USERNAME",
-    "YeniBirAirdropBot"
+    "@goody_bag_jimin_bot"
 )
 
 ADMIN_USER_ID = int(
@@ -110,7 +110,7 @@ VIP_DAYS = int(
     )
 )
 
-TARGET_CHAT_ID = -1004421946217
+TARGET_CHAT_ID = -5371691858
 
 TURKEY_TZ = ZoneInfo("Europe/Istanbul")
 
