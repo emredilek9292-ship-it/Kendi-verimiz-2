@@ -110,7 +110,7 @@ VIP_DAYS = int(
     )
 )
 
-TARGET_CHAT_ID = -5371691858
+TARGET_CHAT_ID = -1004306771338
 
 TURKEY_TZ = ZoneInfo("Europe/Istanbul")
 
