@@ -2080,12 +2080,20 @@ def _resolve_room_id(room=None, token_data=None):
 
 def get_live_links(username, room=None, token_data=None, proxy_url=None):
     """
-    Link üretimi (öncelik):
-      1) room_id varsa share/live/{room} + snssdk deep link
-      2) kaynak LiveMira/proxy linki (hxammo / dichvu321) — yetkili kullanıcıda çalışır
-      3) token openitok/live URL
-      4) gerçek (maskesiz) @username/live
-    Maskeli isimlerde (le***) asla sahte @user/live üretilmez.
+    Meşru TikTok canlı bağlantı denemeleri (öncelik sırası):
+
+    1) room_id biliniyorsa:
+       - https://www.tiktok.com/share/live/{room}
+       - snssdk1180://live?room_id={room}  (uygulama deep link)
+       - snssdk1233://live?room_id={room}  (alternatif app id)
+    2) Kaynak proxy (LiveMira) — üyelerde çalışır
+    3) Token içindeki hazır live URL
+    4) Maskesiz gerçek @username için birden fazla format:
+       - https://www.tiktok.com/@user/live
+       - https://www.tiktok.com/@user/live?enter=1
+       - https://m.tiktok.com/@user/live
+
+    Maskeli isim (le***) için @user/live ÜRETİLMEZ.
     """
     room_id = _resolve_room_id(room, token_data)
     user = canonical_tiktok_username(username)
@@ -2093,15 +2101,21 @@ def get_live_links(username, room=None, token_data=None, proxy_url=None):
 
     room_url = ""
     deep_url = ""
+    deep_url_alt = ""
     if room_id:
         room_url = f"https://www.tiktok.com/share/live/{room_id}"
         deep_url = f"snssdk1180://live?room_id={room_id}"
+        deep_url_alt = f"snssdk1233://live?room_id={room_id}"
 
     proxy_url = str(proxy_url or "").strip()
 
     user_url = ""
+    user_url_m = ""
+    user_url_enter = ""
     if user and not masked:
         user_url = f"https://www.tiktok.com/@{user}/live"
+        user_url_m = f"https://m.tiktok.com/@{user}/live"
+        user_url_enter = f"https://www.tiktok.com/@{user}/live?enter_from_live=1"
 
     token_url = ""
     if token_data:
@@ -2117,14 +2131,16 @@ def get_live_links(username, room=None, token_data=None, proxy_url=None):
                     token_url = value
                     break
 
-    # primary: room > proxy (LiveMira) > token > real username
     primary = room_url or proxy_url or token_url or user_url
     return {
         "room_url": room_url,
         "user_url": user_url,
+        "user_url_m": user_url_m,
+        "user_url_enter": user_url_enter,
         "token_url": token_url,
         "proxy_url": proxy_url,
         "deep_url": deep_url,
+        "deep_url_alt": deep_url_alt,
         "primary": primary,
         "room_id": room_id,
     }
@@ -2136,38 +2152,42 @@ def get_live_link(username, room=None, token_data=None):
 
 
 def format_live_links_html(data):
-    """Telegram mesajına canlı link satırları ekler."""
+    """Telegram mesajına denenecek canlı linkleri ekler."""
     room_url = str(data.get("room_url") or "").strip()
     user_url = str(data.get("user_url") or "").strip()
+    user_url_m = str(data.get("user_url_m") or "").strip()
+    user_url_enter = str(data.get("user_url_enter") or "").strip()
     token_url = str(data.get("token_url") or "").strip()
     proxy_url = str(data.get("proxy_url") or "").strip()
     deep_url = str(data.get("deep_url") or "").strip()
+    deep_url_alt = str(data.get("deep_url_alt") or "").strip()
     primary = str(data.get("live") or "").strip()
 
     lines = []
+    seen = set()
 
-    if room_url:
-        lines.append(f'🎯 <a href="{room_url}">ODAYA GİT (Room)</a>')
+    def add(label, url):
+        if not url or url in seen:
+            return
+        seen.add(url)
+        lines.append(f'<a href="{url}">{label}</a>')
 
-    if deep_url:
-        lines.append(f'📱 <a href="{deep_url}">TİKTOK UYGULAMA (Deep)</a>')
-
-    if proxy_url and proxy_url not in (room_url, user_url, token_url):
-        lines.append(f'🔐 <a href="{proxy_url}">LİVEMİRA / KAYNAK LİNK</a>')
-
-    if user_url and user_url not in (room_url, proxy_url):
-        lines.append(f'👤 <a href="{user_url}">YAYINCI LIVE</a>')
-
-    if token_url and token_url not in (room_url, user_url, proxy_url, primary):
-        lines.append(f'🔗 <a href="{token_url}">YEDEK LİNK</a>')
+    add("🎯 ODAYA GİT (Room)", room_url)
+    add("📱 TİKTOK APP", deep_url)
+    add("📱 TİKTOK APP 2", deep_url_alt)
+    add("🔐 KAYNAK / LİVEMİRA", proxy_url)
+    add("👤 YAYINCI LIVE", user_url)
+    add("👤 YAYINCI (Mobil)", user_url_m)
+    add("👤 YAYINCI (Enter)", user_url_enter)
+    add("🔗 YEDEK", token_url)
 
     if not lines and primary:
-        lines.append(f'🔴 <a href="{primary}">CANLI LİNK</a>')
+        add("🔴 CANLI LİNK", primary)
 
     if not lines:
         return ""
 
-    return "\n\n" + "\n".join(lines)
+    return "\n\n🔗 Canlı denemeleri:\n" + "\n".join(lines)
 
 
 # ============================================================
@@ -2439,6 +2459,15 @@ def parse_source_message(event):
 
         "deep_url":
             links.get("deep_url") or "",
+
+        "deep_url_alt":
+            links.get("deep_url_alt") or "",
+
+        "user_url_m":
+            links.get("user_url_m") or "",
+
+        "user_url_enter":
+            links.get("user_url_enter") or "",
 
         "target_time":
             target_time,
