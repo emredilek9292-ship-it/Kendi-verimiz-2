@@ -6,9 +6,8 @@
 #
 # CANLI LİNK DÜZELTİLDİ:
 # - Token içindeki eski/stale URL kullanılmaz
-# - openitok/live/live_url/url öncelikli canlı bağlantı kullanılır
-# - room varsa share/live yedeği kullanılır
-# - son çare @username/live kullanılır
+# - room varsa share/live/{room} ÖNCELİKLİ kullanılır (stale openitok engeli)
+# - token URL yedek, son çare @username/live
 # - Telegram + Mini App aynı live linkini kullanır
 #
 # EK SİSTEMLER:
@@ -2036,56 +2035,63 @@ def get_live_link(
     token_data=None
 ):
     """
-    TikTok canlı bağlantısını çalışan kaynak kodun mantığıyla üretir.
+    TikTok canlı bağlantısı.
 
-    Öncelik sırası:
-    1) token_data içindeki openitok
-    2) token_data içindeki live
-    3) token_data içindeki live_url
-    4) token_data içindeki url
-    5) room üzerinden TikTok share/live bağlantısı
-    6) son çare @username/live
+    ÖNEMLİ DEĞİŞİKLİK:
+    share/live/{room} artık EN ÖNCE kullanılır.
+    Eski openitok / stale token URL'leri "yayın bitti" gösteriyordu.
+    Room ID varken doğrudan odanın share linkine gidilir.
 
-    Böylece kaynak token gerçek bir canlı URL veriyorsa aynen kullanılır;
-    token URL vermiyorsa room, en son da kullanıcı adı kullanılır.
+    Öncelik:
+    1) Geçerli room -> https://www.tiktok.com/share/live/{room}
+    2) Token URL içinde share/live veya room geçenler
+    3) Diğer token live URL'leri (openitok/live/live_url/url)
+    4) Son çare @username/live
     """
-
-    if token_data:
-
-        for key in [
-            "openitok",
-            "live",
-            "live_url",
-            "url"
-        ]:
-            value = token_data.get(key)
-
-            if value:
-                value = str(value).strip()
-
-                if value.startswith((
-                    "http://",
-                    "https://"
-                )):
-                    return value
 
     room = str(room or "").strip()
 
-    if room and not room.startswith("msg:"):
-        return (
-            "https://www.tiktok.com/"
-            f"share/live/{room}"
-        )
+    # Token içinden room yakala (eksikse)
+    if (not room or room.startswith("msg:")) and token_data:
+        for key in ("room", "room_id", "roomid", "roomId", "roomID"):
+            val = token_data.get(key)
+            if val:
+                room = str(val).strip()
+                break
 
-    username = canonical_tiktok_username(
-        username
-    )
+        # URL içinden room ID çek (share/live/1234567890)
+        if not room or room.startswith("msg:"):
+            for key in ("openitok", "live", "live_url", "url"):
+                val = str(token_data.get(key) or "")
+                m = re.search(r"share/live/(\d+)", val)
+                if m:
+                    room = m.group(1)
+                    break
+                m = re.search(r"[?&]room_id=(\d+)", val)
+                if m:
+                    room = m.group(1)
+                    break
 
+    # 1) ROOM VARSA HER ZAMAN share/live kullan (en güvenilir)
+    if room and not room.startswith("msg:") and room.isdigit():
+        return f"https://www.tiktok.com/share/live/{room}"
+
+    # 2) Token URL'lerinde share/live olanları tercih et
+    if token_data:
+        for key in ("openitok", "live", "live_url", "url"):
+            value = str(token_data.get(key) or "").strip()
+            if value.startswith(("http://", "https://")) and "share/live/" in value:
+                return value
+
+        for key in ("openitok", "live", "live_url", "url"):
+            value = str(token_data.get(key) or "").strip()
+            if value.startswith(("http://", "https://")):
+                return value
+
+    # 3) Son çare: kullanıcı adı
+    username = canonical_tiktok_username(username)
     if username:
-        return (
-            "https://www.tiktok.com/"
-            f"@{username}/live"
-        )
+        return f"https://www.tiktok.com/@{username}/live"
 
     return ""
 
