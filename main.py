@@ -103,6 +103,10 @@ last_event_notification = {}
 USER_SETTINGS_CACHE = {}
 RESOLVE_CACHE = {}
 
+# Kaynak yönlendirme sitesi (LiveMira) lisans/aktivasyon istiyor,
+# sunucudan çözülemiyor (loglarda hep None). Gereksiz istek atmasın.
+RESOLVE_ENABLED = os.environ.get("RESOLVE_ENABLED", "0") == "1"
+
 telegram_queue = asyncio.PriorityQueue()
 telegram_send_lock = asyncio.Lock()
 
@@ -3496,7 +3500,7 @@ async def message_listener(event):
         # Çözülemezse yönlendirme linki aynen kullanılır.
         live = data.get("live", "")
 
-        if live and "tiktok.com" not in live:
+        if RESOLVE_ENABLED and live and "tiktok.com" not in live:
             try:
                 resolved = await resolve_live_link(live)
                 if resolved:
