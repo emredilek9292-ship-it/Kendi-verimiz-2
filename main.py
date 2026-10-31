@@ -2029,71 +2029,113 @@ def canonical_tiktok_username(username):
     return username
 
 
-def get_live_link(
-    username,
-    room=None,
-    token_data=None
-):
-    """
-    TikTok canlı bağlantısı.
-
-    ÖNEMLİ DEĞİŞİKLİK:
-    share/live/{room} artık EN ÖNCE kullanılır.
-    Eski openitok / stale token URL'leri "yayın bitti" gösteriyordu.
-    Room ID varken doğrudan odanın share linkine gidilir.
-
-    Öncelik:
-    1) Geçerli room -> https://www.tiktok.com/share/live/{room}
-    2) Token URL içinde share/live veya room geçenler
-    3) Diğer token live URL'leri (openitok/live/live_url/url)
-    4) Son çare @username/live
-    """
-
+def _resolve_room_id(room=None, token_data=None):
+    """Kaynak room / token / URL içinden sayısal room ID çıkar."""
     room = str(room or "").strip()
 
-    # Token içinden room yakala (eksikse)
-    if (not room or room.startswith("msg:")) and token_data:
+    if room and not room.startswith("msg:") and room.isdigit():
+        return room
+
+    if token_data:
         for key in ("room", "room_id", "roomid", "roomId", "roomID"):
             val = token_data.get(key)
-            if val:
-                room = str(val).strip()
-                break
+            if val is None:
+                continue
+            val = str(val).strip()
+            if val.isdigit():
+                return val
 
-        # URL içinden room ID çek (share/live/1234567890)
-        if not room or room.startswith("msg:"):
-            for key in ("openitok", "live", "live_url", "url"):
-                val = str(token_data.get(key) or "")
-                m = re.search(r"share/live/(\d+)", val)
-                if m:
-                    room = m.group(1)
-                    break
-                m = re.search(r"[?&]room_id=(\d+)", val)
-                if m:
-                    room = m.group(1)
-                    break
+        for key in ("openitok", "live", "live_url", "url"):
+            val = str(token_data.get(key) or "")
+            m = re.search(r"share/live/(\d+)", val)
+            if m:
+                return m.group(1)
+            m = re.search(r"[?&]room_id=(\d+)", val)
+            if m:
+                return m.group(1)
+            m = re.search(r"/live/(\d{10,})", val)
+            if m:
+                return m.group(1)
 
-    # 1) ROOM VARSA HER ZAMAN share/live kullan (en güvenilir)
-    if room and not room.startswith("msg:") and room.isdigit():
-        return f"https://www.tiktok.com/share/live/{room}"
+    return ""
 
-    # 2) Token URL'lerinde share/live olanları tercih et
+
+def get_live_links(username, room=None, token_data=None):
+    """
+    İki ayrı link üretir:
+      - room_url  : share/live/{room}  (doğrudan oda)
+      - user_url  : @username/live     (yayıncı profil live)
+      - token_url : kaynak token URL   (openitok vb.)
+
+    primary: mümkünse room, yoksa token, yoksa user.
+    """
+    room_id = _resolve_room_id(room, token_data)
+    user = canonical_tiktok_username(username)
+
+    room_url = ""
+    if room_id:
+        room_url = f"https://www.tiktok.com/share/live/{room_id}"
+
+    user_url = ""
+    if user:
+        user_url = f"https://www.tiktok.com/@{user}/live"
+
+    token_url = ""
     if token_data:
+        # share/live içeren token URL önce
         for key in ("openitok", "live", "live_url", "url"):
             value = str(token_data.get(key) or "").strip()
             if value.startswith(("http://", "https://")) and "share/live/" in value:
-                return value
+                token_url = value
+                break
+        if not token_url:
+            for key in ("openitok", "live", "live_url", "url"):
+                value = str(token_data.get(key) or "").strip()
+                if value.startswith(("http://", "https://")):
+                    token_url = value
+                    break
 
-        for key in ("openitok", "live", "live_url", "url"):
-            value = str(token_data.get(key) or "").strip()
-            if value.startswith(("http://", "https://")):
-                return value
+    primary = room_url or token_url or user_url
+    return {
+        "room_url": room_url,
+        "user_url": user_url,
+        "token_url": token_url,
+        "primary": primary,
+        "room_id": room_id,
+    }
 
-    # 3) Son çare: kullanıcı adı
-    username = canonical_tiktok_username(username)
-    if username:
-        return f"https://www.tiktok.com/@{username}/live"
 
-    return ""
+def get_live_link(username, room=None, token_data=None):
+    """Geriye uyumlu: tek primary link döner."""
+    return get_live_links(username, room, token_data)["primary"]
+
+
+def format_live_links_html(data):
+    """Telegram mesajına 2-3 canlı link satırı ekler."""
+    room_url = str(data.get("room_url") or "").strip()
+    user_url = str(data.get("user_url") or "").strip()
+    token_url = str(data.get("token_url") or "").strip()
+    primary = str(data.get("live") or "").strip()
+
+    lines = []
+
+    if room_url:
+        lines.append(f'🎯 <a href="{room_url}">ODAYA GİT (Room)</a>')
+
+    if user_url and user_url != room_url:
+        lines.append(f'👤 <a href="{user_url}">YAYINCI LIVE</a>')
+
+    # Token linki room/user'dan farklıysa yedek olarak ekle
+    if token_url and token_url not in (room_url, user_url, primary):
+        lines.append(f'🔗 <a href="{token_url}">YEDEK LİNK</a>')
+
+    if not lines and primary:
+        lines.append(f'🔴 <a href="{primary}">TIKTOK CANLI YAYIN</a>')
+
+    if not lines:
+        return ""
+
+    return "\n\n" + "\n".join(lines)
 
 
 # ============================================================
@@ -2306,6 +2348,17 @@ def parse_source_message(event):
             ])
         )
 
+    links = get_live_links(
+        username_for_link,
+        room,
+        token_data
+    )
+
+    if direct_link_url:
+        links["user_url"] = direct_link_url or links["user_url"]
+        if not links["primary"]:
+            links["primary"] = direct_link_url
+
     return {
         "type":
             "CHEST",
@@ -2335,12 +2388,16 @@ def parse_source_message(event):
             room,
 
         "live":
-            direct_link_url
-            or get_live_link(
-                username_for_link,
-                room,
-                token_data
-            ),
+            links["primary"] or direct_link_url or "",
+
+        "room_url":
+            links["room_url"],
+
+        "user_url":
+            links["user_url"] or direct_link_url or "",
+
+        "token_url":
+            links["token_url"],
 
         "target_time":
             target_time,
@@ -2695,14 +2752,7 @@ async def send_telegram_message(data):
             "\n⚡ YÜKSEK ÖDÜL / AZ KİŞİ"
         )
 
-    if data.get("live"):
-
-        text += (
-            "\n\n🔴 "
-            f'<a href="{data["live"]}">'
-            "TIKTOK CANLI YAYIN"
-            "</a>"
-        )
+    text += format_live_links_html(data)
 
     ok, _ = await telegram_api(
         "sendMessage",
@@ -2785,14 +2835,7 @@ async def send_personal_alarm(
         "\n🚨 Ayarladığın alarma uyuyor!"
     )
 
-    if data.get("live"):
-
-        text += (
-            "\n\n🔴 "
-            f'<a href="{data["live"]}">'
-            "TIKTOK CANLI YAYIN"
-            "</a>"
-        )
+    text += format_live_links_html(data)
 
     ok, _ = await telegram_api(
         "sendMessage",
@@ -2864,14 +2907,7 @@ async def send_follow_notifications(data):
                 "⚡ YÜKSEK ÖDÜL / AZ KİŞİ\n"
             )
 
-        if data.get("live"):
-
-            text += (
-                "\n🔴 "
-                f'<a href="{data["live"]}">'
-                "TIKTOK CANLI YAYIN"
-                "</a>"
-            )
+        text += format_live_links_html(data)
 
         await telegram_api(
             "sendMessage",
