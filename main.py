@@ -6,9 +6,8 @@
 #
 # CANLI LİNK DÜZELTİLDİ:
 # - Token içindeki eski/stale URL kullanılmaz
-# - openitok/live/live_url/url öncelikli canlı bağlantı kullanılır
-# - room varsa share/live yedeği kullanılır
-# - son çare @username/live kullanılır
+# - room varsa share/live/{room} ÖNCELİKLİ kullanılır (stale openitok engeli)
+# - token URL yedek, son çare @username/live
 # - Telegram + Mini App aynı live linkini kullanır
 #
 # EK SİSTEMLER:
@@ -1538,48 +1537,66 @@ def decode_token(token):
 # ============================================================
 
 def extract_p_room(text):
-
+    """Eski p= base64 room ID (dichvu321 / benzeri)."""
     if not text:
         return None
 
     patterns = [
-        r'https?://live\.dichvu321\.com/t/\?p=([A-Za-z0-9_\-+/=]+)',
-        r'https?://[^ \n]+/t/\?p=([A-Za-z0-9_\-+/=]+)',
+        r'https?://(?:live\.)?dichvu321\.com/t/\?p=([A-Za-z0-9_\-+/=]+)',
+        r'https?://[^\s\n]+/t/\?p=([A-Za-z0-9_\-+/=]+)',
+        r'[?&]p=([A-Za-z0-9_\-+/=]{6,})',
     ]
 
     for pattern in patterns:
-
-        m = re.search(
-            pattern,
-            text,
-            re.I
-        )
-
+        m = re.search(pattern, text, re.I)
         if not m:
             continue
-
         try:
-
             encoded = m.group(1)
-
-            padding = "=" * (
-                -len(encoded) % 4
-            )
-
-            room = base64.urlsafe_b64decode(
-                encoded + padding
-            ).decode(
-                "utf-8",
-                errors="ignore"
-            ).strip()
-
-            if room.isdigit():
-                return room
-
+            padding = "=" * (-len(encoded) % 4)
+            for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+                try:
+                    room = decoder(encoded + padding).decode("utf-8", "ignore").strip()
+                    if room.isdigit() and 6 <= len(room) <= 25:
+                        return room
+                except Exception:
+                    continue
         except Exception:
             pass
-
     return None
+
+
+def extract_proxy_live_link(text):
+    """
+    Kaynak LiveMira / dichvu321 / hxammo linkini olduğu gibi alır.
+    r= şifreli parametre room ID vermez; link yetkili kullanıcıda odaya götürür.
+    """
+    if not text:
+        return None
+
+    patterns = [
+        r'(https?://t\.hxammo\.workers\.dev/\?r=[A-Za-z0-9_\-]+)',
+        r'(https?://(?:t\.)?(?:live\.)?dichvu321\.com/t/\?[pr]=[A-Za-z0-9_\-/=]+)',
+        r'(https?://[^\s\n]*dichvu321[^\s\n]+)',
+        r'(https?://[^\s\n]*hxammo[^\s\n]+)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def is_masked_username(username):
+    """le*** / mu*** gibi maskeli isimler gerçek TikTok adı değildir."""
+    u = str(username or "").strip().lstrip("@")
+    if not u:
+        return True
+    if "*" in u or "•" in u or "…" in u:
+        return True
+    if len(u) < 3:
+        return True
+    return False
 
 
 # ============================================================
@@ -2005,89 +2022,168 @@ def calculate_target_time(
 
 def canonical_tiktok_username(username):
     """
-    Sadece gerçek TikTok kullanıcı adını normalize eder.
-    @ işareti, boşluk ve yanlışlıkla gelen TikTok URL parçaları temizlenir.
+    Gerçek TikTok kullanıcı adını normalize eder.
+    Maskeli isimler (ho***, le***) BOŞ döner — sahte @ho/live üretilmesin.
     """
-    username = str(
-        username or ""
-    ).strip()
-
-    if not username:
+    username = str(username or "").strip()
+    if not username or "*" in username or "•" in username:
         return ""
 
-    # Eğer yanlışlıkla URL geldiyse kullanıcı adını URL'den çıkar.
     m = re.search(
         r'(?:tiktok\.com/)?@?([A-Za-z0-9._]+)',
         username,
         re.I
     )
-
     if m:
         username = m.group(1)
 
     username = username.strip().lstrip("@").strip()
-
+    if not username or "*" in username or len(username) < 2:
+        return ""
     return username
 
 
-def get_live_link(
-    username,
-    room=None,
-    token_data=None
-):
-    """
-    TikTok canlı bağlantısını çalışan kaynak kodun mantığıyla üretir.
-
-    Öncelik sırası:
-    1) token_data içindeki openitok
-    2) token_data içindeki live
-    3) token_data içindeki live_url
-    4) token_data içindeki url
-    5) room üzerinden TikTok share/live bağlantısı
-    6) son çare @username/live
-
-    Böylece kaynak token gerçek bir canlı URL veriyorsa aynen kullanılır;
-    token URL vermiyorsa room, en son da kullanıcı adı kullanılır.
-    """
-
-    if token_data:
-
-        for key in [
-            "openitok",
-            "live",
-            "live_url",
-            "url"
-        ]:
-            value = token_data.get(key)
-
-            if value:
-                value = str(value).strip()
-
-                if value.startswith((
-                    "http://",
-                    "https://"
-                )):
-                    return value
-
+def _resolve_room_id(room=None, token_data=None):
+    """Kaynak room / token / URL içinden sayısal room ID çıkar."""
     room = str(room or "").strip()
 
-    if room and not room.startswith("msg:"):
-        return (
-            "https://www.tiktok.com/"
-            f"share/live/{room}"
-        )
+    if room and not room.startswith("msg:") and room.isdigit():
+        return room
 
-    username = canonical_tiktok_username(
-        username
-    )
+    if token_data:
+        for key in ("room", "room_id", "roomid", "roomId", "roomID"):
+            val = token_data.get(key)
+            if val is None:
+                continue
+            val = str(val).strip()
+            if val.isdigit():
+                return val
 
-    if username:
-        return (
-            "https://www.tiktok.com/"
-            f"@{username}/live"
-        )
+        for key in ("openitok", "live", "live_url", "url"):
+            val = str(token_data.get(key) or "")
+            m = re.search(r"share/live/(\d+)", val)
+            if m:
+                return m.group(1)
+            m = re.search(r"[?&]room_id=(\d+)", val)
+            if m:
+                return m.group(1)
+            m = re.search(r"/live/(\d{10,})", val)
+            if m:
+                return m.group(1)
 
     return ""
+
+
+def get_live_links(username, room=None, token_data=None, proxy_url=None):
+    """
+    Meşru TikTok canlı bağlantı denemeleri (öncelik sırası):
+
+    1) room_id biliniyorsa:
+       - https://www.tiktok.com/share/live/{room}
+       - snssdk1180://live?room_id={room}  (uygulama deep link)
+       - snssdk1233://live?room_id={room}  (alternatif app id)
+    2) Kaynak proxy (LiveMira) — üyelerde çalışır
+    3) Token içindeki hazır live URL
+    4) Maskesiz gerçek @username için birden fazla format:
+       - https://www.tiktok.com/@user/live
+       - https://www.tiktok.com/@user/live?enter=1
+       - https://m.tiktok.com/@user/live
+
+    Maskeli isim (le***) için @user/live ÜRETİLMEZ.
+    """
+    room_id = _resolve_room_id(room, token_data)
+    user = canonical_tiktok_username(username)
+    masked = is_masked_username(user)
+
+    room_url = ""
+    deep_url = ""
+    deep_url_alt = ""
+    if room_id:
+        room_url = f"https://www.tiktok.com/share/live/{room_id}"
+        deep_url = f"snssdk1180://live?room_id={room_id}"
+        deep_url_alt = f"snssdk1233://live?room_id={room_id}"
+
+    proxy_url = str(proxy_url or "").strip()
+
+    user_url = ""
+    user_url_m = ""
+    user_url_enter = ""
+    if user and not masked:
+        user_url = f"https://www.tiktok.com/@{user}/live"
+        user_url_m = f"https://m.tiktok.com/@{user}/live"
+        user_url_enter = f"https://www.tiktok.com/@{user}/live?enter_from_live=1"
+
+    token_url = ""
+    if token_data:
+        for key in ("openitok", "live", "live_url", "url"):
+            value = str(token_data.get(key) or "").strip()
+            if value.startswith(("http://", "https://")) and "share/live/" in value:
+                token_url = value
+                break
+        if not token_url:
+            for key in ("openitok", "live", "live_url", "url"):
+                value = str(token_data.get(key) or "").strip()
+                if value.startswith(("http://", "https://")):
+                    token_url = value
+                    break
+
+    primary = room_url or proxy_url or token_url or user_url
+    return {
+        "room_url": room_url,
+        "user_url": user_url,
+        "user_url_m": user_url_m,
+        "user_url_enter": user_url_enter,
+        "token_url": token_url,
+        "proxy_url": proxy_url,
+        "deep_url": deep_url,
+        "deep_url_alt": deep_url_alt,
+        "primary": primary,
+        "room_id": room_id,
+    }
+
+
+def get_live_link(username, room=None, token_data=None):
+    """Geriye uyumlu: tek primary link döner."""
+    return get_live_links(username, room, token_data)["primary"]
+
+
+def format_live_links_html(data):
+    """Telegram mesajına denenecek canlı linkleri ekler."""
+    room_url = str(data.get("room_url") or "").strip()
+    user_url = str(data.get("user_url") or "").strip()
+    user_url_m = str(data.get("user_url_m") or "").strip()
+    user_url_enter = str(data.get("user_url_enter") or "").strip()
+    token_url = str(data.get("token_url") or "").strip()
+    proxy_url = str(data.get("proxy_url") or "").strip()
+    deep_url = str(data.get("deep_url") or "").strip()
+    deep_url_alt = str(data.get("deep_url_alt") or "").strip()
+    primary = str(data.get("live") or "").strip()
+
+    lines = []
+    seen = set()
+
+    def add(label, url):
+        if not url or url in seen:
+            return
+        seen.add(url)
+        lines.append(f'<a href="{url}">{label}</a>')
+
+    add("🎯 ODAYA GİT (Room)", room_url)
+    add("📱 TİKTOK APP", deep_url)
+    add("📱 TİKTOK APP 2", deep_url_alt)
+    add("🔐 KAYNAK / LİVEMİRA", proxy_url)
+    add("👤 YAYINCI LIVE", user_url)
+    add("👤 YAYINCI (Mobil)", user_url_m)
+    add("👤 YAYINCI (Enter)", user_url_enter)
+    add("🔗 YEDEK", token_url)
+
+    if not lines and primary:
+        add("🔴 CANLI LİNK", primary)
+
+    if not lines:
+        return ""
+
+    return "\n\n🔗 Canlı denemeleri:\n" + "\n".join(lines)
 
 
 # ============================================================
@@ -2196,6 +2292,47 @@ def parse_source_message(event):
         or f"msg:{event.message.id}"
     )
 
+    # Entity linkleri (görünmez URL'ler)
+    try:
+        for ent in (event.message.entities or []):
+            u = getattr(ent, "url", None)
+            if not u:
+                continue
+            u = str(u).strip()
+            m2 = re.search(
+                r'(https?://(?:www\.|m\.)?tiktok\.com/@([A-Za-z0-9_.]+)/live[^\s]*)',
+                u,
+                re.I
+            )
+            if m2:
+                if not direct_link_url:
+                    direct_link_url = m2.group(1)
+                cand = m2.group(2)
+                if not is_masked_username(cand):
+                    username = cand
+                    username_for_link = cand
+            pr = extract_p_room(u)
+            if pr and (not room or str(room).startswith("msg:")):
+                room = pr
+            # proxy link entity'de olabilir
+            if ("hxammo" in u or "dichvu321" in u) and "proxy_url" not in dir():
+                pass
+    except Exception as e:
+        print("[ENTITY PARSE HATA]", repr(e))
+
+    try:
+        print(
+            "[DEBUG MSG]",
+            repr((text or "")[:220]),
+            "| room=", room,
+            "| user=", username,
+            "| ents=",
+            [getattr(e, "url", None) for e in (event.message.entities or [])]
+        )
+    except Exception:
+        pass
+
+
     coins = extract_coins(
         text,
         token_data
@@ -2300,6 +2437,20 @@ def parse_source_message(event):
             ])
         )
 
+    proxy_url = extract_proxy_live_link(text)
+
+    links = get_live_links(
+        username_for_link,
+        room,
+        token_data,
+        proxy_url=proxy_url,
+    )
+
+    if direct_link_url and not is_masked_username(username_for_link):
+        links["user_url"] = direct_link_url or links["user_url"]
+        if not links["primary"]:
+            links["primary"] = direct_link_url
+
     return {
         "type":
             "CHEST",
@@ -2329,12 +2480,31 @@ def parse_source_message(event):
             room,
 
         "live":
-            direct_link_url
-            or get_live_link(
-                username_for_link,
-                room,
-                token_data
-            ),
+            links["primary"] or direct_link_url or "",
+
+        "room_url":
+            links["room_url"],
+
+        "user_url":
+            links["user_url"] or "",
+
+        "token_url":
+            links["token_url"],
+
+        "proxy_url":
+            links.get("proxy_url") or proxy_url or "",
+
+        "deep_url":
+            links.get("deep_url") or "",
+
+        "deep_url_alt":
+            links.get("deep_url_alt") or "",
+
+        "user_url_m":
+            links.get("user_url_m") or "",
+
+        "user_url_enter":
+            links.get("user_url_enter") or "",
 
         "target_time":
             target_time,
@@ -2689,14 +2859,7 @@ async def send_telegram_message(data):
             "\n⚡ YÜKSEK ÖDÜL / AZ KİŞİ"
         )
 
-    if data.get("live"):
-
-        text += (
-            "\n\n🔴 "
-            f'<a href="{data["live"]}">'
-            "TIKTOK CANLI YAYIN"
-            "</a>"
-        )
+    text += format_live_links_html(data)
 
     ok, _ = await telegram_api(
         "sendMessage",
@@ -2779,14 +2942,7 @@ async def send_personal_alarm(
         "\n🚨 Ayarladığın alarma uyuyor!"
     )
 
-    if data.get("live"):
-
-        text += (
-            "\n\n🔴 "
-            f'<a href="{data["live"]}">'
-            "TIKTOK CANLI YAYIN"
-            "</a>"
-        )
+    text += format_live_links_html(data)
 
     ok, _ = await telegram_api(
         "sendMessage",
@@ -2858,14 +3014,7 @@ async def send_follow_notifications(data):
                 "⚡ YÜKSEK ÖDÜL / AZ KİŞİ\n"
             )
 
-        if data.get("live"):
-
-            text += (
-                "\n🔴 "
-                f'<a href="{data["live"]}">'
-                "TIKTOK CANLI YAYIN"
-                "</a>"
-            )
+        text += format_live_links_html(data)
 
         await telegram_api(
             "sendMessage",
