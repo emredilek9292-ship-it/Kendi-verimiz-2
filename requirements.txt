@@ -1,4 +1,3 @@
-telethon
-requests
 aiohttp
+telethon
 python-telegram-bot>=22,<23
