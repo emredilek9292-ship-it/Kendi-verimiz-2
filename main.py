@@ -1,9 +1,10 @@
 """
-Oyun / Airdrop / Bot tanitim radari
-- Grup ID'lerini admin komutlariyla ekle/sil (kod degistirmeden)
-- t.me bot + airdrop linkleri yakalar
-- Gemini ile Turkce ceviri + ozet
-- Sadece ADMIN_CHAT_ID'ye bildirir
+Airdrop / oyun bot radari
+- Telethon: grup dinleme
+- BOT_TOKEN: /add /del /list (Airdrop radar botu uzerinden)
+- Gemini ceviri
+- Sadece admin'e bildirim
+- Render icin PORT uzerinde HTTP (health)
 """
 
 from __future__ import annotations
@@ -17,37 +18,35 @@ import time
 from typing import Optional, Set
 
 import aiohttp
+from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.utils import get_peer_id
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ===================== ENV =====================
 
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or os.getenv("ADMIN_CHAT_ID", "0") or 0)
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or ADMIN_USER_ID or 0)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
-
 DEDUP_TTL = int(os.getenv("DEDUP_TTL", "86400") or 86400)
+PORT = int(os.getenv("PORT", "10000") or 10000)
 
-# Opsiyonel: baslangicta env ile de eklenebilir
-# SOURCE_CHATS_EXTRA=-100111,-100222
 SOURCE_CHATS_EXTRA = os.getenv("SOURCE_CHATS_EXTRA", "").strip()
-
-# Upstash (kalici liste - Render restart sonrasi da kalir)
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 SOURCES_KEY = os.getenv("SOURCES_KEY", "radar:source_chats:v1").strip()
-
-# Yerel yedek dosya (Upstash yoksa)
 SOURCES_FILE = os.getenv("SOURCES_FILE", "/tmp/radar_sources.json")
 
-# main.py icine sabit yazmak istersen (opsiyonel, bos birakilabilir)
-SOURCE_CHATS_STATIC = [
-    # -1001111111111,
-]
+SOURCE_CHATS_STATIC: list = []
 
 # ===================== FILTRE =====================
 
@@ -65,8 +64,8 @@ KEYWORD_RE = re.compile(
     r"airdrop|air\s*drop|claim|whitelist|wl\b|mint|snapshot|"
     r"free\s*token|testnet|mainnet|points|xp\b|quest|campaign|"
     r"bot\b|mini\s*app|telegram\s*bot|play\s*to\s*earn|p2e|"
-    r"razdacha|аирдроп|раздача|квест|"
-    r"ücretsiz|odul|gorev|görev|ödül"
+    r"аирдроп|раздача|квест|"
+    r"ücretsiz|ödül|görev|odul|gorev"
     r")\b",
     re.I,
 )
@@ -76,17 +75,13 @@ BOT_USERNAME_RE = re.compile(
     re.I,
 )
 
-CMD_RE = re.compile(
-    r"^/(add|del|remove|list|help|start|status)\b(?:\s+(.+))?",
-    re.I,
-)
-
 # ===================== STATE =====================
 
 seen: dict[str, float] = {}
-ACTIVE_SOURCES: Set[int] = set()  # chat id'ler (telethon form)
+ACTIVE_SOURCES: Set[int] = set()
 http_session: Optional[aiohttp.ClientSession] = None
-client: Optional[TelegramClient] = None
+tg_client: Optional[TelegramClient] = None
+bot_app: Optional[Application] = None
 
 
 def parse_id_list(raw: str) -> list:
@@ -102,20 +97,33 @@ def parse_id_list(raw: str) -> list:
     return items
 
 
-# ===================== KALICI DEPO =====================
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user or user.id != ADMIN_USER_ID:
+            if update.effective_message:
+                await update.effective_message.reply_text("Yetkin yok.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+# ===================== DEPO =====================
 
 async def upstash_get(key: str) -> Optional[str]:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
     assert http_session is not None
-    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
-        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with http_session.get(
+            f"{UPSTASH_REDIS_REST_URL}/get/{key}",
+            headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
             data = await r.json()
             return data.get("result")
     except Exception as e:
-        print("[UPSTASH GET HATA]", repr(e))
+        print("[UPSTASH GET]", repr(e))
         return None
 
 
@@ -123,24 +131,6 @@ async def upstash_set(key: str, value: str) -> bool:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return False
     assert http_session is not None
-    url = f"{UPSTASH_REDIS_REST_URL}/set/{key}/{aiohttp.client.URL(value, encoded=False)}"
-    # Upstash REST: POST /set/key/value — value path'te sorun cikarabilir; body kullan
-    headers = {
-        "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    try:
-        async with http_session.post(
-            f"{UPSTASH_REDIS_REST_URL}/set/{key}",
-            headers=headers,
-            json={"value": value} if False else None,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            # Upstash pipeline style: /set/key/value with encoded value
-            pass
-    except Exception:
-        pass
-    # dogru yontem: GET-style path encode
     try:
         from urllib.parse import quote
         path_val = quote(value, safe="")
@@ -151,7 +141,7 @@ async def upstash_set(key: str, value: str) -> bool:
         ) as r:
             return r.status < 300
     except Exception as e:
-        print("[UPSTASH SET HATA]", repr(e))
+        print("[UPSTASH SET]", repr(e))
         return False
 
 
@@ -171,12 +161,10 @@ def save_sources_file(items: list):
         with open(SOURCES_FILE, "w", encoding="utf-8") as f:
             json.dump(items, f)
     except Exception as e:
-        print("[FILE SAVE HATA]", repr(e))
+        print("[FILE SAVE]", repr(e))
 
 
 async def persist_sources():
-    """ACTIVE_SOURCES'u kaydet (orijinal girilen degerler icin meta tutulur)."""
-    # id listesi
     items = sorted(ACTIVE_SOURCES)
     save_sources_file(items)
     await upstash_set(SOURCES_KEY, json.dumps(items))
@@ -188,75 +176,45 @@ async def load_persisted_sources() -> list:
         try:
             data = json.loads(raw)
             if isinstance(data, list):
-                print("[KAYNAK] Upstash'ten yuklendi:", len(data))
+                print("[KAYNAK] Upstash:", len(data))
                 return data
         except Exception:
             pass
     data = load_sources_file()
     if data:
-        print("[KAYNAK] Dosyadan yuklendi:", len(data))
+        print("[KAYNAK] Dosya:", len(data))
     return data
 
 
-async def resolve_to_id(item) -> Optional[int]:
-    """username veya id -> telethon chat id."""
-    assert client is not None
-    try:
-        entity = await client.get_entity(item)
-        # Telethon chat_id: kanallarda -100... formuna cevrilir event.chat_id ile uyumlu
-        eid = entity.id
-        # channel/supergroup
-        if hasattr(entity, "megagroup") or getattr(entity, "broadcast", False) or type(entity).__name__ in ("Channel", "Chat"):
-            # event.chat_id genelde -100xxxxxxxxxx
-            if eid > 0:
-                # PeerChannel
-                chat_id = int(f"-100{eid}")
-            else:
-                chat_id = eid
-        else:
-            chat_id = eid
-        # dogrulama: get_entity sonrasi
-        return chat_id
-    except Exception as e:
-        print("[RESOLVE HATA]", item, repr(e))
-        return None
-
-
 async def add_source(item) -> str:
-    assert client is not None
+    assert tg_client is not None
     try:
-        entity = await client.get_entity(item)
+        entity = await tg_client.get_entity(
+            int(item) if str(item).lstrip("-").isdigit() else item
+        )
+        chat_id = get_peer_id(entity)
     except Exception as e:
-        return f"Bulunamadi / uye degilsin: {item}\nHata: {e}"
-
-    # event.chat_id ile eslesmesi icin
-    full = await client.get_input_entity(entity)
-    # gercek chat id'yi bir mesajdan almak zor; Telethon utils
-    from telethon.utils import get_peer_id
-    chat_id = get_peer_id(entity)
+        return f"Bulunamadi / hesap uye degil: {item}\n{e}"
 
     if chat_id in ACTIVE_SOURCES:
-        title = getattr(entity, "title", None) or getattr(entity, "username", None) or chat_id
+        title = getattr(entity, "title", None) or chat_id
         return f"Zaten listede: {title} ({chat_id})"
 
     ACTIVE_SOURCES.add(chat_id)
     await persist_sources()
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or chat_id
-    return f"Eklendi: {title}\nID: {chat_id}\nToplam: {len(ACTIVE_SOURCES)}"
+    return f"Eklendi: {title}\nID: `{chat_id}`\nToplam: {len(ACTIVE_SOURCES)}"
 
 
 async def del_source(item) -> str:
-    from telethon.utils import get_peer_id
-
-    assert client is not None
+    assert tg_client is not None
     try:
-        if isinstance(item, int) or (isinstance(item, str) and re.fullmatch(r"-?\d+", str(item))):
+        if str(item).lstrip("-").isdigit():
             chat_id = int(item)
         else:
-            entity = await client.get_entity(item)
+            entity = await tg_client.get_entity(item)
             chat_id = get_peer_id(entity)
     except Exception as e:
-        # dogrudan id dene
         try:
             chat_id = int(str(item).strip())
         except Exception:
@@ -264,7 +222,6 @@ async def del_source(item) -> str:
 
     if chat_id not in ACTIVE_SOURCES:
         return f"Listede yok: {chat_id}"
-
     ACTIVE_SOURCES.discard(chat_id)
     await persist_sources()
     return f"Silindi: {chat_id}\nToplam: {len(ACTIVE_SOURCES)}"
@@ -272,13 +229,11 @@ async def del_source(item) -> str:
 
 def list_sources_text() -> str:
     if not ACTIVE_SOURCES:
-        return "Liste bos.\nEklemek icin: /add -1001234567890"
+        return "Liste bos.\n\nEkle: /add -1001234567890"
     lines = [f"Dinlenen gruplar ({len(ACTIVE_SOURCES)}):"]
     for i, cid in enumerate(sorted(ACTIVE_SOURCES), 1):
-        lines.append(f"{i}. {cid}")
-    lines.append("")
-    lines.append("Ekle: /add -100...")
-    lines.append("Sil: /del -100...")
+        lines.append(f"{i}. `{cid}`")
+    lines.append("\nEkle: /add -100...\nSil: /del -100...")
     return "\n".join(lines)
 
 
@@ -288,23 +243,16 @@ async def gemini_translate_and_summary(text: str) -> tuple[str, str]:
     text = (text or "").strip()
     if not text:
         return "", ""
-
     if not GEMINI_API_KEY:
-        return text, "(Ceviri yok - GEMINI_API_KEY tanimli degil)"
+        return text, "(Ceviri yok - GEMINI_API_KEY yok)"
 
     prompt = (
         "Asagidaki Telegram tanitim / airdrop / bot mesajini isle.\n"
-        "1) CEVIRI: Metni anlami bozmadan, oldugu gibi Turkce'ye cevir. "
-        "Linkleri ve @kullanici / bot adlarini aynen birak.\n"
-        "2) OZET: En fazla 3 kisa cumle - ne vaat ediyor, ne yapilmali, risk var mi.\n"
-        "Cikti formati tam olarak soyle olsun:\n"
-        "CEVIRI:\n"
-        "...\n"
-        "OZET:\n"
-        "...\n\n"
+        "1) CEVIRI: Metni anlami bozmadan Turkce'ye cevir. Link ve @adlari aynen birak.\n"
+        "2) OZET: En fazla 3 kisa cumle.\n"
+        "Format:\nCEVIRI:\n...\nOZET:\n...\n\n"
         f"MESAJ:\n{text[:6000]}"
     )
-
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -313,38 +261,31 @@ async def gemini_translate_and_summary(text: str) -> tuple[str, str]:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
     }
-
-    global http_session
     assert http_session is not None
-
     try:
         async with http_session.post(
             url, json=payload, timeout=aiohttp.ClientTimeout(total=40)
         ) as resp:
             data = await resp.json()
             if resp.status >= 400:
-                print("[GEMINI HATA]", resp.status, str(data)[:300])
-                return text, f"(Gemini hata {resp.status})"
-
+                print("[GEMINI]", resp.status, str(data)[:200])
+                return text, f"(Gemini {resp.status})"
             parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
             raw = "\n".join(p.get("text", "") for p in parts).strip()
-            if not raw:
-                return text, "(Gemini bos cevap)"
-
             m = re.search(
-                r"(?:CEVIRI|CEVIRİ|ÇEVİRİ)\s*:\s*(.*?)\s*(?:OZET|ÖZET)\s*:\s*(.*)",
+                r"(?:CEVIRI|ÇEVİRİ)\s*:\s*(.*?)\s*(?:OZET|ÖZET)\s*:\s*(.*)",
                 raw,
                 re.I | re.S,
             )
             if m:
                 return m.group(1).strip(), m.group(2).strip()
-            return raw, ""
+            return raw or text, ""
     except Exception as e:
-        print("[GEMINI EXCEPTION]", repr(e))
-        return text, f"(Gemini exception: {e})"
+        print("[GEMINI EX]", repr(e))
+        return text, f"(Gemini hata: {e})"
 
 
-# ===================== YARDIMCI =====================
+# ===================== BILDIRIM =====================
 
 def fingerprint(text: str, links: list[str]) -> str:
     base = "|".join(sorted(links)) if links else text[:400]
@@ -367,11 +308,7 @@ def extract_links(text: str) -> list[str]:
 
 
 def is_interesting(text: str, links: list[str]) -> bool:
-    if links:
-        return True
-    if KEYWORD_RE.search(text or ""):
-        return True
-    return False
+    return bool(links) or bool(KEYWORD_RE.search(text or ""))
 
 
 def extract_bot_usernames(links: list[str]) -> list[str]:
@@ -406,103 +343,36 @@ async def notify_admin(source_title, source_id, text, links, ceviri, ozet):
         lines.append("Ozet:")
         lines.append(ozet)
     lines.append("")
-    lines.append("Turkce ceviri (oldugu gibi):")
+    lines.append("Turkce ceviri:")
     lines.append(ceviri[:3500] if ceviri else "(bos)")
     lines.append("")
-    lines.append("Orijinal (kisaltilmis):")
-    lines.append((text or "")[:1500])
+    lines.append("Orijinal:")
+    lines.append((text or "")[:1200])
 
     msg = "\n".join(lines)
     if len(msg) > 4000:
         msg = msg[:3900] + "\n..."
 
-    assert client is not None
-    await client.send_message(ADMIN_CHAT_ID, msg, link_preview=False)
+    if bot_app and bot_app.bot:
+        await bot_app.bot.send_message(
+            ADMIN_CHAT_ID, msg, disable_web_page_preview=True
+        )
+    elif tg_client:
+        await tg_client.send_message(ADMIN_CHAT_ID, msg, link_preview=False)
     print("[BILDIRIM]", source_title, links[:2])
 
 
-# ===================== HANDLERS =====================
-
-async def on_admin_command(event):
-    """Sadece admin'den gelen /add /del /list komutlari."""
-    if not event.message or not event.message.message:
-        return
-    if event.sender_id != ADMIN_CHAT_ID and event.chat_id != ADMIN_CHAT_ID:
-        return
-
-    text = (event.message.message or "").strip()
-    m = CMD_RE.match(text)
-    if not m:
-        return
-
-    cmd = m.group(1).lower()
-    arg = (m.group(2) or "").strip()
-
-    if cmd in ("help", "start"):
-        await event.respond(
-            "Komutlar:\n"
-            "/add -100123... veya /add @grup\n"
-            "/del -100123...\n"
-            "/list\n"
-            "/status\n\n"
-            "Not: Hesabin o grupta UYE olmali.\n"
-            "Birden fazla: /add -1001 -1002 @grup"
-        )
-        return
-
-    if cmd == "list":
-        await event.respond(list_sources_text())
-        return
-
-    if cmd == "status":
-        await event.respond(
-            f"Durum: aktif\n"
-            f"Dinlenen: {len(ACTIVE_SOURCES)}\n"
-            f"Gemini: {'acik' if GEMINI_API_KEY else 'kapali'}\n"
-            f"Upstash: {'acik' if UPSTASH_REDIS_REST_URL else 'kapali'}"
-        )
-        return
-
-    if cmd == "add":
-        if not arg:
-            await event.respond("Kullanim: /add -1001234567890")
-            return
-        parts = parse_id_list(arg)
-        replies = []
-        for p in parts:
-            replies.append(await add_source(p))
-        await event.respond("\n\n".join(replies)[:4000])
-        return
-
-    if cmd in ("del", "remove"):
-        if not arg:
-            await event.respond("Kullanim: /del -1001234567890")
-            return
-        parts = parse_id_list(arg)
-        replies = []
-        for p in parts:
-            replies.append(await del_source(p))
-        await event.respond("\n\n".join(replies)[:4000])
-        return
-
+# ===================== TELETHON =====================
 
 async def on_group_message(event):
-    """Dinlenen gruplardaki tanitim mesajlari."""
     try:
         if event.chat_id not in ACTIVE_SOURCES:
             return
-        # admin komutlarini gruba yazarsa cift isleme
-        if event.sender_id == ADMIN_CHAT_ID and (event.message.message or "").startswith("/"):
-            return
-
         text = event.message.message or ""
-        extra_urls = []
         for ent in event.message.entities or []:
             u = getattr(ent, "url", None)
             if u:
-                extra_urls.append(str(u))
-        if extra_urls:
-            text = text + "\n" + "\n".join(extra_urls)
+                text = text + "\n" + str(u)
 
         links = extract_links(text)
         if not is_interesting(text, links):
@@ -520,81 +390,168 @@ async def on_group_message(event):
             or getattr(chat, "username", None)
             or str(event.chat_id)
         )
-
         ceviri, ozet = await gemini_translate_and_summary(text)
         await notify_admin(title, event.chat_id, text, links, ceviri, ozet)
     except Exception as e:
-        print("[LISTENER HATA]", repr(e))
+        print("[LISTENER]", repr(e))
+
+
+# ===================== BOT KOMUTLARI =====================
+
+@admin_only
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Airdrop / oyun bot radari\n\n"
+        "Komutlar:\n"
+        "/add -1001234567890\n"
+        "/add -100111 -100222\n"
+        "/del -1001234567890\n"
+        "/list\n"
+        "/status\n\n"
+        "Telethon hesabin dinlenecek grupta UYE olmali."
+    )
+
+
+@admin_only
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+
+@admin_only
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Kullanim:\n/add -1001234567890")
+        return
+    parts = parse_id_list(" ".join(context.args))
+    replies = [await add_source(p) for p in parts]
+    await update.effective_message.reply_text("\n\n".join(replies)[:4000])
+
+
+@admin_only
+async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Kullanim:\n/del -1001234567890")
+        return
+    parts = parse_id_list(" ".join(context.args))
+    replies = [await del_source(p) for p in parts]
+    await update.effective_message.reply_text("\n\n".join(replies)[:4000])
+
+
+@admin_only
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(list_sources_text())
+
+
+@admin_only
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        f"Durum: aktif\n"
+        f"Dinlenen: {len(ACTIVE_SOURCES)}\n"
+        f"Gemini: {'acik' if GEMINI_API_KEY else 'kapali'}\n"
+        f"Upstash: {'acik' if UPSTASH_REDIS_REST_URL else 'kapali'}"
+    )
+
+
+# ===================== HTTP (Render port) =====================
+
+async def handle_health(request):
+    return web.Response(
+        text=f"ok sources={len(ACTIVE_SOURCES)}",
+        content_type="text/plain",
+    )
+
+
+async def start_http():
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"[HTTP] Port {PORT} acik (Render health)")
 
 
 # ===================== MAIN =====================
 
 async def main():
-    global client, http_session
+    global tg_client, http_session, bot_app
 
     if not API_ID or not API_HASH or not STRING_SESSION:
         raise SystemExit("API_ID / API_HASH / STRING_SESSION zorunlu")
-    if not ADMIN_CHAT_ID:
-        raise SystemExit("ADMIN_CHAT_ID zorunlu")
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN zorunlu (Airdrop radar bot)")
+    if not ADMIN_USER_ID:
+        raise SystemExit("ADMIN_USER_ID / ADMIN_CHAT_ID zorunlu")
 
     print("=" * 60)
-    print("OYUN / AIRDROP RADARI")
+    print("AIRDROP RADARI + BOT KOMUTLARI")
     print("=" * 60)
-    print("[KONFIG] ADMIN_CHAT_ID =", ADMIN_CHAT_ID)
+    print("[KONFIG] ADMIN =", ADMIN_USER_ID)
+    print("[KONFIG] PORT =", PORT)
     print("[KONFIG] GEMINI =", "aktif" if GEMINI_API_KEY else "yok")
-    print("[KONFIG] UPSTASH =", "aktif" if UPSTASH_REDIS_REST_URL else "yok")
 
     http_session = aiohttp.ClientSession()
-    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-    await client.start()
-    me = await client.get_me()
-    print("[TELEGRAM] Baglandi:", me.id, getattr(me, "username", None))
 
-    # kayitli + static + env kaynaklari yukle
-    from telethon.utils import get_peer_id
+    # HTTP once - Render port gorsun
+    await start_http()
 
-    seed_items = []
-    seed_items.extend(SOURCE_CHATS_STATIC)
-    seed_items.extend(parse_id_list(SOURCE_CHATS_EXTRA))
-    seed_items.extend(await load_persisted_sources())
+    # Telethon
+    tg_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+    await tg_client.start()
+    me = await tg_client.get_me()
+    print("[TELETHON]", me.id, getattr(me, "username", None))
 
-    for item in seed_items:
+    seed = []
+    seed.extend(SOURCE_CHATS_STATIC)
+    seed.extend(parse_id_list(SOURCE_CHATS_EXTRA))
+    seed.extend(await load_persisted_sources())
+
+    for item in seed:
         try:
-            entity = await client.get_entity(int(item) if str(item).lstrip("-").isdigit() else item)
+            entity = await tg_client.get_entity(
+                int(item) if str(item).lstrip("-").isdigit() else item
+            )
             cid = get_peer_id(entity)
             ACTIVE_SOURCES.add(cid)
-            print("[KAYNAK OK]", item, "->", cid, getattr(entity, "title", None))
+            print("[KAYNAK OK]", item, "->", cid)
         except Exception as e:
-            # ham id olarak dene
             try:
-                cid = int(item)
-                ACTIVE_SOURCES.add(cid)
-                print("[KAYNAK ID]", cid)
+                ACTIVE_SOURCES.add(int(item))
+                print("[KAYNAK ID]", item)
             except Exception:
                 print("[KAYNAK HATA]", item, repr(e))
 
     await persist_sources()
+    tg_client.add_event_handler(on_group_message, events.NewMessage(incoming=True))
 
-    # admin komutlari (ozel chat)
-    client.add_event_handler(
-        on_admin_command,
-        events.NewMessage(from_users=ADMIN_CHAT_ID),
-    )
-    # tum gelen mesajlar - ACTIVE_SOURCES icindeyse isle
-    client.add_event_handler(on_group_message, events.NewMessage(incoming=True))
+    # Bot komutlari
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", cmd_start))
+    bot_app.add_handler(CommandHandler("help", cmd_help))
+    bot_app.add_handler(CommandHandler("yardim", cmd_help))
+    bot_app.add_handler(CommandHandler("add", cmd_add))
+    bot_app.add_handler(CommandHandler("del", cmd_del))
+    bot_app.add_handler(CommandHandler("remove", cmd_del))
+    bot_app.add_handler(CommandHandler("list", cmd_list))
+    bot_app.add_handler(CommandHandler("status", cmd_status))
 
-    await client.send_message(
-        ADMIN_CHAT_ID,
-        "Radar aktif.\n"
-        f"Dinlenen: {len(ACTIVE_SOURCES)} grup\n"
-        f"Gemini: {'acik' if GEMINI_API_KEY else 'kapali'}\n\n"
-        "Grup ekle: /add -1001234567890\n"
-        "Liste: /list\n"
-        "Yardim: /help",
-    )
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling(drop_pending_updates=True)
 
-    print("[HAZIR] Dinleniyor... Komut: /add /del /list")
-    await client.run_until_disconnected()
+    try:
+        await bot_app.bot.send_message(
+            ADMIN_CHAT_ID,
+            f"Radar aktif\nDinlenen: {len(ACTIVE_SOURCES)}\n"
+            f"Gemini: {'acik' if GEMINI_API_KEY else 'kapali'}\n\n"
+            f"/add -100... ile grup ekle",
+        )
+    except Exception as e:
+        print("[ADMIN MSG HATA]", repr(e))
+
+    print("[HAZIR] Bot komutlari + Telethon + HTTP")
+    await tg_client.run_until_disconnected()
 
 
 if __name__ == "__main__":
