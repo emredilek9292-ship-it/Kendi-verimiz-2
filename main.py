@@ -22,8 +22,8 @@ from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ===================== ENV =====================
 
@@ -79,6 +79,7 @@ BOT_USERNAME_RE = re.compile(
 
 seen: dict[str, float] = {}
 ACTIVE_SOURCES: Set[int] = set()
+SOURCE_META: dict[int, str] = {}  # chat_id -> title
 http_session: Optional[aiohttp.ClientSession] = None
 tg_client: Optional[TelegramClient] = None
 bot_app: Optional[Application] = None
@@ -201,8 +202,9 @@ async def add_source(item) -> str:
         return f"Zaten listede: {title} ({chat_id})"
 
     ACTIVE_SOURCES.add(chat_id)
+    title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(chat_id)
+    SOURCE_META[chat_id] = str(title)
     await persist_sources()
-    title = getattr(entity, "title", None) or getattr(entity, "username", None) or chat_id
     return f"Eklendi: {title}\nID: `{chat_id}`\nToplam: {len(ACTIVE_SOURCES)}"
 
 
@@ -222,9 +224,10 @@ async def del_source(item) -> str:
 
     if chat_id not in ACTIVE_SOURCES:
         return f"Listede yok: {chat_id}"
+    title = SOURCE_META.pop(chat_id, str(chat_id))
     ACTIVE_SOURCES.discard(chat_id)
     await persist_sources()
-    return f"Silindi: {chat_id}\nToplam: {len(ACTIVE_SOURCES)}"
+    return f"Silindi: {title}\nID: `{chat_id}`\nToplam: {len(ACTIVE_SOURCES)}"
 
 
 def list_sources_text() -> str:
@@ -232,9 +235,43 @@ def list_sources_text() -> str:
         return "Liste bos.\n\nEkle: /add -1001234567890"
     lines = [f"Dinlenen gruplar ({len(ACTIVE_SOURCES)}):"]
     for i, cid in enumerate(sorted(ACTIVE_SOURCES), 1):
-        lines.append(f"{i}. `{cid}`")
-    lines.append("\nEkle: /add -100...\nSil: /del -100...")
+        name = SOURCE_META.get(cid) or str(cid)
+        lines.append(f"{i}. {name}\n   `{cid}`")
+    lines.append("\nEkle: /add -100...\nSil: /del -100... veya asagidaki buton")
     return "\n".join(lines)
+
+
+async def enrich_source_titles():
+    """Eksik isimleri Telethon ile doldur."""
+    if not tg_client:
+        return
+    for cid in list(ACTIVE_SOURCES):
+        if cid in SOURCE_META and SOURCE_META[cid]:
+            continue
+        try:
+            ent = await tg_client.get_entity(cid)
+            SOURCE_META[cid] = (
+                getattr(ent, "title", None)
+                or getattr(ent, "username", None)
+                or str(cid)
+            )
+        except Exception:
+            SOURCE_META[cid] = str(cid)
+
+
+def build_list_keyboard():
+    rows = []
+    for cid in sorted(ACTIVE_SOURCES):
+        name = SOURCE_META.get(cid) or str(cid)
+        # buton yazisi kisa tut
+        label = name if len(name) <= 28 else name[:25] + "..."
+        rows.append([
+            InlineKeyboardButton(
+                f"Sil: {label}",
+                callback_data=f"del:{cid}",
+            )
+        ])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 # ===================== GEMINI =====================
@@ -439,7 +476,36 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(list_sources_text())
+    await enrich_source_titles()
+    kb = build_list_keyboard()
+    await update.effective_message.reply_text(
+        list_sources_text(),
+        reply_markup=kb,
+    )
+
+
+@admin_only
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    await q.answer()
+    data = q.data
+    if data.startswith("del:"):
+        raw = data[4:]
+        try:
+            cid = int(raw)
+        except ValueError:
+            await q.edit_message_text("Gecersiz ID")
+            return
+        msg = await del_source(cid)
+        await enrich_source_titles()
+        kb = build_list_keyboard()
+        text = msg + "\n\n" + list_sources_text()
+        try:
+            await q.edit_message_text(text[:4000], reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(text[:4000], reply_markup=kb)
 
 
 @admin_only
@@ -514,7 +580,12 @@ async def main():
             )
             cid = get_peer_id(entity)
             ACTIVE_SOURCES.add(cid)
-            print("[KAYNAK OK]", item, "->", cid)
+            SOURCE_META[cid] = (
+                getattr(entity, "title", None)
+                or getattr(entity, "username", None)
+                or str(cid)
+            )
+            print("[KAYNAK OK]", item, "->", cid, SOURCE_META[cid])
         except Exception as e:
             try:
                 ACTIVE_SOURCES.add(int(item))
@@ -535,6 +606,7 @@ async def main():
     bot_app.add_handler(CommandHandler("remove", cmd_del))
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CommandHandler("status", cmd_status))
+    bot_app.add_handler(CallbackQueryHandler(on_callback))
 
     await bot_app.initialize()
     await bot_app.start()
