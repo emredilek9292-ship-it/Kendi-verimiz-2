@@ -83,6 +83,8 @@ SOURCE_META: dict[int, str] = {}  # chat_id -> title
 http_session: Optional[aiohttp.ClientSession] = None
 tg_client: Optional[TelegramClient] = None
 bot_app: Optional[Application] = None
+INSPECT_COOLDOWN: dict[str, float] = {}  # bot username -> last inspect ts
+INSPECT_MIN_INTERVAL = int(os.getenv("INSPECT_MIN_INTERVAL", "120") or 120)
 
 
 def parse_id_list(raw: str) -> list:
@@ -363,6 +365,178 @@ def extract_bot_usernames(links: list[str]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def extract_start_param(links: list[str], bot: str) -> str:
+    bot_l = bot.lower()
+    for u in links:
+        m = re.search(
+            rf"(?:t\.me|telegram\.me)/{re.escape(bot)}\?start=([A-Za-z0-9_\-]+)",
+            u,
+            re.I,
+        )
+        if m:
+            return m.group(1)
+    return ""
+
+
+async def inspect_telegram_bot(bot_username: str, start_param: str = "") -> str:
+    """
+    Bota /start atar, gelen mesajlari okur, ref/gorev ozetler.
+    Kanala katilmaz, gorev yapmaz.
+    """
+    assert tg_client is not None
+    bot_username = bot_username.lstrip("@")
+    now = time.time()
+    last = INSPECT_COOLDOWN.get(bot_username.lower(), 0)
+    if now - last < INSPECT_MIN_INTERVAL:
+        wait = int(INSPECT_MIN_INTERVAL - (now - last))
+        return f"@{bot_username} icin bekle: {wait} sn (limit)"
+
+    INSPECT_COOLDOWN[bot_username.lower()] = now
+
+    try:
+        entity = await tg_client.get_entity(bot_username)
+    except Exception as e:
+        return f"@{bot_username} bulunamadi: {e}"
+
+    # onceki son mesaj id
+    last_id = 0
+    try:
+        async for m in tg_client.iter_messages(entity, limit=1):
+            last_id = m.id
+            break
+    except Exception:
+        pass
+
+    payload = f"/start {start_param}".strip() if start_param else "/start"
+    try:
+        await tg_client.send_message(entity, payload)
+    except Exception as e:
+        return f"@{bot_username} /start gonderilemedi: {e}"
+
+    # cevapları bekle
+    await asyncio.sleep(4)
+    collected_texts = []
+    collected_buttons = []
+    collected_links = []
+
+    try:
+        async for m in tg_client.iter_messages(entity, limit=8):
+            if last_id and m.id <= last_id:
+                break
+            t = m.message or ""
+            if t:
+                collected_texts.append(t)
+                collected_links.extend(extract_links(t))
+            # inline buttons
+            markup = getattr(m, "reply_markup", None)
+            if markup and getattr(markup, "rows", None):
+                for row in markup.rows:
+                    for btn in row.buttons:
+                        label = getattr(btn, "text", None) or ""
+                        url = getattr(btn, "url", None) or ""
+                        if label:
+                            collected_buttons.append(label)
+                        if url:
+                            collected_links.append(url)
+                            collected_buttons.append(f"{label} -> {url}" if label else url)
+    except Exception as e:
+        print("[INSPECT READ]", repr(e))
+
+    if not collected_texts and not collected_buttons:
+        return (
+            f"BOT INCELEME: @{bot_username}\n"
+            f"/start gonderildi ama cevap yok (bot yavas veya engel)."
+        )
+
+    raw_blob = "\n\n".join(collected_texts)[:5000]
+    btn_blob = "\n".join(collected_buttons[:40])
+    link_blob = "\n".join(list(dict.fromkeys(collected_links))[:20])
+
+    # ref adaylari
+    ref_links = []
+    for u in collected_links:
+        if re.search(r"[?&]start=", u, re.I) or "ref" in u.lower():
+            ref_links.append(u)
+
+    summary = ""
+    if GEMINI_API_KEY:
+        prompt = (
+            "Asagida bir Telegram botuna /start sonrasi gelen mesajlar var.\n"
+            "Gorev YAPMA. Sadece analiz et.\n"
+            "Yaz:\n"
+            "1) Bot ne vaat ediyor (1-2 cumle)\n"
+            "2) Gorev listesi (madde madde, varsa)\n"
+            "3) Kanal/grup linkleri\n"
+            "4) YouTube veya dis linkler\n"
+            "5) Referans/start linki varsa belirt\n"
+            "6) Risk notu (seed/cüzdan istiyor mu)\n"
+            "Turkce yaz.\n\n"
+            f"BOT: @{bot_username}\n"
+            f"MESAJLAR:\n{raw_blob}\n\n"
+            f"BUTONLAR:\n{btn_blob}\n\n"
+            f"LINKLER:\n{link_blob}\n"
+        )
+        try:
+            summary, _ = await gemini_translate_and_summary(prompt)
+            # gemini_translate expects CEVIRI format; use raw call better
+        except Exception:
+            summary = ""
+
+    # Gemini ozet icin dogrudan istek
+    if GEMINI_API_KEY:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+        prompt = (
+            "Telegram bot /start sonrasi icerik analizi. Gorev yapma, sadece rapor.\n"
+            "Turkce, kisa:\n"
+            "- Ne vaat ediyor\n- Gorevler (madde)\n- Kanal linkleri\n"
+            "- YouTube/dis linkler\n- Ref/start linki\n- Risk\n\n"
+            f"@{bot_username}\nMESAJ:\n{raw_blob}\nBUTON:\n{btn_blob}\nLINK:\n{link_blob}"
+        )
+        payload_g = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500},
+        }
+        try:
+            assert http_session is not None
+            async with http_session.post(
+                url, json=payload_g, timeout=aiohttp.ClientTimeout(total=40)
+            ) as resp:
+                data = await resp.json()
+                parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                summary = "\n".join(p.get("text", "") for p in parts).strip()
+        except Exception as e:
+            summary = f"(AI ozet yok: {e})"
+
+    lines = [
+        f"BOT INCELEME: @{bot_username}",
+        f"Komut: {payload}",
+        "",
+    ]
+    if summary:
+        lines.append("AI RAPOR:")
+        lines.append(summary)
+        lines.append("")
+    if ref_links:
+        lines.append("Ref / start linkleri:")
+        for u in ref_links[:5]:
+            lines.append(f"- {u}")
+        lines.append("")
+    if collected_buttons:
+        lines.append("Butonlar:")
+        for b in collected_buttons[:15]:
+            lines.append(f"- {b}")
+        lines.append("")
+    lines.append("Ham mesaj (kisaltma):")
+    lines.append(raw_blob[:1500] or "(bos)")
+    lines.append("")
+    lines.append("Not: Kanala otomatik katilim YOK. Link varsa sen katil.")
+
+    return "\n".join(lines)[:4000]
+
+
 async def notify_admin(source_title, source_id, text, links, ceviri, ozet):
     bots = extract_bot_usernames(links)
     lines = [
@@ -381,22 +555,41 @@ async def notify_admin(source_title, source_id, text, links, ceviri, ozet):
         lines.append(ozet)
     lines.append("")
     lines.append("Turkce ceviri:")
-    lines.append(ceviri[:3500] if ceviri else "(bos)")
+    lines.append(ceviri[:2500] if ceviri else "(bos)")
     lines.append("")
     lines.append("Orijinal:")
-    lines.append((text or "")[:1200])
+    lines.append((text or "")[:800])
+    if bots:
+        lines.append("")
+        lines.append("Bot incelemek icin asagidaki butona bas (gorev yapmaz, sadece okur).")
 
     msg = "\n".join(lines)
     if len(msg) > 4000:
         msg = msg[:3900] + "\n..."
 
+    # Inline İncele butonlari
+    rows = []
+    for b in bots[:5]:
+        sp = extract_start_param(links, b)
+        cb = f"ins:{b}:{sp}" if sp else f"ins:{b}"
+        # callback_data max 64 byte
+        if len(cb) > 64:
+            cb = f"ins:{b}"[:64]
+        rows.append([InlineKeyboardButton(f"Incele @{b}", callback_data=cb)])
+        rows.append([InlineKeyboardButton(f"Ac @{b}", url=f"https://t.me/{b}")])
+
+    kb = InlineKeyboardMarkup(rows) if rows else None
+
     if bot_app and bot_app.bot:
         await bot_app.bot.send_message(
-            ADMIN_CHAT_ID, msg, disable_web_page_preview=True
+            ADMIN_CHAT_ID,
+            msg,
+            disable_web_page_preview=True,
+            reply_markup=kb,
         )
     elif tg_client:
         await tg_client.send_message(ADMIN_CHAT_ID, msg, link_preview=False)
-    print("[BILDIRIM]", source_title, links[:2])
+    print("[BILDIRIM]", source_title, links[:2], "bots=", bots)
 
 
 # ===================== TELETHON =====================
@@ -489,9 +682,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data:
         return
-    await q.answer()
     data = q.data
+
     if data.startswith("del:"):
+        await q.answer()
         raw = data[4:]
         try:
             cid = int(raw)
@@ -506,6 +700,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(text[:4000], reply_markup=kb)
         except Exception:
             await q.message.reply_text(text[:4000], reply_markup=kb)
+        return
+
+    if data.startswith("ins:"):
+        await q.answer("Inceleniyor...")
+        parts = data.split(":")
+        bot = parts[1] if len(parts) > 1 else ""
+        start_param = parts[2] if len(parts) > 2 else ""
+        if not bot:
+            await q.message.reply_text("Bot adi yok")
+            return
+        report = await inspect_telegram_bot(bot, start_param)
+        await q.message.reply_text(report[:4000])
+        return
 
 
 @admin_only
