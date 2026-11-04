@@ -1,5 +1,5 @@
 """
-Airdrop / oyun bot radari (v3)
+Airdrop / oyun bot radari (v3 + Groq)
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -45,8 +45,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or os.getenv("ADMIN_CHAT_ID", "0") or 0)
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or ADMIN_USER_ID or 0)
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 DEDUP_TTL = int(os.getenv("DEDUP_TTL", "86400") or 86400)
 PORT = int(os.getenv("PORT", "10000") or 10000)
 
@@ -125,6 +127,7 @@ ACTIONS: dict[str, dict] = {}       # onay bekleyen islemler (bellekte; yeniden 
 ACTION_N = 0
 ROUTINES: dict[str, dict] = {}      # gunluk rutinler (kalici)
 INSPECT_TIMES: list = []
+INSPECT_COOLDOWN: dict = {}
 JOIN_TIMES: list = []
 LAST_INSPECT = 0.0
 http_session: Optional[aiohttp.ClientSession] = None
@@ -377,20 +380,56 @@ INSPECT_PROMPT = (
 )
 
 
-async def gemini_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
-    text = (text or "").strip()
-    if not GEMINI_API_KEY:
-        return "(Ozet yok - GEMINI_API_KEY yok)"
+async def _groq(prompt_full: str):
+    """Groq'tan cevap alir. (metin | None, hata_notu) doner."""
+    assert http_session is not None
+    last = "Groq hata"
+    for attempt in range(2):
+        try:
+            async with http_session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "Kisa net Turkce yaz. Uydurma."},
+                        {"role": "user", "content": prompt_full},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 1024,
+                },
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as resp:
+                data = await resp.json()
+                if resp.status in (429, 500, 502, 503, 504):
+                    print("[GROQ]", resp.status, "tekrar denenecek")
+                    last = f"Groq {resp.status}"
+                    await asyncio.sleep(2 + attempt * 4)
+                    continue
+                if resp.status >= 400:
+                    print("[GROQ]", resp.status, str(data)[:300])
+                    return None, f"Groq {resp.status}"
+                raw = ((data.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
+                return (raw or None), ("" if raw else "Groq bos cevap")
+        except Exception as e:
+            print("[GROQ EX]", repr(e))
+            last = f"Groq {type(e).__name__}"
+            await asyncio.sleep(2)
+    return None, last
+
+
+async def _gemini(prompt_full: str):
+    """Gemini'den cevap alir (yedek). (metin | None, hata_notu) doner."""
+    assert http_session is not None
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {
-        "contents": [{"parts": [{"text": prompt + text[:6000]}]}],
+        "contents": [{"parts": [{"text": prompt_full}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
     }
-    assert http_session is not None
-    last = "(Gemini hata, ozet cikarilamadi)"
+    last = "Gemini hata"
     for attempt in range(3):
         try:
             async with http_session.post(
@@ -399,20 +438,42 @@ async def gemini_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
                 data = await resp.json()
                 if resp.status in (429, 500, 502, 503, 504):
                     print("[GEMINI]", resp.status, "tekrar denenecek")
-                    last = f"(Gemini hatasi {resp.status}, ozet cikarilamadi)"
+                    last = f"Gemini {resp.status}"
                     await asyncio.sleep(3 + attempt * 5)
                     continue
                 if resp.status >= 400:
                     print("[GEMINI]", resp.status, str(data)[:200])
-                    return f"(Gemini hatasi {resp.status}, ozet cikarilamadi)"
+                    return None, f"Gemini {resp.status}"
                 parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
                 raw = "\n".join(p.get("text", "") for p in parts).strip()
-                return raw or "(Ozet bos geldi)"
+                return (raw or None), ("" if raw else "Gemini bos cevap")
         except Exception as e:
             print("[GEMINI EX]", repr(e))
-            last = f"(Gemini hata: {type(e).__name__} {e})"
+            last = f"Gemini {type(e).__name__}"
             await asyncio.sleep(3)
-    return last
+    return None, last
+
+
+async def ai_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
+    """Once Groq, olmazsa Gemini. Basarisizsa '(' ile baslayan kisa bir hata notu doner."""
+    full = prompt + (text or "").strip()[:6000]
+    notes = []
+    if GROQ_API_KEY:
+        raw, note = await _groq(full)
+        if raw:
+            return raw
+        notes.append(note)
+    if GEMINI_API_KEY:
+        raw, note = await _gemini(full)
+        if raw:
+            return raw
+        notes.append(note)
+    if not notes:
+        return "(Ozet yok - GROQ_API_KEY / GEMINI_API_KEY yok)"
+    return "(Ozet cikarilamadi: " + ", ".join(n for n in notes if n) + ")"
+
+
+gemini_guide = ai_guide  # eski ad
 
 
 # ===================== BILDIRIM =====================
@@ -456,7 +517,11 @@ async def notify_admin(source_title, text, bots, links, guide, warn):
     else:
         lines += [f"🔗 {u}" for u in links[:6]]
     lines += ["", "Orijinal mesaj:", (text or "")[:500]]
-    await send_admin("\n".join(lines))
+    rows = []
+    for b in bots[:3]:
+        rows.append([InlineKeyboardButton(f"🔍 İncele @{b}"[:60], callback_data=f"ins:{b}")])
+        rows.append([InlineKeyboardButton(f"🤖 Aç @{b}"[:60], url=f"https://t.me/{b}")])
+    await send_admin("\n".join(lines), InlineKeyboardMarkup(rows) if rows else None)
     print("[BILDIRIM]", source_title, bots or links[:2])
 
 
@@ -542,7 +607,7 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
     labels = [l for l, _ in info["clicks"]] + info["webs"] + info["blocked"] + info["privs"]
     combo = raw_text + "\nBUTONLAR: " + ", ".join(labels)
     warn = [w for w in BAD_WORDS if w in combo.lower()]
-    guide = await gemini_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
+    guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
 
     lines = [f"{header}: @{bot}", ""]
     ozet_yok = (not guide) or guide.startswith("(")
@@ -604,6 +669,12 @@ async def inspect_bot(username: str):
     global LAST_INSPECT
     assert tg_client is not None
     try:
+        t0 = time.time()
+        left = INSPECT_MIN_INTERVAL - (t0 - INSPECT_COOLDOWN.get(username, 0))
+        if left > 0:
+            await send_admin(f"⏳ @{username} az önce incelendi, {int(left)} sn sonra tekrar dene.")
+            return
+        INSPECT_COOLDOWN[username] = t0
         async with INSPECT_LOCK:  # incelemeler sirayla ve aralikli
             now = time.time()
             INSPECT_TIMES[:] = [t for t in INSPECT_TIMES if now - t < 3600]
@@ -618,6 +689,9 @@ async def inspect_bot(username: str):
                 await asyncio.sleep(wait)
             async with TG_LOCK:
                 ent = await resolve_entity(username)
+                if not getattr(ent, "bot", False):
+                    await send_admin(f"ℹ️ @{username} bir bot değil (kanal, grup ya da kişi). /start yazmadım.")
+                    return
                 sent = await tg_client.send_message(ent, "/start")
                 LAST_INSPECT = time.time()
                 INSPECT_TIMES.append(LAST_INSPECT)
@@ -885,6 +959,9 @@ async def recon_game(target: str):
 
         username = target
         ent = await resolve_entity(username)
+        if not getattr(ent, "bot", False):
+            await send_admin(f"ℹ️ @{username} bir bot değil, mini uygulama araması yapmadım.")
+            return
         async with TG_LOCK:
             url, how, pub = await get_webview_url(ent, username)
         lines = [f"🧪 OYUN KEŞFİ: @{username}", how]
@@ -1025,7 +1102,7 @@ async def on_group_message(event):
         title = (
             getattr(chat, "title", None) or getattr(chat, "username", None) or str(event.chat_id)
         )
-        guide = await gemini_guide(text) if len(text.strip()) >= 30 else ""
+        guide = await ai_guide(text) if len(text.strip()) >= 30 else ""
         warn = [w for w in BAD_WORDS if w in text.lower()]
         await notify_admin(title, text, bots, links, guide, warn)
 
@@ -1197,6 +1274,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await q.message.reply_text(text[:4000], reply_markup=kb)
 
+    elif data.startswith("ins:"):
+        await q.answer("İnceleniyor...")
+        name = data[4:].strip().lower()
+        if re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+            spawn(inspect_bot(name))
+            await q.message.reply_text(f"@{name} inceleniyor...")
+
     elif data.startswith("a:"):
         act = ACTIONS.get(data[2:])
         if not act:
@@ -1238,7 +1322,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Mod: {'sadece bot linkleri' if ONLY_BOTS else 'genis filtre'}\n"
         f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
         f"Gunluk rutin: {len(ROUTINES)} ({'acik' if ROUTINES_ON else 'kapali'})\n"
-        f"Gemini: {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
+        f"Groq: {'acik' if GROQ_API_KEY else 'kapali'} ({GROQ_MODEL})\n"
+        f"Gemini (yedek): {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
         f"Upstash: {'acik' if UPSTASH_REDIS_REST_URL else 'kapali'}\n"
         f"Keepalive: {'acik' if (KEEPALIVE and RENDER_URL) else 'kapali'}"
     )
@@ -1294,10 +1379,11 @@ async def main():
     INSPECT_LOCK = asyncio.Lock()
 
     print("=" * 60)
-    print("AIRDROP RADARI v3")
+    print("AIRDROP RADARI v3 + GROQ")
     print("=" * 60)
     print("[KONFIG] ADMIN =", ADMIN_USER_ID)
     print("[KONFIG] PORT =", PORT)
+    print("[KONFIG] GROQ =", GROQ_MODEL if GROQ_API_KEY else "yok")
     print("[KONFIG] GEMINI =", GEMINI_MODEL if GEMINI_API_KEY else "yok")
     print("[KONFIG] MOD =", "sadece bot linkleri" if ONLY_BOTS else "genis filtre")
     print("[KONFIG] INSPECT =", INSPECT, "| RUTIN =", ROUTINES_ON)
@@ -1362,7 +1448,8 @@ async def main():
     try:
         await bot_app.bot.send_message(
             ADMIN_CHAT_ID,
-            f"Radar aktif (v3)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
+            f"Radar aktif (v3 + Groq)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
+            f"Groq: {'acik' if GROQ_API_KEY else 'kapali'}\n"
             f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
             f"Rutin: {len(ROUTINES)}\n\n"
             f"/add -100... ile grup ekle, /incele botadi ile dene",
