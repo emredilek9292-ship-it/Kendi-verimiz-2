@@ -23,7 +23,7 @@ import random
 import re
 import time
 from typing import Optional, Set
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
 from aiohttp import web
@@ -741,17 +741,26 @@ async def get_webview_url(ent, username: str):
 
     notes = []
     msgs = await fetch_incoming(ent, 0, limit=5)
-    shorts, wv_urls = [], []
-    pat = re.compile(r"(?:t\.me|telegram\.me)/" + re.escape(username) + r"/([A-Za-z0-9_]+)", re.I)
+    esc = re.escape(username)
+    pat_short = re.compile(r"(?:t\.me|telegram\.me)/" + esc + r"/([A-Za-z0-9_]+)", re.I)
+    pat_main = re.compile(r"https?://(?:t\.me|telegram\.me)/" + esc + r"/?(?:\?([^#\s]*))?$", re.I)
+    shorts, wv_urls, main_params, seen_btns = [], [], [], []
     for m in msgs:
-        shorts += pat.findall(m.message or "")
+        shorts += pat_short.findall(m.message or "")
         for row in (m.buttons or []):
             for b in row:
-                u = getattr(b, "url", None) or ""
-                if classify_button(b) == "webapp" and u:
+                u = (getattr(b, "url", None) or "").strip()
+                kind = classify_button(b)
+                seen_btns.append(f"{(b.text or '').strip()[:20]} [{kind}]" + (f" {u[:70]}" if u else ""))
+                if kind == "webapp" and u:
                     wv_urls.append(u)
-                shorts += pat.findall(u)
+                shorts += pat_short.findall(u)
+                mm = pat_main.match(u) if u else None
+                if mm:
+                    qs = parse_qs(mm.group(1) or "")
+                    main_params.append((qs.get("startapp") or [None])[0])
 
+    # 1) t.me/bot/kisaad linki ile tanimli mini uygulama
     for sn in dict.fromkeys(shorts):
         try:
             from telethon.tl.types import InputBotAppShortName
@@ -766,6 +775,7 @@ async def get_webview_url(ent, username: str):
         except Exception as e:
             notes.append(f"'{sn}': {type(e).__name__} {e}")
 
+    # 2) mesajdaki mini uygulama (webview) butonu
     for u in dict.fromkeys(wv_urls):
         try:
             res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", url=u))
@@ -773,12 +783,32 @@ async def get_webview_url(ent, username: str):
         except Exception as e:
             notes.append(f"webview butonu: {type(e).__name__} {e}")
 
+    # 3) botun ana mini uygulamasi (profildeki "Uygulamayi ac" / t.me/bot?startapp=...)
+    for sp in list(dict.fromkeys(main_params)) or [None]:
+        try:
+            res = await tg_client(M.RequestMainWebViewRequest(
+                peer=ent, bot=ent, platform="android", start_param=sp))
+            return res.url, "ana mini uygulama açıldı"
+        except AttributeError:
+            notes.append("Telethon sürümü eski (ana mini uygulama desteği yok): "
+                         "requirements.txt'te telethon'u güncelle")
+            break
+        except Exception as e:
+            notes.append(f"ana uygulama: {type(e).__name__} {e}")
+
+    # 4) menu tusu
     try:
         res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", from_bot_menu=True))
         return res.url, "menü tuşundan açıldı"
     except Exception as e:
         notes.append(f"menü tuşu: {type(e).__name__} {e}")
-    return None, "Açılamadı. " + " | ".join(notes)
+
+    msg = "Açılamadı. " + " | ".join(notes)
+    if seen_btns:
+        msg += "\nGördüğüm butonlar: " + "; ".join(seen_btns[:8])
+    else:
+        msg += "\nBotun mesajında hiç buton görmedim."
+    return None, msg
 
 
 async def recon_game(username: str):
