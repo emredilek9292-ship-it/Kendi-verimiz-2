@@ -1,11 +1,16 @@
 """
-Airdrop / oyun bot radari (v3 + Groq)
+Airdrop / oyun bot radari (v3)
 
-- Grup dinleme (Telethon)
-- Bot/airdrop yakalama + Turkce ozet (Groq oncelik, Gemini yedek)
-- /incele : bota /start, cevabi oku, rapor
-- Komutlar: /add /del /list /incele /bil /status
-- Otomatik kanal katilimi YOK
+Otomatik olanlar:
+  - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
+  - Yeni botu bulunca ona /start yazar, cevabini okur, "ne yapilir" raporu atar (INSPECT=1).
+Senin onayinla olanlar (rapordaki butonlar):
+  - Botun mesajindaki bir butona bas
+  - Istenen kanala katil
+  - "Her gun otomatik" rutini ekle (gunde bir /start + o butona basma)
+Yapmadigi seyler: mini uygulama ici gorevler, odeme/cuzdan/deposit butonlari, referans uretme.
+
+Komutlar: /add /del /list  /incele botadi  /rutin  /bil botadi  /status
 """
 
 from __future__ import annotations
@@ -14,14 +19,18 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import re
 import time
 from typing import Optional, Set
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.utils import get_peer_id
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -36,20 +45,22 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or os.getenv("ADMIN_CHAT_ID", "0") or 0)
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or ADMIN_USER_ID or 0)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
 DEDUP_TTL = int(os.getenv("DEDUP_TTL", "86400") or 86400)
 PORT = int(os.getenv("PORT", "10000") or 10000)
 
-ONLY_BOTS = os.getenv("ONLY_BOTS", "0").strip() != "0"
-INSPECT = os.getenv("INSPECT", "1").strip() != "0"
-INSPECT_MIN_INTERVAL = int(os.getenv("INSPECT_MIN_INTERVAL", "120") or 120)
-INSPECT_WAIT = int(os.getenv("INSPECT_WAIT", "7") or 7)
+ONLY_BOTS = os.getenv("ONLY_BOTS", "1").strip() != "0"
 KEEPALIVE = os.getenv("KEEPALIVE", "1").strip() != "0"
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+
+# v3 ayarlari (hepsi istege bagli)
+INSPECT = os.getenv("INSPECT", "1").strip() != "0"                 # yeni botu otomatik incele
+INSPECT_MIN_INTERVAL = int(os.getenv("INSPECT_MIN_INTERVAL", "120") or 120)  # iki inceleme arasi sn
+INSPECT_HOURLY_MAX = int(os.getenv("INSPECT_HOURLY_MAX", "10") or 10)
+INSPECT_WAIT = int(os.getenv("INSPECT_WAIT", "7") or 7)            # /start'tan sonra cevap bekleme sn
+JOIN_DAILY_MAX = int(os.getenv("JOIN_DAILY_MAX", "10") or 10)      # 24 saatte en fazla kanal katilimi
+ROUTINES_ON = os.getenv("ROUTINES", "1").strip() != "0"
 
 SOURCE_CHATS_EXTRA = os.getenv("SOURCE_CHATS_EXTRA", "").strip()
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
@@ -59,24 +70,28 @@ SOURCES_FILE = os.getenv("SOURCES_FILE", "/tmp/radar_sources.json")
 SEEN_KEY = os.getenv("SEEN_KEY", "radar:seen_bots:v1").strip()
 SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/radar_seen.json")
 SEEN_MAX = int(os.getenv("SEEN_MAX", "3000") or 3000)
+ROUTINES_KEY = os.getenv("ROUTINES_KEY", "radar:routines:v1").strip()
+ROUTINES_FILE = os.getenv("ROUTINES_FILE", "/tmp/radar_routines.json")
 
 # ===================== FILTRE =====================
 
-# VictorEmpireBot/app?startapp=... dahil
-BOT_LINK_RE = re.compile(
-    r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,})(?:/app|/start)?(?:\?|/|$|\b)",
+BOT_LINK_RE = re.compile(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{2,}bot)\b", re.I)
+
+# Kanal / grup linkleri (bot olmayanlar): t.me/kanaladi, t.me/+davetkodu, t.me/joinchat/kod
+CH_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/"
+    r"(\+[A-Za-z0-9_-]{6,}|joinchat/[A-Za-z0-9_-]{6,}|[A-Za-z][A-Za-z0-9_]{3,})",
     re.I,
 )
 
 LINK_RE = re.compile(
-    r"(https?://(?:t\.me|telegram\.me)/[A-Za-z0-9_+/.?=&%-]+|"
+    r"(https?://(?:t\.me|telegram\.me)/[A-Za-z0-9_+/]+|"
     r"https?://(?:www\.)?(?:zealy\.io|galxe\.com|questn\.com|layer3\.xyz|"
     r"crew3\.xyz|intract\.io|taskon\.xyz|whop\.com|"
     r"gumroad\.com|linktr\.ee|bit\.ly|tinyurl\.com)/[^\s]+|"
     r"https?://[^\s]*airdrop[^\s]*)",
     re.I,
 )
-
 KEYWORD_RE = re.compile(
     r"\b("
     r"airdrop|air\s*drop|claim|whitelist|wl\b|mint|snapshot|"
@@ -88,26 +103,35 @@ KEYWORD_RE = re.compile(
     re.I,
 )
 
-SKIP_USERNAMES = {
-    "joinchat", "share", "proxy", "socks", "addstickers", "s", "c", "iv", "login",
-}
-
 BAD_WORDS = [
     "seed phrase", "secret phrase", "recovery phrase", "mnemonic",
     "private key", "wallet connect", "connect wallet", "connect your wallet",
     "deposit", "cüzdan bağla", "yatırım yap",
 ]
 
+# Bu kelimeleri iceren butonlara bot ASLA basmaz (ve onay butonu da koymaz)
+DANGER_BTN_RE = re.compile(
+    r"wallet|cüzdan|cuzdan|deposit|withdraw|çekim|cekim|yatır|yatir|buy|satın|satin|"
+    r"\bpay\b|ödeme|odeme|stake|invest|premium|stars|usdt|swap|\bton\b",
+    re.I,
+)
+
 # ===================== STATE =====================
 
 seen: dict[str, float] = {}
 ACTIVE_SOURCES: Set[int] = set()
 SOURCE_META: dict[int, str] = {}
-INSPECT_COOLDOWN: dict[str, float] = {}
+ACTIONS: dict[str, dict] = {}       # onay bekleyen islemler (bellekte; yeniden baslayinca silinir)
+ACTION_N = 0
+ROUTINES: dict[str, dict] = {}      # gunluk rutinler (kalici)
+INSPECT_TIMES: list = []
+JOIN_TIMES: list = []
+LAST_INSPECT = 0.0
 http_session: Optional[aiohttp.ClientSession] = None
 tg_client: Optional[TelegramClient] = None
 bot_app: Optional[Application] = None
-TG_LOCK: Optional[asyncio.Lock] = None
+TG_LOCK: Optional[asyncio.Lock] = None       # Telegram hesabiyla yapilan islemler sirayla
+INSPECT_LOCK: Optional[asyncio.Lock] = None  # incelemeler sirayla + aralikli
 BG_TASKS: list = []
 
 
@@ -142,19 +166,15 @@ def admin_only(func):
     return wrapper
 
 
-def extract_bot_names(text: str) -> list[str]:
-    names = []
-    for m in BOT_LINK_RE.findall(text or ""):
-        name = m.lower().strip()
-        if not name or name in SKIP_USERNAMES or name.startswith("+"):
-            continue
-        names.append(name)
-    # sadece bot benzeri: ...bot ile biter veya startapp/app linkinden geldi
-    out = []
-    for n in names:
-        if n.endswith("bot") or "bot" in n:
-            out.append(n)
-    return list(dict.fromkeys(out))
+def new_action(d: dict) -> str:
+    global ACTION_N
+    ACTION_N += 1
+    aid = str(ACTION_N)
+    ACTIONS[aid] = d
+    if len(ACTIONS) > 400:
+        for k in list(ACTIONS)[:100]:
+            ACTIONS.pop(k, None)
+    return aid
 
 
 # ===================== DEPO =====================
@@ -238,6 +258,17 @@ async def load_seen():
     print("[GORULEN BOT]", sum(1 for k in seen if k.startswith("bot:")))
 
 
+async def persist_routines():
+    await save_json(ROUTINES_KEY, ROUTINES_FILE, ROUTINES)
+
+
+async def load_routines():
+    data = await load_json(ROUTINES_KEY, ROUTINES_FILE)
+    if isinstance(data, dict):
+        ROUTINES.update(data)
+    print("[RUTIN]", len(ROUTINES))
+
+
 # ===================== KAYNAKLAR =====================
 
 async def resolve_entity(item):
@@ -294,7 +325,7 @@ def list_sources_text() -> str:
     for i, cid in enumerate(sorted(ACTIVE_SOURCES), 1):
         name = SOURCE_META.get(cid) or str(cid)
         lines.append(f"{i}. {name}\n   `{cid}`")
-    lines.append("\nEkle: /add -100...\nSil: /del -100... veya buton")
+    lines.append("\nEkle: /add -100...\nSil: /del -100... veya asagidaki buton")
     return "\n".join(lines)
 
 
@@ -322,98 +353,66 @@ def build_list_keyboard():
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-# ===================== AI (Groq + Gemini) =====================
+# ===================== GEMINI =====================
 
 GUIDE_PROMPT = (
-    "Asagidaki Telegram mesaji bir oyun / airdrop botunu tanitiyor. "
-    "Cevabi TURKCE yaz. SADECE mesajdaki bilgiyi kullan, uydurma. Format:\n"
-    "Oyun: <ad>\n"
-    "Ne yapilir: <1-2 cumle>\n"
-    "Baslangic:\n1. ...\n2. ...\n"
-    "Token/airdrop: <varsa / belirsiz>\n"
-    "En fazla 900 karakter.\n\nMESAJ:\n"
+    "Asagidaki Telegram mesaji bir oyun / airdrop botunu tanitiyor. Mesaj HANGI DILDE olursa "
+    "olsun cevabi TURKCE yaz. SADECE mesajdaki bilgiyi kullan, hicbir sey uydurma. Format:\n"
+    "🎮 Oyun: <ad>\n"
+    "📌 Ne yapilir: <1-2 cumle>\n"
+    "👣 Baslangic:\n1. ...\n2. ...\n"
+    "💰 Token/airdrop: <varsa yaz, yoksa 'belirsiz'>\n"
+    "Mesajda bilgi yoksa o satira 'mesajda yok' yaz. En fazla 900 karakter.\n\n"
+    "MESAJ:\n"
 )
 
 INSPECT_PROMPT = (
-    "Asagida bir Telegram botunun /start cevabi ve butonlari var. "
-    "TURKCE yaz, uydurma. Format:\n"
-    "Bu ne: <1 cumle>\n"
-    "Yapilacaklar:\n1. ...\n"
-    "Dikkat: <cuzdan/odeme istiyorsa yaz, yoksa yok>\n"
-    "En fazla 700 karakter.\n\nBILGI:\n"
+    "Asagida bir Telegram oyun/airdrop botunun /start cevabi ve buton adlari var. Metin HANGI "
+    "DILDE olursa olsun cevabi TURKCE yaz. SADECE verilen bilgiyi kullan, uydurma. Format:\n"
+    "🎮 Bu ne: <1 cumle>\n"
+    "✅ Yapilacaklar:\n1. ...\n2. ...\n"
+    "⚠️ Dikkat: <cuzdan / odeme / telefon numarasi / ekstra kanal istiyorsa yaz, yoksa 'yok'>\n"
+    "En fazla 700 karakter.\n\n"
+    "BILGI:\n"
 )
 
 
-async def ai_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
+async def gemini_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
     text = (text or "").strip()
-    if not text:
-        return "(bos)"
-    full_prompt = prompt + text[:6000]
-    assert http_session is not None
-
-    # Groq oncelik
-    if GROQ_API_KEY:
-        try:
-            async with http_session.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "Kisa net Turkce yaz. Uydurma.",
-                        },
-                        {"role": "user", "content": full_prompt},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 1024,
-                },
-                timeout=aiohttp.ClientTimeout(total=45),
-            ) as resp:
-                data = await resp.json()
-                if resp.status < 400:
-                    raw = (
-                        (data.get("choices") or [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                        .strip()
-                    )
-                    if raw:
-                        return raw
-                print("[GROQ]", resp.status, str(data)[:300])
-        except Exception as e:
-            print("[GROQ EX]", repr(e))
-
-    # Gemini yedek
     if not GEMINI_API_KEY:
-        return "(Ozet yok - GROQ/GEMINI key yok veya hata)"
-
+        return "(Ozet yok - GEMINI_API_KEY yok)"
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {
-        "contents": [{"parts": [{"text": full_prompt}]}],
+        "contents": [{"parts": [{"text": prompt + text[:6000]}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
     }
-    try:
-        async with http_session.post(
-            url, json=payload, timeout=aiohttp.ClientTimeout(total=45)
-        ) as resp:
-            data = await resp.json()
-            if resp.status >= 400:
-                print("[GEMINI]", resp.status, str(data)[:250])
-                return f"(Gemini hatasi {resp.status})"
-            parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
-            raw = "\n".join(p.get("text", "") for p in parts).strip()
-            return raw or "(Ozet bos)"
-    except Exception as e:
-        print("[GEMINI EX]", repr(e))
-        return f"(Gemini hata: {type(e).__name__})"
+    assert http_session is not None
+    last = "(Gemini hata, ozet cikarilamadi)"
+    for attempt in range(3):
+        try:
+            async with http_session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=60)
+            ) as resp:
+                data = await resp.json()
+                if resp.status in (429, 500, 502, 503, 504):
+                    print("[GEMINI]", resp.status, "tekrar denenecek")
+                    last = f"(Gemini hatasi {resp.status}, ozet cikarilamadi)"
+                    await asyncio.sleep(3 + attempt * 5)
+                    continue
+                if resp.status >= 400:
+                    print("[GEMINI]", resp.status, str(data)[:200])
+                    return f"(Gemini hatasi {resp.status}, ozet cikarilamadi)"
+                parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                raw = "\n".join(p.get("text", "") for p in parts).strip()
+                return raw or "(Ozet bos geldi)"
+        except Exception as e:
+            print("[GEMINI EX]", repr(e))
+            last = f"(Gemini hata: {type(e).__name__} {e})"
+            await asyncio.sleep(3)
+    return last
 
 
 # ===================== BILDIRIM =====================
@@ -447,99 +446,529 @@ async def send_admin(text: str, kb=None):
 
 
 async def notify_admin(source_title, text, bots, links, guide, warn):
-    lines = ["YENI OYUN / AIRDROP", f"Grup: {source_title}", ""]
-    lines.append(guide or "(Mesajda aciklama yok veya AI ozet yok.)")
+    lines = ["🆕 YENİ OYUN BULUNDU", f"📍 Grup: {source_title}", ""]
+    lines.append(guide or "(Mesajda açıklama yok, sadece link var.)")
     if warn:
-        lines += ["", "Dikkat: " + ", ".join(warn)]
+        lines += ["", "⚠️ Dikkat, mesajda şu ifadeler geçiyor: " + ", ".join(warn)]
     lines.append("")
     if bots:
-        lines += [f"https://t.me/{b}" for b in bots]
+        lines += [f"🔗 https://t.me/{b}" for b in bots]
     else:
-        lines += [f"{u}" for u in links[:6]]
-    lines += ["", "Orijinal:", (text or "")[:500]]
-
-    rows = []
-    for b in bots[:4]:
-        rows.append([InlineKeyboardButton(f"Incele @{b}", callback_data=f"ins:{b}"[:64])])
-        rows.append([InlineKeyboardButton(f"Ac @{b}", url=f"https://t.me/{b}")])
-    kb = InlineKeyboardMarkup(rows) if rows else None
-    await send_admin("\n".join(lines), kb)
+        lines += [f"🔗 {u}" for u in links[:6]]
+    lines += ["", "Orijinal mesaj:", (text or "")[:500]]
+    await send_admin("\n".join(lines))
     print("[BILDIRIM]", source_title, bots or links[:2])
 
 
-# ===================== INCELEME =====================
+# ===================== BOT INCELEME =====================
 
-async def fetch_incoming(entity, min_id: int):
+def raw_url(b) -> str:
+    """Butonun linkini (varsa) dondurur: hem URL hem mini uygulama butonlarinda calisir."""
+    return (getattr(b, "url", None) or getattr(getattr(b, "button", None), "url", None) or "") or ""
+
+
+def classify_button(b) -> str:
+    """Buton turunu ozelliklerinden anlar (Telethon surumu/sinif adlari farkli olsa da calisir)."""
+    raw = getattr(b, "button", None)
+    name = type(raw).__name__.lower()
+    url = raw_url(b)
+    if "webview" in name or "webapp" in name or getattr(raw, "web_app", None):
+        return "webapp"
+    if "request" in name or "phone" in name or "geo" in name or "location" in name or "contact" in name:
+        return "private"
+    if any(x in name for x in ("buy", "game", "copy", "login", "auth", "switch")):
+        return "other"  # odeme, oyun, giris, inline degistirme: basilmaz
+    if url:
+        return "url"
+    if "callback" in name or "inline" in name or name == "keyboardbutton" or getattr(raw, "data", None) is not None:
+        return "click"
+    return "other"
+
+
+def summarize_msgs(msgs, bot: str) -> dict:
+    """msgs: eskiden yeniye. Mesajlardaki metin, buton ve kanal linklerini ayiklar."""
+    texts, webs, blocked, privs, chans = [], [], [], [], []
+    linkbtns, others = [], []
+    total = 0
+    clicks: dict[str, int] = {}  # etiket -> mesaj id (ayni etiket varsa en yenisi)
+    for m in msgs:
+        t = (m.message or "").strip()
+        if t:
+            texts.append(t[:700])
+        urls = [str(e.url) for e in (m.entities or []) if getattr(e, "url", None)]
+        urls.append(t)
+        for row in (m.buttons or []):
+            for b in row:
+                total += 1
+                label = (b.text or "").strip()
+                kind = classify_button(b)
+                if kind == "url":
+                    u0 = raw_url(b)
+                    urls.append(u0)
+                    linkbtns.append((label, u0))
+                elif kind == "other":
+                    others.append((label, type(b.button).__name__))
+                elif kind == "webapp":
+                    webs.append(label)
+                elif kind == "private":
+                    privs.append(label)
+                elif kind == "click" and label:
+                    if DANGER_BTN_RE.search(label):
+                        blocked.append(label)
+                    else:
+                        clicks[label] = m.id
+        for u in urls:
+            for tgt in CH_RE.findall(u):
+                low = tgt.lower()
+                if low.endswith("bot") or low == bot.lower() or low in ("share", "proxy", "socks", "addstickers"):
+                    continue
+                chans.append(tgt)
+    return {
+        "total": total,
+        "linkbtns": linkbtns[:6],
+        "others": others[:6],
+        "texts": texts,
+        "clicks": list(clicks.items()),
+        "webs": list(dict.fromkeys(webs)),
+        "blocked": list(dict.fromkeys(blocked)),
+        "privs": list(dict.fromkeys(privs)),
+        "chans": list(dict.fromkeys(chans))[:4],
+    }
+
+
+async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] = None):
+    info = summarize_msgs(msgs, bot)
+    raw_text = "\n\n".join(info["texts"])
+    labels = [l for l, _ in info["clicks"]] + info["webs"] + info["blocked"] + info["privs"]
+    combo = raw_text + "\nBUTONLAR: " + ", ".join(labels)
+    warn = [w for w in BAD_WORDS if w in combo.lower()]
+    guide = await gemini_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
+
+    lines = [f"{header}: @{bot}", ""]
+    ozet_yok = (not guide) or guide.startswith("(")
+    if ozet_yok:
+        if guide:
+            lines.append(guide)
+        lines.append(("Botun mesajı:\n" + raw_text[:700]) if raw_text else "(Bot metin göndermedi.)")
+    else:
+        lines.append(guide)
+    lines.append(f"ℹ️ Bot {len(msgs)} mesaj gönderdi, mesajlarda {info['total']} buton gördüm.")
+    if info["total"] == 0:
+        lines.append("Not: Çoğu oyun botunun 'Oyna' tuşu mesajda değil, sohbetin altındaki menü tuşunda durur. "
+                     "Onu otomatik göremiyorum.")
+    if info["clicks"]:
+        lines += ["", "▶️ Basılabilir: " + ", ".join(l for l, _ in info["clicks"])]
+    if info["webs"]:
+        lines.append("📱 Mini uygulama (sen açarsın): " + ", ".join(info["webs"]))
+    if info["linkbtns"]:
+        lines.append("🔗 Link butonları: " + " | ".join(f"{l} → {u}" for l, u in info["linkbtns"]))
+    if info["others"]:
+        lines.append("❔ Diğer butonlar: " + ", ".join(f"{l} ({t})" for l, t in info["others"]))
+    if info["blocked"]:
+        lines.append("⛔ Ödeme/cüzdan butonları atlandı: " + ", ".join(info["blocked"]))
+    if info["privs"]:
+        lines.append("🚫 Telefon/konum isteyen buton var: " + ", ".join(info["privs"]))
+    if warn:
+        lines += ["", "⚠️ Dikkat, şu ifadeler geçiyor: " + ", ".join(warn),
+                  "Güvenlik için otomatik işlem butonu koymadım."]
+
+    rows = []
+    if not warn:
+        if routine_label:
+            aid = new_action({"t": "routine", "bot": bot, "label": routine_label})
+            rows.append([InlineKeyboardButton(f"🔁 Her gün otomatik: {routine_label[:22]}", callback_data=f"a:{aid}")])
+        for label, mid in info["clicks"][:8]:
+            aid = new_action({"t": "click", "bot": bot, "msg_id": mid, "label": label})
+            rows.append([InlineKeyboardButton(f"▶️ Bas: {label[:28]}", callback_data=f"a:{aid}")])
+        for tgt in info["chans"]:
+            aid = new_action({"t": "join", "target": tgt})
+            rows.append([InlineKeyboardButton(f"📢 Katıl: {tgt[:22]}", callback_data=f"a:{aid}")])
+    rows.append([InlineKeyboardButton("🤖 Botu aç", url=f"https://t.me/{bot}")])
+    await send_admin("\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def fetch_incoming(ent, after_id: int, limit: int = 8):
     assert tg_client is not None
-    out = []
-    async for m in tg_client.iter_messages(entity, limit=10):
-        if m.id < min_id:
-            break
-        out.append(m)
-    out.reverse()
-    return out
+    msgs = [m for m in await tg_client.get_messages(ent, limit=limit) if not m.out and m.id >= after_id]
+    msgs.reverse()
+    for m in msgs:
+        try:
+            await m.get_buttons()
+        except Exception:
+            pass
+    return msgs
 
 
-async def inspect_bot(bot: str):
-    bot = bot.lstrip("@").lower()
-    now = time.time()
-    last = INSPECT_COOLDOWN.get(bot, 0)
-    if now - last < INSPECT_MIN_INTERVAL:
-        wait = int(INSPECT_MIN_INTERVAL - (now - last))
-        await send_admin(f"@{bot} inceleme limiti: {wait} sn bekle")
-        return
-    INSPECT_COOLDOWN[bot] = now
-
-    assert tg_client is not None and TG_LOCK is not None
+async def inspect_bot(username: str):
+    """Bota /start yazar, cevabini okur, rapor gonderir."""
+    global LAST_INSPECT
+    assert tg_client is not None
     try:
-        async with TG_LOCK:
-            ent = await resolve_entity(bot)
-            sent = await tg_client.send_message(ent, "/start")
-            await asyncio.sleep(INSPECT_WAIT)
-            msgs = await fetch_incoming(ent, sent.id + 1)
-
-        texts = []
-        buttons = []
-        for m in msgs:
-            t = (m.message or "").strip()
-            if t:
-                texts.append(t[:800])
-            for row in m.buttons or []:
-                for b in row:
-                    label = (b.text or "").strip()
-                    url = getattr(b, "url", None) or ""
-                    if label and url:
-                        buttons.append(f"{label} -> {url}")
-                    elif label:
-                        buttons.append(label)
-
-        raw = "\n\n".join(texts) if texts else "(Bot cevap vermedi)"
-        btn_txt = "\n".join(buttons[:20]) if buttons else "(buton yok)"
-        guide = await ai_guide(
-            f"BOT: @{bot}\nMESAJLAR:\n{raw}\n\nBUTONLAR:\n{btn_txt}",
-            INSPECT_PROMPT,
-        )
-
-        lines = [
-            f"INCELEME: @{bot}",
-            "",
-            guide,
-            "",
-            "Botun mesaji:",
-            raw[:1500],
-            "",
-            "Butonlar:",
-            btn_txt[:800],
-            "",
-            "Not: Otomatik katilim/gorev YOK.",
-        ]
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"Botu ac", url=f"https://t.me/{bot}")]]
-        )
-        await send_admin("\n".join(lines), kb)
+        async with INSPECT_LOCK:  # incelemeler sirayla ve aralikli
+            now = time.time()
+            INSPECT_TIMES[:] = [t for t in INSPECT_TIMES if now - t < 3600]
+            if len(INSPECT_TIMES) >= INSPECT_HOURLY_MAX:
+                await send_admin(
+                    f"⏸ @{username} incelenmedi: saatlik limit ({INSPECT_HOURLY_MAX}) doldu.\n"
+                    f"Biraz sonra /incele {username} yaz."
+                )
+                return
+            wait = INSPECT_MIN_INTERVAL - (now - LAST_INSPECT)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            async with TG_LOCK:
+                ent = await resolve_entity(username)
+                sent = await tg_client.send_message(ent, "/start")
+                LAST_INSPECT = time.time()
+                INSPECT_TIMES.append(LAST_INSPECT)
+                await asyncio.sleep(INSPECT_WAIT)
+                msgs = await fetch_incoming(ent, sent.id + 1)
+        if not msgs:
+            await send_admin(f"🔍 @{username} /start'a cevap vermedi.")
+            return
+        await send_report(username, msgs, "🔍 İNCELEME")
     except Exception as e:
         print("[INSPECT]", repr(e))
-        await send_admin(f"@{bot} inceleme hatasi: {type(e).__name__} {e}")
+        try:
+            await send_admin(f"⚠️ @{username} incelenemedi: {e}")
+        except Exception:
+            pass
+
+
+async def do_click(bot: str, msg_id: int, label: str):
+    """Onaylanan butona basar. (yeni_mesajlar, not) doner."""
+    assert tg_client is not None
+    ent = await resolve_entity(bot)
+    msg = await tg_client.get_messages(ent, ids=msg_id)
+    if not msg:
+        return None, "Mesaj bulunamadı (silinmiş olabilir). /incele ile yeniden bak."
+    try:
+        await msg.get_buttons()
+    except Exception:
+        pass
+    labels = [(b.text or "").strip() for row in (msg.buttons or []) for b in row]
+    if label not in labels:
+        return None, "Buton artık yok (bot mesajı değiştirmiş). /incele ile yeniden bak."
+    await asyncio.sleep(random.uniform(1.5, 4))
+    try:
+        await msg.click(filter=lambda b: (b.text or "").strip() == label)
+    except Exception as e:
+        return None, f"Basılamadı: {e}"
+    await asyncio.sleep(4)
+    return await fetch_incoming(ent, msg_id), "ok"
+
+
+async def do_join(target: str) -> str:
+    assert tg_client is not None
+    now = time.time()
+    JOIN_TIMES[:] = [t for t in JOIN_TIMES if now - t < 86400]
+    if len(JOIN_TIMES) >= JOIN_DAILY_MAX:
+        return f"Günlük katılım limiti doldu ({JOIN_DAILY_MAX}). Hesabı korumak için yarın dene."
+    try:
+        await asyncio.sleep(random.uniform(2, 6))
+        if target.startswith("+") or target.lower().startswith("joinchat/"):
+            code = target.lstrip("+")
+            if code.lower().startswith("joinchat/"):
+                code = code[9:]
+            await tg_client(ImportChatInviteRequest(code))
+        else:
+            ent = await tg_client.get_entity(target)
+            await tg_client(JoinChannelRequest(ent))
+        JOIN_TIMES.append(time.time())
+        return "Katıldım ✅"
+    except Exception as e:
+        return f"Katılamadım: {e}"
+
+
+async def handle_action(act: dict):
+    t = act.get("t")
+    if t == "click":
+        async with TG_LOCK:
+            new, note = await do_click(act["bot"], act["msg_id"], act["label"])
+        if new is None:
+            await send_admin(f"⚠️ @{act['bot']}: {note}")
+            return
+        if not new:
+            await send_admin(f"✅ @{act['bot']}: '{act['label']}' basıldı, yeni mesaj gelmedi.")
+            return
+        await send_report(act["bot"], new, f"✅ '{act['label'][:24]}' basıldı → CEVAP",
+                          routine_label=act["label"])
+    elif t == "join":
+        async with TG_LOCK:
+            note = await do_join(act["target"])
+        await send_admin(f"📢 {act['target']}: {note}")
+    elif t == "routine":
+        for r in ROUTINES.values():
+            if r["bot"] == act["bot"] and r["label"] == act["label"]:
+                await send_admin("🔁 Bu rutin zaten var. /rutin ile bak.")
+                return
+        rid = str(int(time.time() * 1000))
+        ROUTINES[rid] = {"bot": act["bot"], "label": act["label"],
+                         "last": time.time(), "jitter": random.randint(0, 1800)}
+        await persist_routines()
+        await send_admin(f"🔁 Rutin eklendi: @{act['bot']} → '{act['label']}' her gün otomatik basılacak.\n"
+                         f"Silmek için /rutin")
+
+
+# ===================== OYUN KESFI (mini uygulama) =====================
+
+DESKTOP_UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
+SCRIPT_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
+HOST_RE = re.compile(r"https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::\d+)?(?:/[A-Za-z0-9_\-./]*)?")
+PATH_RE = re.compile(
+    r"""["'`](/(?:api|v\d|auth|user|users|game|tasks?|claim|mine|mining|farm|reward|daily|upgrade|boost|referral)"""
+    r"""[A-Za-z0-9_\-/.]{0,60})["'`]""",
+    re.I,
+)
+NOISE_HOSTS = (
+    "w3.org", "github.com", "reactjs.org", "fb.me", "google", "gstatic", "telegram.org", "t.me",
+    "cloudflare", "apple.com", "mozilla.org", "npmjs", "sentry", "facebook", "twitter.com", "x.com",
+    "youtube", "unpkg", "jsdelivr", "cdnjs", "yandex", "jquery", "schema.org", "w.org",
+)
+
+
+async def fetch_text(url: str, limit: int = 3_000_000):
+    assert http_session is not None
+    try:
+        async with http_session.get(
+            url, headers={"User-Agent": DESKTOP_UA}, timeout=aiohttp.ClientTimeout(total=25)
+        ) as r:
+            if r.status >= 400:
+                return None
+            data = await r.content.read(limit)
+            return data.decode("utf-8", "ignore")
+    except Exception as e:
+        print("[FETCH]", repr(e))
+        return None
+
+
+async def get_webview_url(ent, username: str):
+    """Mini uygulamayi Telegram'in actigi gibi acar. (adres, aciklama, acik_siteler) doner.
+    Adres kimlik verisi icerir: SADECE bellekte kalir, sohbete yazilmaz."""
+    assert tg_client is not None
+    from telethon.tl.functions import messages as M
+
+    notes = []
+    msgs = await fetch_incoming(ent, 0, limit=5)
+    esc = re.escape(username)
+    pat_short = re.compile(r"(?:t\.me|telegram\.me)/" + esc + r"/([A-Za-z0-9_]+)", re.I)
+    pat_main = re.compile(r"https?://(?:t\.me|telegram\.me)/" + esc + r"/?(?:\?([^#\s]*))?$", re.I)
+    shorts, wv_urls, main_params, seen_btns, pub_urls = [], [], [], [], []
+    for m in msgs:
+        shorts += pat_short.findall(m.message or "")
+        for row in (m.buttons or []):
+            for b in row:
+                u = raw_url(b).strip()
+                kind = classify_button(b)
+                raw = getattr(b, "button", None)
+                desc = f"{(b.text or '').strip()[:20]} [{kind}/{type(raw).__name__}]"
+                if u:
+                    desc += f" {u[:70]}"
+                elif len(seen_btns) < 4:
+                    desc += f" {repr(raw)[:90]}"
+                seen_btns.append(desc)
+                if kind == "webapp" and u:
+                    wv_urls.append(u)
+                shorts += pat_short.findall(u)
+                mm = pat_main.match(u) if u else None
+                if mm:
+                    qs = parse_qs(mm.group(1) or "")
+                    main_params.append((qs.get("startapp") or [None])[0])
+                if u and not re.match(r"https?://(?:t\.me|telegram\.me)/", u, re.I):
+                    pub_urls.append(u)
+    pub_urls = list(dict.fromkeys(pub_urls))
+
+    # 1) t.me/bot/kisaad linki ile tanimli mini uygulama
+    for sn in dict.fromkeys(shorts):
+        try:
+            from telethon.tl.types import InputBotAppShortName
+            from telethon.utils import get_input_user
+            res = await tg_client(M.RequestAppWebViewRequest(
+                peer=ent,
+                app=InputBotAppShortName(bot_id=get_input_user(ent), short_name=sn),
+                platform="android",
+                write_allowed=True,
+            ))
+            return res.url, f"mini uygulama '{sn}' açıldı", pub_urls
+        except Exception as e:
+            notes.append(f"'{sn}': {type(e).__name__} {e}")
+
+    # 2) mesajdaki mini uygulama (webview) butonu
+    for u in dict.fromkeys(wv_urls):
+        try:
+            res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", url=u))
+            return res.url, "mesajdaki mini uygulama butonundan açıldı", pub_urls
+        except Exception as e:
+            notes.append(f"webview butonu: {type(e).__name__} {e}")
+
+    # 3) botun ana mini uygulamasi
+    for sp in list(dict.fromkeys(main_params)) or [None]:
+        try:
+            res = await tg_client(M.RequestMainWebViewRequest(
+                peer=ent, bot=ent, platform="android", start_param=sp))
+            return res.url, "ana mini uygulama açıldı", pub_urls
+        except AttributeError:
+            notes.append("Telethon sürümü eski (ana mini uygulama desteği yok)")
+            break
+        except Exception as e:
+            notes.append(f"ana uygulama: {type(e).__name__} {e}")
+
+    # 4) menu tusu
+    try:
+        res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", from_bot_menu=True))
+        return res.url, "menü tuşundan açıldı", pub_urls
+    except Exception as e:
+        notes.append(f"menü tuşu: {type(e).__name__} {e}")
+
+    msg = "Açılamadı: " + " | ".join(notes)
+    if seen_btns:
+        msg += "\nGördüğüm butonlar: " + "; ".join(seen_btns[:8])
+    else:
+        msg += "\nBotun mesajında hiç buton görmedim."
+    return None, msg, pub_urls
+
+
+async def scan_site(lines: list, pages: list):
+    """Sayfalari ve JS dosyalarini okuyup sunucu adreslerini / API yollarini listeler."""
+    blobs, scripts, ok_pages = [], [], []
+    for pg in pages[:4]:
+        t = await fetch_text(pg)
+        if t:
+            ok_pages.append(pg)
+            blobs.append(t)
+            scripts += [urljoin(pg, x) for x in SCRIPT_RE.findall(t)[:6]]
+    n_html = len(blobs)
+    for sj in list(dict.fromkeys(scripts))[:8]:
+        t = await fetch_text(sj)
+        if t:
+            blobs.append(t)
+    if not blobs:
+        lines.append("Sayfalar indirilemedi.")
+        await send_admin("\n".join(lines))
+        return
+
+    hosts, paths, tg_hint = [], [], False
+    for t in blobs:
+        low = t.lower()
+        if "telegram-web-app" in low or "tgwebapp" in low:
+            tg_hint = True
+        for h in HOST_RE.findall(t):
+            h = h.rstrip(".,;)")
+            if any(n in h.lower() for n in NOISE_HOSTS):
+                continue
+            hosts.append(h[:90])
+        paths += PATH_RE.findall(t)
+    hosts = list(dict.fromkeys(hosts))[:20]
+    paths = list(dict.fromkeys(paths))[:40]
+
+    lines.append("")
+    lines.append("Okunan: " + ", ".join(p.split("?")[0] for p in ok_pages))
+    lines.append(f"Toplam {n_html} sayfa, {len(blobs) - n_html} script okundu")
+    lines.append("Telegram mini uygulaması belirtisi: " + ("var" if tg_hint else "yok"))
+    lines.append("")
+    lines.append("Sunucu adresleri:")
+    lines += [f"- {h}" for h in hosts] or ["- bulunamadı"]
+    lines.append("")
+    lines.append("API yolu adayları:")
+    lines += [f"- {p}" for p in paths] or ["- bulunamadı"]
+    await send_admin("\n".join(lines))
+
+
+async def recon_game(target: str):
+    """target: bot adi (...bot) ya da http(s) adresi."""
+    try:
+        if target.lower().startswith("http"):
+            clean = target.split("#")[0]
+            await scan_site(["🧪 SİTE KEŞFİ", "Adres: " + clean.split("?")[0]], [clean])
+            return
+
+        username = target
+        ent = await resolve_entity(username)
+        async with TG_LOCK:
+            url, how, pub = await get_webview_url(ent, username)
+        lines = [f"🧪 OYUN KEŞFİ: @{username}", how]
+        pages = []
+        if url:
+            base = url.split("#")[0]  # kimlik verisi (#...) asla kullanilmaz / yazilmaz
+            pu = urlparse(base)
+            lines.append(f"Adres: {pu.scheme}://{pu.netloc}{pu.path}")
+            pages.append(base)
+        else:
+            lines.append("Mini uygulamayı açamadım; botun butonlarındaki sitelere bakıyorum.")
+        for u in pub:
+            clean = u.split("#")[0]
+            pu = urlparse(clean)
+            pages += [clean, f"{pu.scheme}://{pu.netloc}/"]
+        pages = list(dict.fromkeys(pages))[:4]
+        if not pages:
+            await send_admin("\n".join(lines))
+            return
+        await scan_site(lines, pages)
+    except Exception as e:
+        print("[RECON]", repr(e))
+        try:
+            await send_admin(f"⚠️ {target} keşfi başarısız: {type(e).__name__} {e}")
+        except Exception:
+            pass
+
+
+# ===================== GUNLUK RUTIN =====================
+
+async def run_routine(r: dict) -> str:
+    assert tg_client is not None
+    async with TG_LOCK:
+        ent = await resolve_entity(r["bot"])
+        sent = await tg_client.send_message(ent, "/start")
+        await asyncio.sleep(INSPECT_WAIT)
+        msgs = await fetch_incoming(ent, sent.id + 1)
+        target = None
+        for m in reversed(msgs):  # en yeniden eskiye
+            for row in (m.buttons or []):
+                for b in row:
+                    if (b.text or "").strip() == r["label"] and classify_button(b) == "click":
+                        target = m
+                        break
+                if target:
+                    break
+            if target:
+                break
+        if not target:
+            return f"❓ @{r['bot']}: '{r['label']}' butonu bulunamadı (bot menüsü değişmiş olabilir)."
+        await asyncio.sleep(random.uniform(1.5, 4))
+        await target.click(filter=lambda b: (b.text or "").strip() == r["label"])
+        await asyncio.sleep(4)
+        after = await fetch_incoming(ent, target.id)
+    snippet = ""
+    for m in reversed(after):
+        if (m.message or "").strip():
+            snippet = m.message.strip()[:300]
+            break
+    return f"✅ @{r['bot']}: '{r['label']}' basıldı.\n{snippet}"
+
+
+async def routine_loop():
+    if not ROUTINES_ON:
+        return
+    await asyncio.sleep(90)
+    while True:
+        try:
+            now = time.time()
+            for rid, r in list(ROUTINES.items()):
+                if now - r.get("last", 0) < 86400 + r.get("jitter", 0):
+                    continue
+                try:
+                    msg = await run_routine(r)
+                except Exception as e:
+                    msg = f"⚠️ Rutin hatası @{r['bot']}: {e}"
+                r["last"] = time.time()
+                r["jitter"] = random.randint(0, 1800)
+                await persist_routines()
+                await send_admin("🔁 GÜNLÜK RUTİN\n" + msg)
+                await asyncio.sleep(random.uniform(20, 60))
+        except Exception as e:
+            print("[ROUTINE LOOP]", repr(e))
+        await asyncio.sleep(1800)
 
 
 # ===================== TELETHON =====================
@@ -556,7 +985,6 @@ async def on_group_message(event):
                 await msg.get_buttons()
             except Exception:
                 pass
-
         extra = []
         for ent in msg.entities or []:
             u = getattr(ent, "url", None)
@@ -569,8 +997,8 @@ async def on_group_message(event):
                     extra.append(str(u))
         full = text + "\n" + "\n".join(extra)
 
-        bots = extract_bot_names(full)
-        links: list = []
+        bots = list(dict.fromkeys(m.lower() for m in BOT_LINK_RE.findall(full)))
+        links = []
 
         if bots:
             yeni = [b for b in bots if f"bot:{b}" not in seen]
@@ -595,14 +1023,13 @@ async def on_group_message(event):
 
         chat = await event.get_chat()
         title = (
-            getattr(chat, "title", None)
-            or getattr(chat, "username", None)
-            or str(event.chat_id)
+            getattr(chat, "title", None) or getattr(chat, "username", None) or str(event.chat_id)
         )
-        guide = await ai_guide(text) if len(text.strip()) >= 20 else ""
+        guide = await gemini_guide(text) if len(text.strip()) >= 30 else ""
         warn = [w for w in BAD_WORDS if w in text.lower()]
         await notify_admin(title, text, bots, links, guide, warn)
 
+        # Otomatik inceleme: botlara /start yazip cevabi oku (grup mesajinda uyari varsa acma)
         if INSPECT and bots and not warn:
             for b in bots:
                 spawn(inspect_bot(b))
@@ -610,19 +1037,22 @@ async def on_group_message(event):
         print("[LISTENER]", repr(e))
 
 
-# ===================== KOMUTLAR =====================
+# ===================== BOT KOMUTLARI =====================
 
 @admin_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Airdrop / oyun bot radari\n\n"
-        "/add -100...\n"
-        "/del -100...\n"
+        "Komutlar:\n"
+        "/add -1001234567890  (grup ekle)\n"
+        "/del -1001234567890\n"
         "/list\n"
-        "/incele botadi\n"
-        "/bil botadi\n"
+        "/incele botadi  (bota /start yaz, cevabı oku, rapor ver)\n"
+        "/oyun botadi  (mini uygulamanın sunucu adreslerini çıkar)\n"
+        "/rutin  (günlük otomatik rutinler)\n"
+        "/bil botadi  (zaten bildiğin oyun, bildirim gelmesin)\n"
         "/status\n\n"
-        "Telethon hesabin grupta UYE olmali."
+        "Telethon hesabin dinlenecek grupta UYE olmali."
     )
 
 
@@ -662,49 +1092,86 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_bil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.effective_message.reply_text("Kullanim:\n/bil victorempirebot")
+        await update.effective_message.reply_text(
+            "Kullanim:\n/bil hamster_kombat_bot blumcryptobot\n(link de yazabilirsin)"
+        )
         return
     eklenen = []
     for a in context.args:
         m = BOT_LINK_RE.search(a)
         name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-        if len(name) >= 3 and name not in SKIP_USERNAMES:
+        if re.fullmatch(r"[a-z0-9_]{2,}bot", name):
             seen[f"bot:{name}"] = time.time()
             eklenen.append(name)
     if eklenen:
         await persist_seen()
         await update.effective_message.reply_text(
-            "Bilinen: " + ", ".join("@" + n for n in eklenen)
+            "Bilinen olarak eklendi: " + ", ".join("@" + n for n in eklenen)
         )
     else:
-        await update.effective_message.reply_text("Gecerli bot adi yok.")
+        await update.effective_message.reply_text("Gecerli bot adi bulunamadi.")
 
 
 @admin_only
 async def cmd_incele(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.effective_message.reply_text("Kullanim:\n/incele victorempirebot")
+        await update.effective_message.reply_text("Kullanim:\n/incele hamster_kombat_bot")
         return
     a = context.args[0]
     m = BOT_LINK_RE.search(a)
     name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-    await update.effective_message.reply_text(f"@{name} inceleniyor...")
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+        return
+    await update.effective_message.reply_text(
+        f"@{name} inceleniyor, 10-20 saniye (sırada başka varsa daha uzun)..."
+    )
     spawn(inspect_bot(name))
 
 
 @admin_only
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n_bots = sum(1 for k in seen if k.startswith("bot:"))
-    await update.effective_message.reply_text(
-        f"Durum: aktif\n"
-        f"Dinlenen: {len(ACTIVE_SOURCES)}\n"
-        f"Gorulen bot: {n_bots}\n"
-        f"Mod: {'sadece bot' if ONLY_BOTS else 'genis filtre'}\n"
-        f"Inceleme: {'acik' if INSPECT else 'kapali'}\n"
-        f"Groq: {'acik' if GROQ_API_KEY else 'kapali'} ({GROQ_MODEL})\n"
-        f"Gemini: {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
-        f"Upstash: {'acik' if UPSTASH_REDIS_REST_URL else 'kapali'}"
-    )
+async def cmd_oyun(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Kullanim:\n/oyun lootvaultdexbot\nveya bir site adresi:\n/oyun https://lootvault.lol")
+        return
+    a = context.args[0]
+    if a.lower().startswith("http"):
+        await update.effective_message.reply_text("Site inceleniyor, 20-40 saniye...")
+        spawn(recon_game(a))
+        return
+    m = BOT_LINK_RE.search(a)
+    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten) ya da http adresi.")
+        return
+    await update.effective_message.reply_text(f"@{name} inceleniyor, 20-40 saniye...")
+    spawn(recon_game(name))
+
+
+def routines_text_and_kb():
+    if not ROUTINES:
+        return "Rutin yok.\n\nBir botu /incele ile incele, bir butona bas, çıkan\n'🔁 Her gün otomatik' butonuna dokun.", None
+    lines = [f"Günlük rutinler ({len(ROUTINES)}):"]
+    rows = []
+    for rid, r in ROUTINES.items():
+        lines.append(f"- @{r['bot']} → '{r['label']}'")
+        rows.append([InlineKeyboardButton(f"Sil: {r['bot'][:14]} / {r['label'][:14]}", callback_data=f"rd:{rid}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+@admin_only
+async def cmd_rutin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = routines_text_and_kb()
+    await update.effective_message.reply_text(text, reply_markup=kb)
+
+
+def kb_without(markup, data: str):
+    if not markup:
+        return None
+    rows = [[b for b in row if b.callback_data != data] for row in markup.inline_keyboard]
+    rows = [r for r in rows if r]
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 @admin_only
@@ -729,20 +1196,55 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(text[:4000], reply_markup=kb)
         except Exception:
             await q.message.reply_text(text[:4000], reply_markup=kb)
-        return
 
-    if data.startswith("ins:"):
-        await q.answer("Inceleniyor...")
-        bot = data[4:].strip().lower()
-        if bot:
-            spawn(inspect_bot(bot))
-            await q.message.reply_text(f"@{bot} inceleme basladi...")
-        return
+    elif data.startswith("a:"):
+        act = ACTIONS.get(data[2:])
+        if not act:
+            await q.answer("Bu buton eskimiş.", show_alert=True)
+            await q.message.reply_text("Bu işlemin süresi dolmuş (servis yeniden başlamış olabilir). "
+                                       "/incele botadi ile yeniden bak.")
+            return
+        await q.answer("İşleniyor...")
+        try:
+            await q.edit_message_reply_markup(reply_markup=kb_without(q.message.reply_markup, data))
+        except Exception:
+            pass
+        try:
+            await handle_action(act)
+        except Exception as e:
+            print("[ACTION]", repr(e))
+            await send_admin(f"⚠️ İşlem hatası: {e}")
 
-    await q.answer()
+    elif data.startswith("rd:"):
+        await q.answer()
+        ROUTINES.pop(data[3:], None)
+        await persist_routines()
+        text, kb = routines_text_and_kb()
+        try:
+            await q.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(text, reply_markup=kb)
+    else:
+        await q.answer()
 
 
-# ===================== HTTP =====================
+@admin_only
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n_bots = sum(1 for k in seen if k.startswith("bot:"))
+    await update.effective_message.reply_text(
+        f"Durum: aktif\n"
+        f"Dinlenen: {len(ACTIVE_SOURCES)}\n"
+        f"Gorulen/bilinen bot: {n_bots}\n"
+        f"Mod: {'sadece bot linkleri' if ONLY_BOTS else 'genis filtre'}\n"
+        f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
+        f"Gunluk rutin: {len(ROUTINES)} ({'acik' if ROUTINES_ON else 'kapali'})\n"
+        f"Gemini: {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
+        f"Upstash: {'acik' if UPSTASH_REDIS_REST_URL else 'kapali'}\n"
+        f"Keepalive: {'acik' if (KEEPALIVE and RENDER_URL) else 'kapali'}"
+    )
+
+
+# ===================== HTTP (Render port) =====================
 
 async def handle_health(request):
     return web.Response(text=f"ok sources={len(ACTIVE_SOURCES)}", content_type="text/plain")
@@ -756,14 +1258,14 @@ async def start_http():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"[HTTP] Port {PORT}")
+    print(f"[HTTP] Port {PORT} acik (Render health)")
 
 
 async def keepalive_loop():
     if not (KEEPALIVE and RENDER_URL):
         print("[KEEPALIVE] kapali")
         return
-    print("[KEEPALIVE]", RENDER_URL)
+    print("[KEEPALIVE] acik:", RENDER_URL)
     while True:
         await asyncio.sleep(600)
         try:
@@ -773,31 +1275,32 @@ async def keepalive_loop():
             ) as r:
                 await r.read()
         except Exception as e:
-            print("[KEEPALIVE]", repr(e))
+            print("[KEEPALIVE HATA]", repr(e))
 
 
 # ===================== MAIN =====================
 
 async def main():
-    global tg_client, http_session, bot_app, TG_LOCK
+    global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK
 
     if not API_ID or not API_HASH or not STRING_SESSION:
         raise SystemExit("API_ID / API_HASH / STRING_SESSION zorunlu")
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN zorunlu")
+        raise SystemExit("BOT_TOKEN zorunlu (Airdrop radar bot)")
     if not ADMIN_USER_ID:
-        raise SystemExit("ADMIN_USER_ID zorunlu")
+        raise SystemExit("ADMIN_USER_ID / ADMIN_CHAT_ID zorunlu")
 
     TG_LOCK = asyncio.Lock()
+    INSPECT_LOCK = asyncio.Lock()
 
     print("=" * 60)
-    print("AIRDROP RADARI v3 + GROQ")
+    print("AIRDROP RADARI v3")
     print("=" * 60)
     print("[KONFIG] ADMIN =", ADMIN_USER_ID)
-    print("[KONFIG] GROQ =", "aktif" if GROQ_API_KEY else "yok", GROQ_MODEL)
-    print("[KONFIG] GEMINI =", "aktif" if GEMINI_API_KEY else "yok", GEMINI_MODEL)
-    print("[KONFIG] MOD =", "sadece bot" if ONLY_BOTS else "genis filtre")
-    print("[KONFIG] INSPECT =", INSPECT)
+    print("[KONFIG] PORT =", PORT)
+    print("[KONFIG] GEMINI =", GEMINI_MODEL if GEMINI_API_KEY else "yok")
+    print("[KONFIG] MOD =", "sadece bot linkleri" if ONLY_BOTS else "genis filtre")
+    print("[KONFIG] INSPECT =", INSPECT, "| RUTIN =", ROUTINES_ON)
 
     http_session = aiohttp.ClientSession()
     await start_http()
@@ -807,20 +1310,21 @@ async def main():
     me = await tg_client.get_me()
     print("[TELETHON]", me.id, getattr(me, "username", None))
     await tg_client.get_dialogs()
+
     await load_seen()
+    await load_routines()
 
     seed = []
     seed.extend(parse_id_list(SOURCE_CHATS_EXTRA))
     seed.extend(await load_persisted_sources())
+
     for item in seed:
         try:
             entity = await resolve_entity(item)
             cid = get_peer_id(entity)
             ACTIVE_SOURCES.add(cid)
             SOURCE_META[cid] = (
-                getattr(entity, "title", None)
-                or getattr(entity, "username", None)
-                or str(cid)
+                getattr(entity, "title", None) or getattr(entity, "username", None) or str(cid)
             )
             print("[KAYNAK OK]", item, "->", cid, SOURCE_META[cid])
         except Exception as e:
@@ -843,6 +1347,8 @@ async def main():
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CommandHandler("bil", cmd_bil))
     bot_app.add_handler(CommandHandler("incele", cmd_incele))
+    bot_app.add_handler(CommandHandler("oyun", cmd_oyun))
+    bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
     bot_app.add_handler(CommandHandler("status", cmd_status))
     bot_app.add_handler(CallbackQueryHandler(on_callback))
 
@@ -851,18 +1357,20 @@ async def main():
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
     spawn(keepalive_loop())
+    spawn(routine_loop())
 
     try:
         await bot_app.bot.send_message(
             ADMIN_CHAT_ID,
-            f"Radar aktif (Groq)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
-            f"Groq: {'acik' if GROQ_API_KEY else 'kapali'}\n"
-            f"/incele botadi ile dene",
+            f"Radar aktif (v3)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
+            f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
+            f"Rutin: {len(ROUTINES)}\n\n"
+            f"/add -100... ile grup ekle, /incele botadi ile dene",
         )
     except Exception as e:
-        print("[ADMIN MSG]", repr(e))
+        print("[ADMIN MSG HATA]", repr(e))
 
-    print("[HAZIR]")
+    print("[HAZIR] Bot komutlari + Telethon + HTTP")
     await tg_client.run_until_disconnected()
 
 
