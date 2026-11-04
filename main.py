@@ -28,7 +28,6 @@ import aiohttp
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl import types as T
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.utils import get_peer_id
@@ -453,27 +452,18 @@ async def notify_admin(source_title, text, bots, links, guide, warn):
 
 # ===================== BOT INCELEME =====================
 
-WEBVIEW_TYPES = tuple(
-    t for t in (getattr(T, "KeyboardButtonWebView", None),
-                getattr(T, "KeyboardButtonSimpleWebView", None)) if t
-)
-PRIVATE_TYPES = tuple(
-    t for t in (getattr(T, "KeyboardButtonRequestPhone", None),
-                getattr(T, "KeyboardButtonRequestGeoLocation", None)) if t
-)
-
-
 def classify_button(b) -> str:
-    raw = b.button
-    if WEBVIEW_TYPES and isinstance(raw, WEBVIEW_TYPES):
+    """Buton turunu sinif adindan anlar (Telethon surumunden bagimsiz)."""
+    name = type(b.button).__name__
+    if name in ("KeyboardButtonWebView", "KeyboardButtonSimpleWebView"):
         return "webapp"
-    if isinstance(raw, T.KeyboardButtonUrl):
+    if name in ("KeyboardButtonUrl", "KeyboardButtonUrlAuth"):
         return "url"
-    if PRIVATE_TYPES and isinstance(raw, PRIVATE_TYPES):
+    if name in ("KeyboardButtonRequestPhone", "KeyboardButtonRequestGeoLocation"):
         return "private"
-    if isinstance(raw, (T.KeyboardButtonCallback, T.KeyboardButton)):
+    if name in ("KeyboardButtonCallback", "KeyboardButton"):
         return "click"
-    return "other"
+    return "other"  # odeme (Buy), oyun vb.: basilmaz
 
 
 def summarize_msgs(msgs, bot: str) -> dict:
@@ -558,6 +548,11 @@ async def fetch_incoming(ent, after_id: int, limit: int = 8):
     assert tg_client is not None
     msgs = [m for m in await tg_client.get_messages(ent, limit=limit) if not m.out and m.id >= after_id]
     msgs.reverse()
+    for m in msgs:
+        try:
+            await m.get_buttons()
+        except Exception:
+            pass
     return msgs
 
 
@@ -604,6 +599,10 @@ async def do_click(bot: str, msg_id: int, label: str):
     msg = await tg_client.get_messages(ent, ids=msg_id)
     if not msg:
         return None, "Mesaj bulunamadı (silinmiş olabilir). /incele ile yeniden bak."
+    try:
+        await msg.get_buttons()
+    except Exception:
+        pass
     labels = [(b.text or "").strip() for row in (msg.buttons or []) for b in row]
     if label not in labels:
         return None, "Buton artık yok (bot mesajı değiştirmiş). /incele ile yeniden bak."
@@ -735,6 +734,11 @@ async def on_group_message(event):
         msg = event.message
         text = msg.message or ""
 
+        if msg.reply_markup:
+            try:
+                await msg.get_buttons()
+            except Exception:
+                pass
         extra = []
         for ent in msg.entities or []:
             u = getattr(ent, "url", None)
