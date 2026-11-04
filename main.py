@@ -23,6 +23,7 @@ import random
 import re
 import time
 from typing import Optional, Set
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from aiohttp import web
@@ -393,7 +394,7 @@ async def gemini_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
     for attempt in range(3):
         try:
             async with http_session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=40)
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=60)
             ) as resp:
                 data = await resp.json()
                 if resp.status in (429, 500, 502, 503, 504):
@@ -409,7 +410,7 @@ async def gemini_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
                 return raw or "(Ozet bos geldi)"
         except Exception as e:
             print("[GEMINI EX]", repr(e))
-            last = f"(Gemini hata: {e})"
+            last = f"(Gemini hata: {type(e).__name__} {e})"
             await asyncio.sleep(3)
     return last
 
@@ -478,6 +479,7 @@ def classify_button(b) -> str:
 def summarize_msgs(msgs, bot: str) -> dict:
     """msgs: eskiden yeniye. Mesajlardaki metin, buton ve kanal linklerini ayiklar."""
     texts, webs, blocked, privs, chans = [], [], [], [], []
+    linkbtns, others = [], []
     total = 0
     clicks: dict[str, int] = {}  # etiket -> mesaj id (ayni etiket varsa en yenisi)
     for m in msgs:
@@ -493,6 +495,9 @@ def summarize_msgs(msgs, bot: str) -> dict:
                 kind = classify_button(b)
                 if kind == "url" and getattr(b, "url", None):
                     urls.append(b.url)
+                    linkbtns.append((label, b.url))
+                elif kind == "other":
+                    others.append((label, type(b.button).__name__))
                 elif kind == "webapp":
                     webs.append(label)
                 elif kind == "private":
@@ -510,6 +515,8 @@ def summarize_msgs(msgs, bot: str) -> dict:
                 chans.append(tgt)
     return {
         "total": total,
+        "linkbtns": linkbtns[:6],
+        "others": others[:6],
         "texts": texts,
         "clicks": list(clicks.items()),
         "webs": list(dict.fromkeys(webs)),
@@ -543,6 +550,10 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
         lines += ["", "▶️ Basılabilir: " + ", ".join(l for l, _ in info["clicks"])]
     if info["webs"]:
         lines.append("📱 Mini uygulama (sen açarsın): " + ", ".join(info["webs"]))
+    if info["linkbtns"]:
+        lines.append("🔗 Link butonları: " + " | ".join(f"{l} → {u}" for l, u in info["linkbtns"]))
+    if info["others"]:
+        lines.append("❔ Diğer butonlar: " + ", ".join(f"{l} ({t})" for l, t in info["others"]))
     if info["blocked"]:
         lines.append("⛔ Ödeme/cüzdan butonları atlandı: " + ", ".join(info["blocked"]))
     if info["privs"]:
@@ -689,6 +700,140 @@ async def handle_action(act: dict):
                          f"Silmek için /rutin")
 
 
+# ===================== OYUN KESFI (mini uygulama) =====================
+
+DESKTOP_UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
+SCRIPT_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
+HOST_RE = re.compile(r"https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::\d+)?(?:/[A-Za-z0-9_\-./]*)?")
+PATH_RE = re.compile(
+    r"""["'`](/(?:api|v\d|auth|user|users|game|tasks?|claim|mine|mining|farm|reward|daily|upgrade|boost|referral)"""
+    r"""[A-Za-z0-9_\-/.]{0,60})["'`]""",
+    re.I,
+)
+NOISE_HOSTS = (
+    "w3.org", "github.com", "reactjs.org", "fb.me", "google", "gstatic", "telegram.org", "t.me",
+    "cloudflare", "apple.com", "mozilla.org", "npmjs", "sentry", "facebook", "twitter.com", "x.com",
+    "youtube", "unpkg", "jsdelivr", "cdnjs", "yandex", "jquery", "schema.org", "w.org",
+)
+
+
+async def fetch_text(url: str, limit: int = 3_000_000):
+    assert http_session is not None
+    try:
+        async with http_session.get(
+            url, headers={"User-Agent": DESKTOP_UA}, timeout=aiohttp.ClientTimeout(total=25)
+        ) as r:
+            if r.status >= 400:
+                return None
+            data = await r.content.read(limit)
+            return data.decode("utf-8", "ignore")
+    except Exception as e:
+        print("[FETCH]", repr(e))
+        return None
+
+
+async def get_webview_url(ent, username: str):
+    """Mini uygulamayi Telegram'in actigi gibi acar. (adres, aciklama) doner.
+    Adres kimlik verisi icerir: SADECE bellekte kalir, sohbete yazilmaz."""
+    assert tg_client is not None
+    from telethon.tl.functions import messages as M
+
+    notes = []
+    msgs = await fetch_incoming(ent, 0, limit=5)
+    shorts, wv_urls = [], []
+    pat = re.compile(r"(?:t\.me|telegram\.me)/" + re.escape(username) + r"/([A-Za-z0-9_]+)", re.I)
+    for m in msgs:
+        shorts += pat.findall(m.message or "")
+        for row in (m.buttons or []):
+            for b in row:
+                u = getattr(b, "url", None) or ""
+                if classify_button(b) == "webapp" and u:
+                    wv_urls.append(u)
+                shorts += pat.findall(u)
+
+    for sn in dict.fromkeys(shorts):
+        try:
+            from telethon.tl.types import InputBotAppShortName
+            from telethon.utils import get_input_user
+            res = await tg_client(M.RequestAppWebViewRequest(
+                peer=ent,
+                app=InputBotAppShortName(bot_id=get_input_user(ent), short_name=sn),
+                platform="android",
+                write_allowed=True,
+            ))
+            return res.url, f"mini uygulama '{sn}' açıldı"
+        except Exception as e:
+            notes.append(f"'{sn}': {type(e).__name__} {e}")
+
+    for u in dict.fromkeys(wv_urls):
+        try:
+            res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", url=u))
+            return res.url, "mesajdaki mini uygulama butonundan açıldı"
+        except Exception as e:
+            notes.append(f"webview butonu: {type(e).__name__} {e}")
+
+    try:
+        res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", from_bot_menu=True))
+        return res.url, "menü tuşundan açıldı"
+    except Exception as e:
+        notes.append(f"menü tuşu: {type(e).__name__} {e}")
+    return None, "Açılamadı. " + " | ".join(notes)
+
+
+async def recon_game(username: str):
+    """Mini uygulamanin sayfasini ve JS dosyalarini okuyup API adreslerini listeler."""
+    try:
+        ent = await resolve_entity(username)
+        async with TG_LOCK:
+            url, how = await get_webview_url(ent, username)
+        if not url:
+            await send_admin(f"🧪 @{username}: mini uygulama açılamadı.\n{how}")
+            return
+        base = url.split("#")[0]  # kimlik verisi (#...) asla kullanilmaz / yazilmaz
+        pu = urlparse(base)
+        shown = f"{pu.scheme}://{pu.netloc}{pu.path}"
+        lines = [f"🧪 OYUN KEŞFİ: @{username}", how, f"Adres: {shown}"]
+
+        html_text = await fetch_text(base)
+        if not html_text:
+            lines.append("Sayfa indirilemedi.")
+            await send_admin("\n".join(lines))
+            return
+        scripts = [urljoin(base, x) for x in SCRIPT_RE.findall(html_text)]
+        blobs = [html_text]
+        for sj in scripts[:5]:
+            t = await fetch_text(sj)
+            if t:
+                blobs.append(t)
+
+        hosts, paths = [], []
+        for t in blobs:
+            for h in HOST_RE.findall(t):
+                h = h.rstrip(".,;)")
+                if any(n in h.lower() for n in NOISE_HOSTS):
+                    continue
+                hosts.append(h[:90])
+            paths += PATH_RE.findall(t)
+        hosts = list(dict.fromkeys(hosts))[:20]
+        paths = list(dict.fromkeys(paths))[:40]
+
+        lines.append(f"Okunan dosya: {len(blobs)} ({len(scripts)} script bulundu)")
+        lines.append("")
+        lines.append("Sunucu adresleri:")
+        lines += [f"- {h}" for h in hosts] or ["- bulunamadı"]
+        lines.append("")
+        lines.append("API yolu adayları:")
+        lines += [f"- {p}" for p in paths] or ["- bulunamadı"]
+        await send_admin("\n".join(lines))
+    except Exception as e:
+        print("[RECON]", repr(e))
+        try:
+            await send_admin(f"⚠️ @{username} keşfi başarısız: {type(e).__name__} {e}")
+        except Exception:
+            pass
+
+
 # ===================== GUNLUK RUTIN =====================
 
 async def run_routine(r: dict) -> str:
@@ -824,6 +969,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/del -1001234567890\n"
         "/list\n"
         "/incele botadi  (bota /start yaz, cevabı oku, rapor ver)\n"
+        "/oyun botadi  (mini uygulamanın sunucu adreslerini çıkar)\n"
         "/rutin  (günlük otomatik rutinler)\n"
         "/bil botadi  (zaten bildiğin oyun, bildirim gelmesin)\n"
         "/status\n\n"
@@ -902,6 +1048,21 @@ async def cmd_incele(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"@{name} inceleniyor, 10-20 saniye (sırada başka varsa daha uzun)..."
     )
     spawn(inspect_bot(name))
+
+
+@admin_only
+async def cmd_oyun(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Kullanim:\n/oyun lootvaultdexbot")
+        return
+    a = context.args[0]
+    m = BOT_LINK_RE.search(a)
+    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+        return
+    await update.effective_message.reply_text(f"@{name} mini uygulaması açılıp inceleniyor, 20-40 saniye...")
+    spawn(recon_game(name))
 
 
 def routines_text_and_kb():
@@ -1102,6 +1263,7 @@ async def main():
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CommandHandler("bil", cmd_bil))
     bot_app.add_handler(CommandHandler("incele", cmd_incele))
+    bot_app.add_handler(CommandHandler("oyun", cmd_oyun))
     bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
     bot_app.add_handler(CommandHandler("status", cmd_status))
     bot_app.add_handler(CallbackQueryHandler(on_callback))
