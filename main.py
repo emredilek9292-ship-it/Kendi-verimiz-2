@@ -61,7 +61,7 @@ INSPECT = os.getenv("INSPECT", "1").strip() != "0"                 # yeni botu o
 INSPECT_MIN_INTERVAL = int(os.getenv("INSPECT_MIN_INTERVAL", "120") or 120)  # iki inceleme arasi sn
 INSPECT_HOURLY_MAX = int(os.getenv("INSPECT_HOURLY_MAX", "10") or 10)
 INSPECT_WAIT = int(os.getenv("INSPECT_WAIT", "7") or 7)            # /start'tan sonra cevap bekleme sn
-JOIN_DAILY_MAX = int(os.getenv("JOIN_DAILY_MAX", "10") or 10)      # 24 saatte en fazla kanal katilimi
+JOIN_DAILY_MAX = int(os.getenv("JOIN_DAILY_MAX", "0") or 0)        # 24 saatte en fazla kanal katilimi (0 = sinirsiz)
 ROUTINES_ON = os.getenv("ROUTINES", "1").strip() != "0"
 
 SOURCE_CHATS_EXTRA = os.getenv("SOURCE_CHATS_EXTRA", "").strip()
@@ -114,9 +114,16 @@ BAD_WORDS = [
 # Bu kelimeleri iceren butonlara bot ASLA basmaz (ve onay butonu da koymaz)
 DANGER_BTN_RE = re.compile(
     r"wallet|cüzdan|cuzdan|deposit|withdraw|çekim|cekim|yatır|yatir|buy|satın|satin|"
-    r"\bpay\b|ödeme|odeme|stake|invest|premium|stars|usdt|swap|\bton\b",
+    r"\bpay\b|ödeme|odeme|stake|invest|premium|stars|usdt|swap|\bton\b|"
+    r"tanıt|tanit|promot|advert|reklam|çekler|cekler|\bchecks?\b|"
+    r"оплат|выплат|вывод|куп[ий]|пополн|реклам|продвиж|кошел|депозит|\bчек[иа]?\b",
     re.I,
 )
+
+
+def norm_label(s: str) -> str:
+    """Etiketteki degisen sayilari (ornek: 'Kanallar · 446') yok sayarak karsilastirmak icin."""
+    return re.sub(r"\s+", " ", re.sub(r"[\d·•.,:%+\-]+", " ", s or "")).strip().lower()
 
 # ===================== STATE =====================
 
@@ -720,12 +727,15 @@ async def do_click(bot: str, msg_id: int, label: str):
         await msg.get_buttons()
     except Exception:
         pass
-    labels = [(b.text or "").strip() for row in (msg.buttons or []) for b in row]
-    if label not in labels:
+    def match(b):
+        t = (b.text or "").strip()
+        return t == label or (norm_label(t) != "" and norm_label(t) == norm_label(label))
+
+    if not any(match(b) for row in (msg.buttons or []) for b in row):
         return None, "Buton artık yok (bot mesajı değiştirmiş). /incele ile yeniden bak."
     await asyncio.sleep(random.uniform(1.5, 4))
     try:
-        await msg.click(filter=lambda b: (b.text or "").strip() == label)
+        await msg.click(filter=match)
     except Exception as e:
         return None, f"Basılamadı: {e}"
     await asyncio.sleep(4)
@@ -736,7 +746,7 @@ async def do_join(target: str) -> str:
     assert tg_client is not None
     now = time.time()
     JOIN_TIMES[:] = [t for t in JOIN_TIMES if now - t < 86400]
-    if len(JOIN_TIMES) >= JOIN_DAILY_MAX:
+    if JOIN_DAILY_MAX > 0 and len(JOIN_TIMES) >= JOIN_DAILY_MAX:
         return f"Günlük katılım limiti doldu ({JOIN_DAILY_MAX}). Hesabı korumak için yarın dene."
     try:
         await asyncio.sleep(random.uniform(2, 6))
@@ -751,7 +761,13 @@ async def do_join(target: str) -> str:
         JOIN_TIMES.append(time.time())
         return "Katıldım ✅"
     except Exception as e:
-        return f"Katılamadım: {e}"
+        name = type(e).__name__
+        if "FloodWait" in name:
+            sec = int(getattr(e, "seconds", 0) or 0)
+            return f"Telegram şimdilik bekletiyor: yaklaşık {max(1, sec // 60)} dk sonra tekrar dene."
+        if "TooMuch" in name:
+            return "Hesap Telegram'ın kanal/grup üyelik sınırına ulaştı, bazı kanallardan çıkman gerekir."
+        return f"Katılamadım: {name} {e}"
 
 
 async def handle_action(act: dict):
@@ -773,7 +789,7 @@ async def handle_action(act: dict):
         await send_admin(f"📢 {act['target']}: {note}")
     elif t == "routine":
         for r in ROUTINES.values():
-            if r["bot"] == act["bot"] and r["label"] == act["label"]:
+            if r["bot"] == act["bot"] and norm_label(r["label"]) == norm_label(act["label"]):
                 await send_admin("🔁 Bu rutin zaten var. /rutin ile bak.")
                 return
         rid = str(int(time.time() * 1000))
@@ -1003,7 +1019,7 @@ async def run_routine(r: dict) -> str:
         for m in reversed(msgs):  # en yeniden eskiye
             for row in (m.buttons or []):
                 for b in row:
-                    if (b.text or "").strip() == r["label"] and classify_button(b) == "click":
+                    if norm_label(b.text or "") == norm_label(r["label"]) and classify_button(b) == "click":
                         target = m
                         break
                 if target:
@@ -1013,7 +1029,7 @@ async def run_routine(r: dict) -> str:
         if not target:
             return f"❓ @{r['bot']}: '{r['label']}' butonu bulunamadı (bot menüsü değişmiş olabilir)."
         await asyncio.sleep(random.uniform(1.5, 4))
-        await target.click(filter=lambda b: (b.text or "").strip() == r["label"])
+        await target.click(filter=lambda b: norm_label(b.text or "") == norm_label(r["label"]))
         await asyncio.sleep(4)
         after = await fetch_incoming(ent, target.id)
     snippet = ""
@@ -1321,6 +1337,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Gorulen/bilinen bot: {n_bots}\n"
         f"Mod: {'sadece bot linkleri' if ONLY_BOTS else 'genis filtre'}\n"
         f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
+        f"Kanal katilim limiti: {JOIN_DAILY_MAX if JOIN_DAILY_MAX > 0 else 'yok'}\n"
         f"Gunluk rutin: {len(ROUTINES)} ({'acik' if ROUTINES_ON else 'kapali'})\n"
         f"Groq: {'acik' if GROQ_API_KEY else 'kapali'} ({GROQ_MODEL})\n"
         f"Gemini (yedek): {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
