@@ -389,20 +389,29 @@ async def gemini_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
     }
     assert http_session is not None
-    try:
-        async with http_session.post(
-            url, json=payload, timeout=aiohttp.ClientTimeout(total=40)
-        ) as resp:
-            data = await resp.json()
-            if resp.status >= 400:
-                print("[GEMINI]", resp.status, str(data)[:200])
-                return f"(Gemini hatasi {resp.status}, ozet cikarilamadi)"
-            parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
-            raw = "\n".join(p.get("text", "") for p in parts).strip()
-            return raw or "(Ozet bos geldi)"
-    except Exception as e:
-        print("[GEMINI EX]", repr(e))
-        return f"(Gemini hata: {e})"
+    last = "(Gemini hata, ozet cikarilamadi)"
+    for attempt in range(3):
+        try:
+            async with http_session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=40)
+            ) as resp:
+                data = await resp.json()
+                if resp.status in (429, 500, 502, 503, 504):
+                    print("[GEMINI]", resp.status, "tekrar denenecek")
+                    last = f"(Gemini hatasi {resp.status}, ozet cikarilamadi)"
+                    await asyncio.sleep(3 + attempt * 5)
+                    continue
+                if resp.status >= 400:
+                    print("[GEMINI]", resp.status, str(data)[:200])
+                    return f"(Gemini hatasi {resp.status}, ozet cikarilamadi)"
+                parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                raw = "\n".join(p.get("text", "") for p in parts).strip()
+                return raw or "(Ozet bos geldi)"
+        except Exception as e:
+            print("[GEMINI EX]", repr(e))
+            last = f"(Gemini hata: {e})"
+            await asyncio.sleep(3)
+    return last
 
 
 # ===================== BILDIRIM =====================
@@ -469,6 +478,7 @@ def classify_button(b) -> str:
 def summarize_msgs(msgs, bot: str) -> dict:
     """msgs: eskiden yeniye. Mesajlardaki metin, buton ve kanal linklerini ayiklar."""
     texts, webs, blocked, privs, chans = [], [], [], [], []
+    total = 0
     clicks: dict[str, int] = {}  # etiket -> mesaj id (ayni etiket varsa en yenisi)
     for m in msgs:
         t = (m.message or "").strip()
@@ -478,6 +488,7 @@ def summarize_msgs(msgs, bot: str) -> dict:
         urls.append(t)
         for row in (m.buttons or []):
             for b in row:
+                total += 1
                 label = (b.text or "").strip()
                 kind = classify_button(b)
                 if kind == "url" and getattr(b, "url", None):
@@ -498,6 +509,7 @@ def summarize_msgs(msgs, bot: str) -> dict:
                     continue
                 chans.append(tgt)
     return {
+        "total": total,
         "texts": texts,
         "clicks": list(clicks.items()),
         "webs": list(dict.fromkeys(webs)),
@@ -516,7 +528,17 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
     guide = await gemini_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
 
     lines = [f"{header}: @{bot}", ""]
-    lines.append(guide or (raw_text[:600] if raw_text else "(Bot metin göndermedi, sadece butonlar var.)"))
+    ozet_yok = (not guide) or guide.startswith("(")
+    if ozet_yok:
+        if guide:
+            lines.append(guide)
+        lines.append(("Botun mesajı:\n" + raw_text[:700]) if raw_text else "(Bot metin göndermedi.)")
+    else:
+        lines.append(guide)
+    lines.append(f"ℹ️ Bot {len(msgs)} mesaj gönderdi, mesajlarda {info['total']} buton gördüm.")
+    if info["total"] == 0:
+        lines.append("Not: Çoğu oyun botunun 'Oyna' tuşu mesajda değil, sohbetin altındaki menü tuşunda durur. "
+                     "Onu otomatik göremiyorum.")
     if info["clicks"]:
         lines += ["", "▶️ Basılabilir: " + ", ".join(l for l, _ in info["clicks"])]
     if info["webs"]:
