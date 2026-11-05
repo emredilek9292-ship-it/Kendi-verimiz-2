@@ -22,6 +22,7 @@ import os
 import random
 import re
 import time
+import unicodedata
 from typing import Optional, Set
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -646,6 +647,14 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
 
     rows = []
     if not warn:
+        n_tasks, task_msg = 0, None
+        for m_ in msgs:
+            tk = parse_tasks(m_)
+            if tk:
+                n_tasks, task_msg = len(tk), m_
+        if n_tasks and task_msg is not None:
+            aid = new_action({"t": "autotasks", "bot": bot, "msg_id": task_msg.id, "cap": n_tasks})
+            rows.append([InlineKeyboardButton(f"🤖 Bu sayfadaki {n_tasks} görevi otomatik yap", callback_data=f"a:{aid}")])
         if routine_label:
             aid = new_action({"t": "routine", "bot": bot, "label": routine_label})
             rows.append([InlineKeyboardButton(f"🔁 Her gün otomatik: {routine_label[:22]}", callback_data=f"a:{aid}")])
@@ -765,6 +774,8 @@ async def do_join(target: str) -> str:
         if "FloodWait" in name:
             sec = int(getattr(e, "seconds", 0) or 0)
             return f"Telegram şimdilik bekletiyor: yaklaşık {max(1, sec // 60)} dk sonra tekrar dene."
+        if "AlreadyParticipant" in name:
+            return "Katıldım ✅ (zaten üyeydin)"
         if "TooMuch" in name:
             return "Hesap Telegram'ın kanal/grup üyelik sınırına ulaştı, bazı kanallardan çıkman gerekir."
         return f"Katılamadım: {name} {e}"
@@ -783,6 +794,9 @@ async def handle_action(act: dict):
             return
         await send_report(act["bot"], new, f"✅ '{act['label'][:24]}' basıldı → CEVAP",
                           routine_label=act["label"])
+    elif t == "autotasks":
+        await send_admin(f"🤖 @{act['bot']}: {act['cap']} görev otomatik başlıyor. Durdurmak için /dur")
+        spawn(run_autotasks(act["bot"], [], act["cap"], msg_id=act["msg_id"]))
     elif t == "join":
         async with TG_LOCK:
             note = await do_join(act["target"])
@@ -1006,6 +1020,284 @@ async def recon_game(target: str):
             pass
 
 
+# ===================== OTOMATIK GOREV (URL + "Kontrol et" cifti olan listeler) =====================
+
+AUTO_DEFAULT_CAP = int(os.getenv("AUTO_TASKS_DEFAULT", "0") or 0)  # 0 = sinirsiz
+AUTO_RUNNING = False
+AUTO_STOP = False
+CHECK_WORDS = ("kontrol", "check", "проверить", "проверка", "verify", "dogrula")
+
+
+def fold(s: str) -> str:
+    """Buyuk/kucuk harf ve Turkce harf farkini yok sayarak karsilastirmak icin."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.replace("ı", "i").lower()
+
+
+CHECK_FOLDED = tuple(fold(w) for w in CHECK_WORDS)
+
+
+def parse_tasks(msg) -> list:
+    """Ayni satirda [t.me linki butonu] + [Kontrol et butonu] olan gorevleri bulur."""
+    tasks = []
+    for i, row in enumerate(msg.buttons or []):
+        url_btn, chk = None, None
+        for j, b in enumerate(row):
+            kind = classify_button(b)
+            u = raw_url(b)
+            if kind == "url" and re.match(r"https?://", u or "", re.I):
+                url_btn = b
+            elif kind == "click" and any(w in fold(b.text or "") for w in CHECK_FOLDED):
+                chk = (i, j)
+        if url_btn is not None and chk is not None:
+            tasks.append({
+                "url": raw_url(url_btn).split("#")[0],
+                "label": (url_btn.text or "").strip(),
+                "pos": chk,
+            })
+    return tasks
+
+
+async def nav_click(ent, keyword: str) -> bool:
+    """En yeni bot mesajlarinda etiketi 'keyword' iceren butona basar (menude gezinme)."""
+    assert tg_client is not None
+    kw = fold(keyword)
+    msgs = [m for m in await tg_client.get_messages(ent, limit=8) if not m.out]
+    for m in msgs:  # en yeniden eskiye
+        try:
+            await m.get_buttons()
+        except Exception:
+            pass
+        for row in (m.buttons or []):
+            for b in row:
+                label = (b.text or "").strip()
+                if classify_button(b) == "click" and kw in fold(label) and not DANGER_BTN_RE.search(label):
+                    await asyncio.sleep(random.uniform(1.5, 3.5))
+                    await m.click(filter=lambda x, lab=label: (x.text or "").strip() == lab)
+                    await asyncio.sleep(4)
+                    return True
+    return False
+
+
+async def latest_task_msg(ent, prefer_id=None):
+    """Gorev cifti iceren en yeni bot mesajini bulur."""
+    assert tg_client is not None
+    cands = []
+    if prefer_id:
+        try:
+            m = await tg_client.get_messages(ent, ids=prefer_id)
+            if m:
+                cands.append(m)
+        except Exception:
+            pass
+    cands += [m for m in await tg_client.get_messages(ent, limit=8) if not m.out]
+    for m in cands:
+        try:
+            await m.get_buttons()
+        except Exception:
+            pass
+        if parse_tasks(m):
+            return m
+    return None
+
+
+async def next_page(cur) -> bool:
+    for i, row in enumerate(cur.buttons or []):
+        for j, b in enumerate(row):
+            if (b.text or "").strip() == ">" and classify_button(b) == "click":
+                await asyncio.sleep(random.uniform(1.5, 3.5))
+                try:
+                    await cur.click(i, j)
+                except Exception:
+                    return False
+                await asyncio.sleep(4)
+                return True
+    return False
+
+
+async def resolve_tme(url: str) -> str:
+    """t.me olmayan (takip / yonlendirme) linki en fazla 4 adimda t.me adresine cozer; olmazsa ''."""
+    assert http_session is not None
+    cur = url
+    for _ in range(4):
+        host = urlparse(cur).netloc.lower().split(":")[0]
+        if host in ("t.me", "telegram.me", "www.t.me"):
+            return cur
+        try:
+            async with http_session.get(
+                cur, allow_redirects=False, headers={"User-Agent": DESKTOP_UA},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                loc = r.headers.get("Location")
+                if loc:
+                    cur = urljoin(cur, loc)
+                    continue
+                if r.status < 400:  # bazi siteler sayfa icinden yonlendirir
+                    txt = (await r.content.read(200_000)).decode("utf-8", "ignore")
+                    mm = re.search(r"https?://(?:t\.me|telegram\.me)/[A-Za-z0-9_+/?=&%.\-]+", txt)
+                    return mm.group(0) if mm else ""
+                return ""
+        except Exception as e:
+            print("[RESOLVE]", repr(e))
+            return ""
+    return ""
+
+
+async def dump_buttons(ent) -> str:
+    """Teshis: botun son mesajlarindaki butonlari (tur + link) kisaca listeler."""
+    assert tg_client is not None
+    lines = ["Botun son mesajlarındaki butonlar (teşhis):"]
+    try:
+        msgs = [m for m in await tg_client.get_messages(ent, limit=4) if not m.out]
+        for m in msgs[:3]:
+            try:
+                await m.get_buttons()
+            except Exception:
+                pass
+            lines.append(f"— mesaj {m.id}: {(m.message or '')[:40]!r}")
+            for i, row in enumerate((m.buttons or [])[:6]):
+                parts = []
+                for b in row:
+                    u = raw_url(b)
+                    parts.append(f"{(b.text or '').strip()[:18]} [{classify_button(b)}]" + (f" {u[:50]}" if u else ""))
+                lines.append(f"  {i + 1}. " + " | ".join(parts))
+    except Exception as e:
+        lines.append(f"(okunamadı: {type(e).__name__})")
+    return "\n".join(lines)
+
+
+async def do_task_action(url: str) -> str:
+    """Linke gore: kanala katil ya da bota /start yaz. 'STOP:' ile baslarsa calisma durur."""
+    assert tg_client is not None
+    p = urlparse(url)
+    if p.netloc.lower().split(":")[0] not in ("t.me", "telegram.me", "www.t.me"):
+        real = await resolve_tme(url)
+        if not real:
+            return "t.me linkine çözülemedi, atladım"
+        url = real
+        p = urlparse(url)
+    segs = [x for x in p.path.split("/") if x]
+    qs = parse_qs(p.query)
+    if not segs:
+        return "link boş, atladım"
+    first = segs[0]
+    if first.startswith("+") or first.lower() == "joinchat":
+        target = first if first.startswith("+") else "joinchat/" + (segs[1] if len(segs) > 1 else "")
+    elif re.fullmatch(r"[A-Za-z0-9_]{3,}bot", first, re.I):
+        if len(segs) > 1 or "startapp" in qs:
+            return "mini uygulama görevi, atladım"
+        ent = await resolve_entity(first)
+        if not getattr(ent, "bot", False):
+            return "bot değil, atladım"
+        param = (qs.get("start") or [""])[0]
+        await tg_client.send_message(ent, f"/start {param}".strip())
+        await asyncio.sleep(random.uniform(2, 4))
+        return "Başlattım ✅"
+    elif first == "c":
+        return "özel gönderi linki, atladım"
+    else:
+        target = first
+    note = await do_join(target)
+    if note.startswith("Telegram şimdilik") or "sınırına" in note or "limiti" in note:
+        return "STOP:" + note
+    return note
+
+
+async def run_autotasks(bot: str, steps: list, cap: int, msg_id: Optional[int] = None):
+    """Gorev listesindeki gorevleri sirayla yapar: katil/start -> bekle -> Kontrol et -> cevabi oku."""
+    global AUTO_RUNNING, AUTO_STOP
+    if AUTO_RUNNING:
+        await send_admin("⏳ Zaten bir otomatik görev çalışıyor. Durdurmak için /dur yaz.")
+        return
+    AUTO_RUNNING, AUTO_STOP = True, False
+    results = []
+    try:
+        assert tg_client is not None
+        ent = await resolve_entity(bot)
+        if not getattr(ent, "bot", False):
+            await send_admin(f"ℹ️ @{bot} bir bot değil, otomatik görev başlatmadım.")
+            return
+        async with TG_LOCK:
+            if steps:
+                await tg_client.send_message(ent, "/start")
+                await asyncio.sleep(INSPECT_WAIT)
+                for kw in steps:
+                    if AUTO_STOP:
+                        break
+                    if not await nav_click(ent, kw):
+                        await send_admin(f"⚠️ @{bot}: '{kw}' butonunu bulamadım, durdum. Menüyü görmek için /incele {bot}\n\n" + await dump_buttons(ent))
+                        return
+            mid = msg_id
+            done, pages = set(), 0
+            announced, last_progress = False, 0
+            while (cap <= 0 or len(results) < cap) and not AUTO_STOP:
+                if results and len(results) % 5 == 0 and len(results) != last_progress:
+                    last_progress = len(results)
+                    await send_admin(f"⏳ {len(results)} görev işlendi, devam ediyorum... (durdurmak için /dur)")
+                cur = await latest_task_msg(ent, mid)
+                if cur is None:
+                    if not results:
+                        await send_admin(f"⚠️ @{bot}: görev listesi bulunamadı (link + 'Kontrol et' çiftleri yok).\n\n"
+                                         + await dump_buttons(ent))
+                        return
+                    break
+                mid = cur.id
+                tasks = [t for t in parse_tasks(cur) if t["url"] not in done]
+                if tasks and not announced:
+                    announced = True
+                    await send_admin(f"📋 @{bot}: görev listesi bulundu, bu sayfada {len(tasks)} görev var. "
+                                     f"Başlıyorum... (durdurmak için /dur)")
+                if not tasks:
+                    if pages >= 30:
+                        break
+                    sig = tuple(x["url"] for x in parse_tasks(cur))
+                    if not await next_page(cur):
+                        break
+                    pages += 1
+                    nxt = await latest_task_msg(ent, mid)
+                    if nxt is not None and tuple(x["url"] for x in parse_tasks(nxt)) == sig:
+                        break  # sayfa degismedi: son sayfa
+                    continue
+                t = tasks[0]
+                done.add(t["url"])
+                note = await do_task_action(t["url"])
+                if note.startswith("STOP:"):
+                    results.append((t["label"], note[5:], ""))
+                    break
+                if not (note.startswith("Katıldım") or note.startswith("Başlattım")):
+                    results.append((t["label"], note, ""))
+                    continue
+                await asyncio.sleep(random.uniform(4, 9))
+                cur = await latest_task_msg(ent, mid)
+                again = [x for x in parse_tasks(cur) if x["url"] == t["url"]] if cur else []
+                if not again:
+                    results.append((t["label"], note, "liste değişti, Kontrol et basılmadı"))
+                    continue
+                try:
+                    ans = await cur.click(*again[0]["pos"])
+                    reply = (getattr(ans, "message", None) or "").strip()
+                except Exception as e:
+                    reply = f"Kontrol basılamadı: {type(e).__name__}"
+                results.append((t["label"], note, reply))
+                await asyncio.sleep(random.uniform(3, 6))
+    except Exception as e:
+        print("[AUTO]", repr(e))
+        results.append(("hata", f"{type(e).__name__} {e}", ""))
+    finally:
+        AUTO_RUNNING = False
+
+    ok = sum(1 for _, n, _r in results if n.startswith(("Katıldım", "Başlattım")))
+    lines = [f"🤖 OTOMATİK GÖREV BİTTİ: @{bot}",
+             f"{len(results)} görev işlendi, {ok} tanesinde katılma/başlatma yapıldı.", ""]
+    for label, note, reply in results[:20]:
+        lines.append(f"• {label[:24]} → {note[:45]}" + (f" → «{reply[:70]}»" if reply else ""))
+    if len(results) > 20:
+        lines.append(f"... ve {len(results) - 20} görev daha")
+    lines += ["", "ℹ️ Katıldığın kanallardan hemen ayrılma: PR GRAM gibi botlar 7 gün şartı koyuyor."]
+    await send_admin("\n".join(lines))
+
+
 # ===================== GUNLUK RUTIN =====================
 
 async def run_routine(r: dict) -> str:
@@ -1142,6 +1434,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list\n"
         "/incele botadi  (bota /start yaz, cevabı oku, rapor ver)\n"
         "/oyun botadi  (mini uygulamanın sunucu adreslerini çıkar)\n"
+        "/gorev botadi  (görev listesindeki görevleri otomatik yap)\n"
+        "/dur  (otomatik görevi durdur)\n"
         "/rutin  (günlük otomatik rutinler)\n"
         "/bil botadi  (zaten bildiğin oyun, bildirim gelmesin)\n"
         "/status\n\n"
@@ -1242,6 +1536,44 @@ async def cmd_oyun(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spawn(recon_game(name))
 
 
+@admin_only
+async def cmd_gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Kullanim:\n/gorev gram_prbot\n(menüde Kazanç > Kanallar'a gider; görev kalmayana ya da /dur diyene kadar yapar)\n\n"
+            "Sayıyla sınırlamak için:\n/gorev gram_prbot kazanc>kanallar 30\n\n"
+            "Durdurmak için: /dur")
+        return
+    a = context.args[0]
+    m = BOT_LINK_RE.search(a)
+    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+        return
+    cap, steps = AUTO_DEFAULT_CAP, ["kazanc", "kanallar"]
+    for x in context.args[1:]:
+        if x.isdigit():
+            cap = max(0, int(x))
+        else:
+            steps = [y.strip() for y in x.split(">") if y.strip()]
+    if AUTO_RUNNING:
+        await update.effective_message.reply_text("⏳ Zaten bir otomatik görev çalışıyor. Durdurmak için /dur")
+        return
+    await update.effective_message.reply_text(
+        f"🤖 @{name}: {' > '.join(steps)} yolundan {cap if cap > 0 else 'sınırsız'} görev otomatik başlıyor. Bitince özet gelecek. Durdurmak için /dur")
+    spawn(run_autotasks(name, steps, cap))
+
+
+@admin_only
+async def cmd_dur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_STOP
+    if AUTO_RUNNING:
+        AUTO_STOP = True
+        await update.effective_message.reply_text("Durdurma isteği alındı, o anki görev bitince duracak.")
+    else:
+        await update.effective_message.reply_text("Çalışan otomatik görev yok.")
+
+
 def routines_text_and_kb():
     if not ROUTINES:
         return "Rutin yok.\n\nBir botu /incele ile incele, bir butona bas, çıkan\n'🔁 Her gün otomatik' butonuna dokun.", None
@@ -1338,6 +1670,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Mod: {'sadece bot linkleri' if ONLY_BOTS else 'genis filtre'}\n"
         f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
         f"Kanal katilim limiti: {JOIN_DAILY_MAX if JOIN_DAILY_MAX > 0 else 'yok'}\n"
+        f"Otomatik gorev: {'calisiyor' if AUTO_RUNNING else 'bosta'}\n"
         f"Gunluk rutin: {len(ROUTINES)} ({'acik' if ROUTINES_ON else 'kapali'})\n"
         f"Groq: {'acik' if GROQ_API_KEY else 'kapali'} ({GROQ_MODEL})\n"
         f"Gemini (yedek): {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
@@ -1451,6 +1784,8 @@ async def main():
     bot_app.add_handler(CommandHandler("bil", cmd_bil))
     bot_app.add_handler(CommandHandler("incele", cmd_incele))
     bot_app.add_handler(CommandHandler("oyun", cmd_oyun))
+    bot_app.add_handler(CommandHandler("gorev", cmd_gorev))
+    bot_app.add_handler(CommandHandler("dur", cmd_dur))
     bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
     bot_app.add_handler(CommandHandler("status", cmd_status))
     bot_app.add_handler(CallbackQueryHandler(on_callback))
