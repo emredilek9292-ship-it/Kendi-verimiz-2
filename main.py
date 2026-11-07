@@ -2459,4 +2459,520 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_bil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not co
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Kullanim:\n/bil hamster_kombat_bot blumcryptobot\n(link de yazabilirsin)"
+        )
+        return
+    eklenen = []
+    for a in context.args:
+        m = BOT_LINK_RE.search(a)
+        name = (m.group(1) if m else a.strip().lstrip("@")).lower()
+        if re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+            seen[f"bot:{name}"] = time.time()
+            eklenen.append(name)
+    if eklenen:
+        await persist_seen()
+        await update.effective_message.reply_text(
+            "Bilinen olarak eklendi: " + ", ".join("@" + n for n in eklenen)
+        )
+    else:
+        await update.effective_message.reply_text("Gecerli bot adi bulunamadi.")
+
+
+@admin_only
+async def cmd_incele(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Kullanim:\n/incele hamster_kombat_bot")
+        return
+    a = context.args[0]
+    m = BOT_LINK_RE.search(a)
+    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+        return
+    await update.effective_message.reply_text(
+        f"@{name} inceleniyor, 10-20 saniye (sırada başka varsa daha uzun)..."
+    )
+    spawn(inspect_bot(name))
+
+
+@admin_only
+async def cmd_oyun(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Kullanim:\n/oyun lootvaultdexbot\nveya bir site adresi:\n/oyun https://lootvault.lol")
+        return
+    a = context.args[0]
+    if a.lower().startswith("http"):
+        await update.effective_message.reply_text("Site inceleniyor, 20-40 saniye...")
+        spawn(recon_game(a))
+        return
+    m = BOT_LINK_RE.search(a)
+    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten) ya da http adresi.")
+        return
+    await update.effective_message.reply_text(f"@{name} inceleniyor, 20-40 saniye...")
+    spawn(recon_game(name))
+
+
+@admin_only
+async def cmd_gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Kullanim:\n/gorev gram_prbot\n(menüde Kazanç > Kanallar'a gider; görev kalmayana ya da /dur diyene kadar yapar)\n\n"
+            "Sayıyla sınırlamak için:\n/gorev gram_prbot kazanc>kanallar 30\n\n"
+            "Durdurmak için: /dur")
+        return
+    a = context.args[0]
+    m = BOT_LINK_RE.search(a)
+    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+        return
+    cap, steps = AUTO_DEFAULT_CAP, ["kazanc", "kanallar"]
+    for x in context.args[1:]:
+        if x.isdigit():
+            cap = max(0, int(x))
+        else:
+            steps = [y.strip() for y in x.split(">") if y.strip()]
+    if AUTO_RUNNING:
+        await update.effective_message.reply_text("⏳ Zaten bir otomatik görev çalışıyor. Durdurmak için /dur")
+        return
+    await update.effective_message.reply_text(
+        f"🤖 @{name}: {' > '.join(steps)} yolundan {cap if cap > 0 else 'sınırsız'} görev otomatik başlıyor. Bitince özet gelecek. Durdurmak için /dur")
+    spawn(run_autotasks(name, steps, cap))
+
+
+@admin_only
+async def cmd_otopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.effective_message.reply_text(autopilot_status_text())
+        return
+    a = args[0].lower().lstrip("@")
+    if a in ("kapat", "off", "durdur", "dur"):
+        AUTOPILOT["on"] = False
+        await persist_autopilot()
+        await update.effective_message.reply_text(
+            "🛬 Otopilot kapatıldı. Görev taraması durdu; 7 günü dolan kanallardan çıkış takibi sürüyor.")
+        return
+    m = BOT_LINK_RE.search(a)
+    name = (m.group(1) if m else a).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Kullanım:\n/otopilot gram_prbot\n/otopilot kapat\n/otopilot (durum)")
+        return
+    steps = ["kazanc", "kanallar"]
+    if len(args) > 1:
+        steps = [y.strip() for y in args[1].split(">") if y.strip()] or steps
+    AUTOPILOT.update({"on": True, "bot": name, "steps": steps, "since": time.time()})
+    await persist_autopilot()
+    await update.effective_message.reply_text(
+        f"🛫 Otopilot açıldı: @{name} ({' > '.join(steps)})\n"
+        f"Şimdi ilk turu başlatıyorum. Sonra her {AUTOPILOT_MIN_MINUTES}-{AUTOPILOT_MAX_MINUTES} dk'da bir "
+        f"yeni görevleri tarar, hiç durmaz. Katıldığım kanallardan "
+        f"{LEAVE_AFTER_HOURS // 24} gün {LEAVE_AFTER_HOURS % 24} saat sonra çıkarım.\n"
+        f"Kapatmak için: /otopilot kapat")
+    spawn(run_autotasks(name, steps, 0))
+
+
+@admin_only
+async def cmd_cik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("Süresi dolan kanallar kontrol ediliyor...")
+    spawn(leave_and_report(True))
+
+
+@admin_only
+async def cmd_dur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_STOP
+    if AUTO_RUNNING:
+        AUTO_STOP = True
+        await update.effective_message.reply_text("Durdurma isteği alındı, o anki görev bitince duracak." + (" Otopilot hâlâ açık, sonraki turda yeniden başlar; tamamen kapatmak için /otopilot kapat." if AUTOPILOT.get("on") else ""))
+    else:
+        await update.effective_message.reply_text("Çalışan otomatik görev yok.")
+
+
+@admin_only
+async def cmd_yetkiler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.effective_message.reply_text("Bu sadece asıl sahibe açık.")
+        return
+    lines = ["🔑 Botu kullanabilenler:"]
+    rows = []
+    for uid in sorted(ADMIN_IDS):
+        info = EXTRA_ADMINS.get(str(uid), {})
+        tag = "asıl sahip" if uid == ADMIN_USER_ID else (info.get("name") or "eklenen")
+        lines.append(f"- {uid} ({tag})")
+        if str(uid) in EXTRA_ADMINS:
+            rows.append([InlineKeyboardButton(f"Yetkiyi kaldır: {uid}", callback_data=f"adm:del:{uid}")])
+    lines.append("\nYeni hesap eklemek için: o hesaptan bota /start yaz, sana onay butonu gelir.")
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+
+
+def routines_text_and_kb():
+    if not ROUTINES:
+        return "Rutin yok.\n\nBir botu /incele ile incele, bir butona bas, çıkan\n'🔁 Her gün otomatik' butonuna dokun.", None
+    lines = [f"Günlük rutinler ({len(ROUTINES)}):"]
+    rows = []
+    for rid, r in ROUTINES.items():
+        lines.append(f"- @{r['bot']} → '{r['label']}'")
+        rows.append([InlineKeyboardButton(f"Sil: {r['bot'][:14]} / {r['label'][:14]}", callback_data=f"rd:{rid}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+@admin_only
+async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        if not REFS:
+            await update.effective_message.reply_text(
+                "Kayıtlı referans linki yok.\n\n/ref botadi → otomatik ara\n"
+                "/ref botadi https://t.me/... → elle kaydet\n/ref sil botadi")
+            return
+        lines = ["Kayıtlı referans linkleri:"] + [f"@{b}: {v['link']}" for b, v in REFS.items()]
+        await update.effective_message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+        return
+    if args[0].lower() in ("sil", "del") and len(args) > 1:
+        name = args[1].lstrip("@").lower()
+        if REFS.pop(name, None) is not None:
+            await persist_refs()
+            await update.effective_message.reply_text(f"@{name} referans linki silindi.")
+        else:
+            await update.effective_message.reply_text("Böyle bir kayıt yok.")
+        return
+    m = BOT_LINK_RE.search(args[0])
+    name = (m.group(1) if m else args[0].strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+        return
+    if len(args) >= 2 and args[1].lower().startswith(("http", "t.me")):
+        link = args[1] if args[1].lower().startswith("http") else "https://" + args[1]
+        if "t.me/" not in link.lower():
+            await update.effective_message.reply_text("Bu bir t.me linki değil.")
+            return
+        REFS[name] = {"link": link, "src": "elle", "t": time.time()}
+        await persist_refs()
+        await update.effective_message.reply_text(f"@{name} için referans linki kaydedildi.")
+        return
+    spawn(ref_finder(name))
+
+
+@admin_only
+async def cmd_topla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        if not CLAIMS:
+            await update.effective_message.reply_text(
+                "Otomatik toplama yok.\n\n/topla botadi → uygulamanın kodundaki güvenli 'topla/oturum' "
+                "yollarını bul, onayınla dene\n/topla kapat botadi → o botun otomatik toplamalarını sil")
+            return
+        now = time.time()
+        lines = ["Otomatik toplamalar:"]
+        for c in CLAIMS.values():
+            ago = f"{int((now - c['when']) // 60)} dk önce" if c.get("when") else "henüz çalışmadı"
+            lines.append(f"- @{c['bot']} POST {c['path']} (her {c.get('every', CLAIM_EVERY_MIN)} dk) · son: "
+                         f"{c.get('st', '-')} {c.get('msg', '')[:40]} ({ago}) · ✓{c.get('n_ok', 0)} ✗{c.get('n_err', 0)}")
+        await update.effective_message.reply_text("\n".join(lines)[:4000])
+        return
+    if args[0].lower() in ("kapat", "sil") and len(args) > 1:
+        name = args[1].lstrip("@").lower()
+        keys = [k for k, c in CLAIMS.items() if c["bot"] == name]
+        for k in keys:
+            CLAIMS.pop(k, None)
+        await persist_claims()
+        await update.effective_message.reply_text(f"@{name}: {len(keys)} otomatik toplama silindi.")
+        return
+    m = BOT_LINK_RE.search(args[0])
+    name = (m.group(1) if m else args[0].strip().lstrip("@")).lower()
+    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+        return
+    spawn(claim_discover(name))
+
+
+@admin_only
+async def cmd_rutin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = routines_text_and_kb()
+    await update.effective_message.reply_text(text, reply_markup=kb)
+
+
+def kb_without(markup, data: str):
+    if not markup:
+        return None
+    rows = [[b for b in row if b.callback_data != data] for row in markup.inline_keyboard]
+    rows = [r for r in rows if r]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+@admin_only
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    data = q.data
+
+    if data.startswith("del:"):
+        await q.answer()
+        try:
+            cid = int(data[4:])
+        except ValueError:
+            await q.edit_message_text("Gecersiz ID")
+            return
+        msg = await del_source(cid)
+        await enrich_source_titles()
+        text = msg + "\n\n" + list_sources_text()
+        kb = build_list_keyboard()
+        try:
+            await q.edit_message_text(text[:4000], reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(text[:4000], reply_markup=kb)
+
+    elif data.startswith("adm:"):
+        await q.answer()
+        if q.from_user.id != ADMIN_USER_ID:
+            await q.message.reply_text("Yetki verme/kaldırma sadece asıl sahibe açık.")
+            return
+        parts = data.split(":")
+        act = parts[1] if len(parts) > 1 else ""
+        uid = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
+        if act == "ok" and uid:
+            ADMIN_IDS.add(uid)
+            try:
+                chat = await context.bot.get_chat(uid)
+                nm = f"{chat.full_name} (@{chat.username})" if chat.username else str(chat.full_name)
+            except Exception:
+                nm = str(uid)
+            EXTRA_ADMINS[str(uid)] = {"name": nm, "t": time.time()}
+            await persist_admins()
+            await q.message.reply_text(f"✅ Yetki verildi: {nm} (ID {uid})")
+            try:
+                await context.bot.send_message(uid, "✅ Erişim verildi. /start yaz, komutlar orada.")
+            except Exception:
+                pass
+        elif act == "no" and uid:
+            await q.message.reply_text(f"❌ Reddedildi: ID {uid}")
+        elif act == "del" and uid and str(uid) in EXTRA_ADMINS:
+            ADMIN_IDS.discard(uid)
+            EXTRA_ADMINS.pop(str(uid), None)
+            await persist_admins()
+            await q.message.reply_text(f"Yetki kaldırıldı: ID {uid}")
+
+    elif data.startswith("ins:"):
+        await q.answer("İnceleniyor...")
+        name = data[4:].strip().lower()
+        if re.fullmatch(r"[a-z0-9_]{2,}bot", name):
+            spawn(inspect_bot(name))
+            await q.message.reply_text(f"@{name} inceleniyor...")
+
+    elif data.startswith("a:"):
+        act = ACTIONS.get(data[2:])
+        if not act:
+            await q.answer("Bu buton eskimiş.", show_alert=True)
+            await q.message.reply_text("Bu işlemin süresi dolmuş (servis yeniden başlamış olabilir). "
+                                       "/incele botadi ile yeniden bak.")
+            return
+        await q.answer("İşleniyor...")
+        try:
+            await q.edit_message_reply_markup(reply_markup=kb_without(q.message.reply_markup, data))
+        except Exception:
+            pass
+        try:
+            await handle_action(act)
+        except Exception as e:
+            print("[ACTION]", repr(e))
+            await send_admin(f"⚠️ İşlem hatası: {e}")
+
+    elif data.startswith("rd:"):
+        await q.answer()
+        ROUTINES.pop(data[3:], None)
+        await persist_routines()
+        text, kb = routines_text_and_kb()
+        try:
+            await q.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(text, reply_markup=kb)
+    else:
+        await q.answer()
+
+
+@admin_only
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n_bots = sum(1 for k in seen if k.startswith("bot:"))
+    await update.effective_message.reply_text(
+        f"Durum: aktif\n"
+        f"Dinlenen: {len(ACTIVE_SOURCES)}\n"
+        f"Gorulen/bilinen bot: {n_bots}\n"
+        f"Mod: {'sadece bot linkleri' if ONLY_BOTS else 'genis filtre'}\n"
+        f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
+        f"Kanal katilim limiti: {JOIN_DAILY_MAX if JOIN_DAILY_MAX > 0 else 'yok'}\n"
+        f"Otomatik gorev: {'calisiyor' if AUTO_RUNNING else 'bosta'}\n"
+        f"Otopilot: {autopilot_short()} | kayitli kanal: {len(JOINS)}\n"
+        f"Gunluk rutin: {len(ROUTINES)} ({'acik' if ROUTINES_ON else 'kapali'})\n"
+        f"Groq: {'acik' if GROQ_API_KEY else 'kapali'} ({GROQ_MODEL})\n"
+        f"Gemini (yedek): {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
+        f"Upstash: {'acik' if UPSTASH_REDIS_REST_URL else 'kapali'}\n"
+        f"Keepalive: {'acik' if (KEEPALIVE and RENDER_URL) else 'kapali'}"
+    )
+
+
+# ===================== HTTP (Render port) =====================
+
+async def handle_health(request):
+    return web.Response(text=f"ok sources={len(ACTIVE_SOURCES)}", content_type="text/plain")
+
+
+async def start_http():
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"[HTTP] Port {PORT} acik (Render health)")
+
+
+async def keepalive_loop():
+    if not (KEEPALIVE and RENDER_URL):
+        print("[KEEPALIVE] kapali")
+        return
+    print("[KEEPALIVE] acik:", RENDER_URL)
+    while True:
+        await asyncio.sleep(600)
+        try:
+            assert http_session is not None
+            async with http_session.get(
+                RENDER_URL + "/health", timeout=aiohttp.ClientTimeout(total=20)
+            ) as r:
+                await r.read()
+        except Exception as e:
+            print("[KEEPALIVE HATA]", repr(e))
+
+
+# ===================== MAIN =====================
+
+async def main():
+    global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK
+
+    if not API_ID or not API_HASH or not STRING_SESSION:
+        raise SystemExit("API_ID / API_HASH / STRING_SESSION zorunlu")
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN zorunlu (Airdrop radar bot)")
+    if not ADMIN_USER_ID:
+        raise SystemExit("ADMIN_USER_ID / ADMIN_CHAT_ID zorunlu")
+
+    TG_LOCK = asyncio.Lock()
+    INSPECT_LOCK = asyncio.Lock()
+
+    print("=" * 60)
+    print("AIRDROP RADARI v3 + GROQ")
+    print("=" * 60)
+    print("[KONFIG] ADMIN =", ADMIN_USER_ID)
+    print("[KONFIG] PORT =", PORT)
+    print("[KONFIG] GROQ =", GROQ_MODEL if GROQ_API_KEY else "yok")
+    print("[KONFIG] GEMINI =", GEMINI_MODEL if GEMINI_API_KEY else "yok")
+    print("[KONFIG] MOD =", "sadece bot linkleri" if ONLY_BOTS else "genis filtre")
+    print("[KONFIG] INSPECT =", INSPECT, "| RUTIN =", ROUTINES_ON)
+
+    http_session = aiohttp.ClientSession()
+    await start_http()
+
+    tg_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+    await tg_client.start()
+    me = await tg_client.get_me()
+    print("[TELETHON]", me.id, getattr(me, "username", None))
+    await tg_client.get_dialogs()
+
+    await load_seen()
+    await load_routines()
+    await load_joins()
+    await load_autopilot()
+    await load_admins()
+    await load_refs()
+    await load_claims()
+
+    seed = []
+    seed.extend(parse_id_list(SOURCE_CHATS_EXTRA))
+    seed.extend(await load_persisted_sources())
+
+    for item in seed:
+        try:
+            entity = await resolve_entity(item)
+            cid = get_peer_id(entity)
+            ACTIVE_SOURCES.add(cid)
+            SOURCE_META[cid] = (
+                getattr(entity, "title", None) or getattr(entity, "username", None) or str(cid)
+            )
+            print("[KAYNAK OK]", item, "->", cid, SOURCE_META[cid])
+        except Exception as e:
+            try:
+                ACTIVE_SOURCES.add(int(item))
+                print("[KAYNAK ID]", item)
+            except Exception:
+                print("[KAYNAK HATA]", item, repr(e))
+
+    await persist_sources()
+    tg_client.add_event_handler(on_group_message, events.NewMessage(incoming=True))
+
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", cmd_start))
+    bot_app.add_handler(CommandHandler("help", cmd_help))
+    bot_app.add_handler(CommandHandler("yardim", cmd_help))
+    bot_app.add_handler(CommandHandler("add", cmd_add))
+    bot_app.add_handler(CommandHandler("del", cmd_del))
+    bot_app.add_handler(CommandHandler("remove", cmd_del))
+    bot_app.add_handler(CommandHandler("list", cmd_list))
+    bot_app.add_handler(CommandHandler("bil", cmd_bil))
+    bot_app.add_handler(CommandHandler("incele", cmd_incele))
+    bot_app.add_handler(CommandHandler("oyun", cmd_oyun))
+    bot_app.add_handler(CommandHandler("ref", cmd_ref))
+    bot_app.add_handler(CommandHandler("topla", cmd_topla))
+    bot_app.add_handler(CommandHandler("gorev", cmd_gorev))
+    bot_app.add_handler(CommandHandler("dur", cmd_dur))
+    bot_app.add_handler(CommandHandler("otopilot", cmd_otopilot))
+    bot_app.add_handler(CommandHandler("cik", cmd_cik))
+    bot_app.add_handler(CommandHandler("yetkiler", cmd_yetkiler))
+    bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
+    bot_app.add_handler(CommandHandler("status", cmd_status))
+    bot_app.add_handler(CallbackQueryHandler(on_callback))
+
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling(drop_pending_updates=True)
+
+    spawn(keepalive_loop())
+    spawn(routine_loop())
+    spawn(autopilot_loop())
+    spawn(claims_loop())
+
+    try:
+        await bot_app.bot.send_message(
+            ADMIN_CHAT_ID,
+            f"Radar aktif (v3 + Groq)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
+            f"Groq: {'acik' if GROQ_API_KEY else 'kapali'}\n"
+            f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
+            f"Rutin: {len(ROUTINES)}\n\n"
+            f"/add -100... ile grup ekle, /incele botadi ile dene",
+        )
+    except Exception as e:
+        print("[ADMIN MSG HATA]", repr(e))
+
+    print("[HAZIR] Bot komutlari + Telethon + HTTP")
+    await tg_client.run_until_disconnected()
+
+
+try:
+    _n_lines = sum(1 for _ in open(__file__, encoding="utf-8"))
+except Exception:
+    _n_lines = -1
+print(f"[BOOT] dosya sonuna kadar okundu ({_n_lines} satir)", flush=True)
+
+
+if __name__ == "__main__":
+    print("[BOOT] main() baslatiliyor", flush=True)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    print("[BOOT] main() bitti (program kapaniyor)", flush=True)
