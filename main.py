@@ -15,6 +15,12 @@ Komutlar: /add /del /list  /incele botadi  /rutin  /bil botadi  /status
 
 from __future__ import annotations
 
+import faulthandler
+import sys
+
+faulthandler.enable()  # ani cokmelerde (segfault) iz birakir
+print(f"[BOOT] main.py okunmaya basladi (Python {sys.version.split()[0]})", flush=True)
+
 import asyncio
 import hashlib
 import json
@@ -2453,9 +2459,4 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_bil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Kullanim:\n/bil hamster_kombat_bot blumcryptobot\n(link de yazabilirsin)"
-        )
-        return
-    ekle
+    if not co
