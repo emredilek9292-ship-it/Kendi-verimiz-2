@@ -913,6 +913,16 @@ async def handle_action(act: dict):
         spawn(run_autotasks(act["bot"], [], act["cap"], msg_id=act["msg_id"]))
     elif t == "findref":
         spawn(ref_finder(act["bot"]))
+    elif t == "claimtry":
+        spawn(claim_try(act))
+    elif t == "claimauto":
+        key = f"{act['bot']}|{act['path']}"
+        CLAIMS[key] = {"bot": act["bot"], "base": act["base"], "path": act["path"], "mode": act["mode"],
+                       "auth": act["auth"], "every": CLAIM_EVERY_MIN, "last": time.time(), "on": True,
+                       "n_ok": 1, "n_err": 0, "cls": "ok", "when": time.time()}
+        await persist_claims()
+        await send_admin(f"🔁 Otomatik toplama açıldı: @{act['bot']} POST {act['path']} her {CLAIM_EVERY_MIN} dk. "
+                         f"Hata olursa haber veririm. Liste / kapatma: /topla")
     elif t == "join":
         async with TG_LOCK:
             note = await do_join(act["target"])
@@ -1856,32 +1866,46 @@ async def collect_site(pages: list):
     return blobs, list(dict.fromkeys(hosts))[:20], list(dict.fromkeys(paths))[:60]
 
 
-async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
-    """Mini uygulamanin JS'inden referans kalibi arar, giris verisiyle API'yi (yalniz GET) yoklar."""
+def app_base_headers(origin: str) -> dict:
+    return {"Origin": origin, "Referer": origin + "/", "User-Agent": DESKTOP_UA, "Accept": "application/json"}
+
+
+async def http_call(method: str, url: str, headers: dict, body=None):
+    """(durum, json | None, metin_ozeti). Hata durumlarinda da cevap metnini dondurur."""
+    assert http_session is not None
+    try:
+        async with http_session.request(
+            method, url, headers=headers, json=body, allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            txt = await r.text()
+            try:
+                data = json.loads(txt)
+            except Exception:
+                data = None
+            return r.status, data, (txt or "")[:200]
+    except Exception as e:
+        return 0, None, type(e).__name__
+
+
+async def app_context(webview_url: str) -> dict:
+    """Mini uygulamaya girer: sayfa + JS'i okur, calisan giris yontemini (tma / token) bulur.
+    Giris verisi yalniz bellekte kalir."""
     init = parse_init_data(webview_url)
     base_url = webview_url.split("#")[0]
     pu = urlparse(base_url)
     origin = f"{pu.scheme}://{pu.netloc}"
-    res = {"links": [], "codes": [], "templates": [], "api": [], "notes": []}
+    ctx = {"ok": False, "init": init, "origin": origin, "mode": "", "hdr": {}, "bases": [origin],
+           "blobs": [], "hosts": [], "paths": [], "got": [], "auth": None, "notes": []}
 
     blobs, hosts, paths = await collect_site([base_url, origin + "/"])
+    ctx.update(blobs=blobs, hosts=hosts, paths=paths)
     if not blobs:
-        res["notes"].append("Uygulama sayfası indirilemedi.")
-        return res
-
-    for t in blobs:
-        found_tpl = re.findall(r"""[A-Za-z0-9_./:?&%\-]{0,80}startapp=[^\s"'`]{0,60}""", t)[:3]
-        if not found_tpl:
-            found_tpl = re.findall(r".{0,70}startapp=.{0,90}", t)[:2]
-        for s_ in found_tpl:
-            tpl = re.sub(r"\s+", " ", s_).strip()[:150]
-            if tpl and tpl not in res["templates"]:
-                res["templates"].append(tpl)
-    res["templates"] = res["templates"][:3]
-
+        ctx["notes"].append("Uygulama sayfası indirilemedi.")
+        return ctx
     if not init:
-        res["notes"].append("Giriş verisi alınamadı, API yoklaması yapılamadı.")
-        return res
+        ctx["notes"].append("Giriş verisi alınamadı, API yoklaması yapılamadı.")
+        return ctx
 
     api_bases = []
     for h in hosts:
@@ -1889,11 +1913,12 @@ async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
         if ph.netloc and "api" in ph.netloc.lower():
             api_bases.append(f"{ph.scheme}://{ph.netloc}")
     bases = list(dict.fromkeys(api_bases + [origin]))[:3]
+    ctx["bases"] = bases
     js_get = [p for p in paths if not ACTION_PATH_RE.search(p) and not AUTH_PATH_RE.search(p)]
     get_paths = list(dict.fromkeys(js_get + DEFAULT_GET_PATHS))[:24]
     urls = [b.rstrip("/") + p for p in get_paths for b in bases][:45]
 
-    base_hdr = {"Origin": origin, "Referer": origin + "/", "User-Agent": DESKTOP_UA, "Accept": "application/json"}
+    base_hdr = app_base_headers(origin)
     sem = asyncio.Semaphore(6)
 
     async def one(u, hdr):
@@ -1905,43 +1930,65 @@ async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
         out = await asyncio.gather(*[one(u, hdr) for u in urls])
         return [(u, d) for u, d in out if d]
 
-    got = await run_gets({**base_hdr, "Authorization": f"tma {init}", "X-Telegram-Init-Data": init})
-    mode = "tma"
-    if not got:
-        # Bazi uygulamalar once giris yapip oturum anahtari (token) dagitir
-        auth_paths = [p for p in paths if AUTH_PATH_RE.search(p) and not ACTION_PATH_RE.search(p)] + DEFAULT_AUTH_PATHS
-        auth_urls = [b.rstrip("/") + p for p in dict.fromkeys(auth_paths) for b in bases][:12]
-        bodies = [{"initData": init}, {"init_data": init}, {"initDataRaw": init}, {"data": init}]
-        token, t0 = None, time.time()
-        for au in auth_urls:
-            for body in bodies:
-                if time.time() - t0 > 60:
-                    break
-                st, data = await http_json("POST", au, {**base_hdr, "Content-Type": "application/json"}, body)
-                token = find_token(data)
-                if token:
-                    break
-            if token or time.time() - t0 > 60:
-                break
-        if token:
-            mode = "token"
-            got = await run_gets({**base_hdr, "Authorization": f"Bearer {token}"})
-        else:
-            res["notes"].append("API giriş yöntemini çözemedim (tma başlığı ve basit giriş denemeleri sonuç vermedi).")
+    tma_hdr = {**base_hdr, "Authorization": f"tma {init}", "X-Telegram-Init-Data": init}
+    got = await run_gets(tma_hdr)
+    if got:
+        ctx.update(ok=True, mode="tma", hdr=tma_hdr, got=got)
+        return ctx
 
-    for u, data in got:
+    # Bazi uygulamalar once giris yapip oturum anahtari (token) dagitir
+    auth_paths = [p for p in paths if AUTH_PATH_RE.search(p) and not ACTION_PATH_RE.search(p)] + DEFAULT_AUTH_PATHS
+    auth_urls = [b.rstrip("/") + p for p in dict.fromkeys(auth_paths) for b in bases][:12]
+    bodies = [{"initData": init}, {"init_data": init}, {"initDataRaw": init}, {"data": init}]
+    token, used, t0 = None, None, time.time()
+    for au in auth_urls:
+        for body in bodies:
+            if time.time() - t0 > 60:
+                break
+            st, data = await http_json("POST", au, {**base_hdr, "Content-Type": "application/json"}, body)
+            token = find_token(data)
+            if token:
+                used = {"url": au, "key": next(iter(body))}
+                break
+        if token or time.time() - t0 > 60:
+            break
+    if token:
+        bearer = {**base_hdr, "Authorization": f"Bearer {token}"}
+        ctx.update(ok=True, mode="token", hdr=bearer, auth=used, got=await run_gets(bearer))
+    else:
+        ctx["notes"].append("API giriş yöntemini çözemedim (tma başlığı ve basit giriş denemeleri sonuç vermedi).")
+    return ctx
+
+
+async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
+    """Mini uygulamanin JS'inden referans kalibi arar, giris verisiyle API'yi (yalniz GET) yoklar."""
+    ctx = await app_context(webview_url)
+    res = {"links": [], "codes": [], "templates": [], "api": [], "notes": list(ctx["notes"])}
+
+    for t in ctx["blobs"]:
+        found_tpl = re.findall(r"""[A-Za-z0-9_./:?&%\-]{0,80}startapp=[^\s"'`]{0,60}""", t)[:3]
+        if not found_tpl:
+            found_tpl = re.findall(r".{0,70}startapp=.{0,90}", t)[:2]
+        for s_ in found_tpl:
+            tpl = re.sub(r"\s+", " ", s_).strip()[:150]
+            if tpl and tpl not in res["templates"]:
+                res["templates"].append(tpl)
+    res["templates"] = res["templates"][:3]
+
+    for u, data in ctx["got"]:
         links, codes, keys = [], [], []
         scan_json(data, "", links, codes, keys)
         res["links"] += links
         res["codes"] += codes
-        short = urlparse(u).path
         if keys:
-            res["api"].append(f"GET {short} → {', '.join(keys[:8])}")
+            res["api"].append(f"GET {urlparse(u).path} → {', '.join(keys[:8])}")
     res["links"] = list(dict.fromkeys(res["links"]))[:5]
     res["codes"] = list(dict.fromkeys(res["codes"]))[:6]
     res["api"] = list(dict.fromkeys(res["api"]))[:8]
-    if got:
-        res["notes"].append(f"API yoklaması başarılı ({mode} yöntemi, {len(got)} yanıt).")
+    if ctx["got"]:
+        res["notes"].append(f"API yoklaması başarılı ({ctx['mode']} yöntemi, {len(ctx['got'])} yanıt).")
+    elif ctx["ok"]:
+        res["notes"].append(f"Giriş çalışıyor ({ctx['mode']}) ama okuma yolları cevap vermedi.")
     return res
 
 
@@ -1994,6 +2041,231 @@ async def ref_finder(bot: str):
             await send_admin(f"⚠️ @{bot} referans araması başarısız: {type(e).__name__} {e}")
         except Exception:
             pass
+
+
+# ===================== ODUL TOPLAMA (mini uygulama, kesif tabanli + onayli) =====================
+# Uygulamanin KENDI JS kodunda gecen, guvenli 'topla / oturum baslat' yollarini bulur. Para harcayan,
+# yakan, cekim yapan, satin alan yollara asla istek atmaz. Her yol ilk kez SENIN onayinla denenir;
+# calisirsa istersen otomatik (periyodik) toplanir.
+
+CLAIMS_KEY = os.getenv("CLAIMS_KEY", "radar:claims:v1").strip()
+CLAIMS_FILE = os.getenv("CLAIMS_FILE", "/tmp/radar_claims.json")
+CLAIMS: dict = {}  # "bot|yol" -> {bot, base, path, mode, auth, every, last, on, n_ok, n_err, cls, ...}
+CLAIM_EVERY_MIN = int(os.getenv("CLAIM_EVERY_MIN", "60") or 60)
+
+CLAIM_OK_RE = re.compile(
+    r"claim|collect|harvest|check-?in|daily|session|farm|(?<![a-z])(?:mine|mining)(?![a-z])", re.I)
+CLAIM_BAD_RE = re.compile(
+    r"buy|purchase|shop|store|burn|forge|withdraw|deposit|transfer|swap|stake|pay|invest|upgrade|craft|ticket|"
+    r"sell|exchange|mint|task|referral|invite|friend|crew|clash|arcade|raid|play|spin|wheel|bet|wager|stars|"
+    r"premium|wallet|(?<![a-z])ton(?![a-z])|auth|login|logout|signout|revoke|delete|remove|unlink|connect|verify|boost",
+    re.I,
+)
+CLAIM_SCAN_RE = re.compile(
+    r"""["'`](/[A-Za-z0-9_\-/.]*(?:claim|collect|harvest|checkin|check-in|session|mine|mining|farm|daily)"""
+    r"""[A-Za-z0-9_\-/.]{0,40})["'`]""",
+    re.I,
+)
+
+
+async def persist_claims():
+    await save_json(CLAIMS_KEY, CLAIMS_FILE, CLAIMS)
+
+
+async def load_claims():
+    data = await load_json(CLAIMS_KEY, CLAIMS_FILE)
+    if isinstance(data, dict):
+        CLAIMS.update(data)
+    print("[TOPLAMA]", len(CLAIMS))
+
+
+def claim_candidates(ctx: dict) -> list:
+    """Uygulamanin kendi kodunda gecen guvenli 'topla/oturum' yollari."""
+    found = []
+    for t in ctx["blobs"]:
+        found += CLAIM_SCAN_RE.findall(t)
+    found += list(ctx["paths"])
+    out = []
+    for p in dict.fromkeys(found):
+        if not CLAIM_OK_RE.search(p) or CLAIM_BAD_RE.search(p):
+            continue
+        if re.search(r"[{}$:\\]", p) or len(p) > 80:
+            continue
+        if p.lower().endswith((".js", ".css", ".png", ".svg", ".json", ".html", ".jpg", ".webp", ".woff2")):
+            continue
+        out.append(p)
+    return out[:6]
+
+
+def summarize_resp(data, txt: str) -> str:
+    """Cevabin kisa ozeti (oturum anahtari / gizli alanlar yazilmaz)."""
+    if isinstance(data, dict):
+        parts = []
+        for k, v in list(data.items())[:12]:
+            if re.search(r"token|jwt|secret|key|hash|sign|auth", str(k), re.I):
+                continue
+            if isinstance(v, (str, int, float, bool)) and len(str(v)) <= 60 and not str(v).startswith("eyJ"):
+                parts.append(f"{k}={v}")
+        if parts:
+            return ", ".join(parts[:6])
+        return "alanlar: " + ", ".join(list(data.keys())[:10])
+    return (txt or "")[:80]
+
+
+async def quick_auth(webview_url: str, c: dict):
+    """Kayitli giris yontemiyle (kesif yapmadan) yetki basliklarini uretir."""
+    init = parse_init_data(webview_url)
+    if not init:
+        return None
+    pu = urlparse(webview_url.split("#")[0])
+    origin = f"{pu.scheme}://{pu.netloc}"
+    base_hdr = app_base_headers(origin)
+    if c.get("mode") == "tma":
+        return {**base_hdr, "Authorization": f"tma {init}", "X-Telegram-Init-Data": init}
+    a = c.get("auth") or {}
+    if c.get("mode") == "token" and a.get("url") and a.get("key"):
+        st, data, _ = await http_call("POST", a["url"], {**base_hdr, "Content-Type": "application/json"},
+                                      {a["key"]: init})
+        tok = find_token(data)
+        if tok:
+            return {**base_hdr, "Authorization": f"Bearer {tok}"}
+    return None
+
+
+async def claim_run(c: dict):
+    """Kayitli bir toplama istegini taze giris verisiyle atar. (durum, ozet) doner."""
+    bot = c["bot"]
+    ent = await resolve_entity(bot)
+    async with TG_LOCK:
+        url, how, pub = await get_webview_url(ent, bot)
+    if not url:
+        return 0, "mini uygulama açılamadı"
+    hdr = await quick_auth(url, c)
+    if hdr is None:
+        return 401, "giriş yapılamadı"
+    st, data, txt = await http_call("POST", c["base"].rstrip("/") + c["path"],
+                                    {**hdr, "Content-Type": "application/json"}, {})
+    return st, summarize_resp(data, txt)
+
+
+async def claim_discover(bot: str):
+    """Uygulamaya girer, kodunda gecen guvenli toplama yollarini listeler (hicbirine istek atmaz)."""
+    try:
+        ent = await resolve_entity(bot)
+        if not getattr(ent, "bot", False):
+            await send_admin(f"ℹ️ @{bot} bir bot değil.")
+            return
+        await send_admin(f"🔎 @{bot}: uygulamanın kendi kodundaki 'topla / oturum' yolları aranıyor (hiçbirine istek atmıyorum)...")
+        async with TG_LOCK:
+            url, how, pub = await get_webview_url(ent, bot)
+        if not url:
+            await send_admin(f"⚠️ @{bot}: mini uygulama açılamadı. {how[:300]}")
+            return
+        ctx = await app_context(url)
+        cands = claim_candidates(ctx)
+        if not cands:
+            await send_admin(f"❌ @{bot}: uygulamanın kodunda güvenli bir 'topla / oturum' yolu bulamadım.\n"
+                             + "\n".join(ctx["notes"]) + "\n\nİstersen /ref " + bot + " ile uygulamanın API yapısına bak.")
+            return
+        lines = [f"🪙 @{bot}: uygulamanın kodunda şu 'topla / oturum' yolları geçiyor:"]
+        lines += [f"- {p}" for p in cands]
+        lines += ["", f"Giriş yöntemi: {ctx['mode'] or 'çözülemedi'}",
+                  "Henüz hiçbirine istek atmadım. Bir yolu denemek için butona bas (POST {} atarım).",
+                  "Para harcayan / yakan / çekim yapan yollar listeye alınmadı."]
+        rows = []
+        if ctx["ok"]:
+            for p in cands[:4]:
+                aid = new_action({"t": "claimtry", "bot": bot, "path": p})
+                rows.append([InlineKeyboardButton(f"▶️ POST {p[:40]} dene", callback_data=f"a:{aid}")])
+        else:
+            lines.append("⚠️ Uygulamaya giriş yapamadığım için deneme butonu koymadım.")
+        await send_admin("\n".join(lines), InlineKeyboardMarkup(rows) if rows else None)
+    except Exception as e:
+        print("[CLAIM DISCOVER]", repr(e))
+        try:
+            await send_admin(f"⚠️ @{bot} toplama araması başarısız: {type(e).__name__} {e}")
+        except Exception:
+            pass
+
+
+async def claim_try(act: dict):
+    """Onaylanan yola ilk kez POST {} atar; calisirsa 'otomatik topla' butonu sunar."""
+    bot, path = act["bot"], act["path"]
+    try:
+        ent = await resolve_entity(bot)
+        async with TG_LOCK:
+            url, how, pub = await get_webview_url(ent, bot)
+        if not url:
+            await send_admin(f"⚠️ @{bot}: mini uygulama açılamadı. {how[:200]}")
+            return
+        ctx = await app_context(url)
+        if not ctx["ok"]:
+            await send_admin(f"⚠️ @{bot}: uygulamaya giriş yapamadım. " + " ".join(ctx["notes"]))
+            return
+        hdr = {**ctx["hdr"], "Content-Type": "application/json"}
+        last = None
+        for base in ctx["bases"]:
+            st, data, txt = await http_call("POST", base.rstrip("/") + path, hdr, {})
+            last = (base, st, data, txt)
+            if st not in (0, 404):
+                break
+        base, st, data, txt = last
+        ok = 200 <= st < 300
+        lines = [f"{'✅' if ok else '⚠️'} @{bot}: POST {path} → {st}", summarize_resp(data, txt)]
+        kb = None
+        if ok:
+            aid = new_action({"t": "claimauto", "bot": bot, "base": base, "path": path,
+                              "mode": ctx["mode"], "auth": ctx["auth"]})
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                f"🔁 Otomatik topla (her {CLAIM_EVERY_MIN} dk)", callback_data=f"a:{aid}")]])
+        else:
+            lines.append("İstek kabul edilmedi: zamanı gelmemiş olabilir ya da gövde/parametre gerekiyor. "
+                         "Birkaç dakika sonra tekrar deneyebilirsin.")
+        await send_admin("\n".join(lines), kb)
+    except Exception as e:
+        print("[CLAIM TRY]", repr(e))
+        try:
+            await send_admin(f"⚠️ @{bot} toplama denemesi başarısız: {type(e).__name__} {e}")
+        except Exception:
+            pass
+
+
+async def claims_tick():
+    """Zamani gelen otomatik toplamalari bir kez calistirir."""
+    now = time.time()
+    for key, c in list(CLAIMS.items()):
+        if not c.get("on", True) or now - c.get("last", 0) < c.get("every", CLAIM_EVERY_MIN) * 60:
+            continue
+        c["last"] = now
+        try:
+            st, summ = await claim_run(c)
+        except Exception as e:
+            st, summ = 0, type(e).__name__
+        cls = "ok" if 200 <= st < 300 else ("wait" if st in (400, 409, 423, 425, 429) else "err")
+        prev = c.get("cls")
+        c.update(st=st, msg=summ, cls=cls, when=now)
+        if cls == "ok":
+            c["n_ok"] = c.get("n_ok", 0) + 1
+        elif cls == "err":
+            c["n_err"] = c.get("n_err", 0) + 1
+        await persist_claims()
+        notify = (cls == "err" and prev != "err") or (
+            cls == "ok" and (prev in (None, "err") or now - c.get("last_notify", 0) > 12 * 3600))
+        if notify:
+            c["last_notify"] = now
+            await persist_claims()
+            await send_admin(f"{'🪙' if cls == 'ok' else '⚠️'} Otomatik toplama @{c['bot']} {c['path']}: {st} {summ}\n"
+                             f"Toplam başarılı: {c.get('n_ok', 0)}, hata: {c.get('n_err', 0)}  (liste: /topla)")
+
+
+async def claims_loop():
+    await asyncio.sleep(150)
+    while True:
+        try:
+            await claims_tick()
+        except Exception as e:
+            print("[CLAIMS LOOP]", repr(e))
+        await asyncio.sleep(60)
 
 
 # ===================== GUNLUK RUTIN =====================
@@ -2133,6 +2405,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/incele botadi  (bota /start yaz, cevabı oku, rapor ver)\n"
         "/oyun botadi  (mini uygulamanın sunucu adreslerini çıkar)\n"
         "/ref botadi  (referans linkini bul ve kaydet; /ref ile liste)\n"
+        "/topla botadi  (mini uygulamada ödül toplama / oturum başlatma yolunu bul, otomatikleştir)\n"
         "/gorev botadi  (görev listesindeki görevleri otomatik yap)\n"
         "/otopilot gram_prbot  (hiç durmadan çalış, 7 gün sonra kanallardan çık)\n"
         "/cik  (süresi dolan kanallardan şimdi çık)\n"
@@ -2185,470 +2458,4 @@ async def cmd_bil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kullanim:\n/bil hamster_kombat_bot blumcryptobot\n(link de yazabilirsin)"
         )
         return
-    eklenen = []
-    for a in context.args:
-        m = BOT_LINK_RE.search(a)
-        name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-        if re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-            seen[f"bot:{name}"] = time.time()
-            eklenen.append(name)
-    if eklenen:
-        await persist_seen()
-        await update.effective_message.reply_text(
-            "Bilinen olarak eklendi: " + ", ".join("@" + n for n in eklenen)
-        )
-    else:
-        await update.effective_message.reply_text("Gecerli bot adi bulunamadi.")
-
-
-@admin_only
-async def cmd_incele(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text("Kullanim:\n/incele hamster_kombat_bot")
-        return
-    a = context.args[0]
-    m = BOT_LINK_RE.search(a)
-    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
-        return
-    await update.effective_message.reply_text(
-        f"@{name} inceleniyor, 10-20 saniye (sırada başka varsa daha uzun)..."
-    )
-    spawn(inspect_bot(name))
-
-
-@admin_only
-async def cmd_oyun(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Kullanim:\n/oyun lootvaultdexbot\nveya bir site adresi:\n/oyun https://lootvault.lol")
-        return
-    a = context.args[0]
-    if a.lower().startswith("http"):
-        await update.effective_message.reply_text("Site inceleniyor, 20-40 saniye...")
-        spawn(recon_game(a))
-        return
-    m = BOT_LINK_RE.search(a)
-    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten) ya da http adresi.")
-        return
-    await update.effective_message.reply_text(f"@{name} inceleniyor, 20-40 saniye...")
-    spawn(recon_game(name))
-
-
-@admin_only
-async def cmd_gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Kullanim:\n/gorev gram_prbot\n(menüde Kazanç > Kanallar'a gider; görev kalmayana ya da /dur diyene kadar yapar)\n\n"
-            "Sayıyla sınırlamak için:\n/gorev gram_prbot kazanc>kanallar 30\n\n"
-            "Durdurmak için: /dur")
-        return
-    a = context.args[0]
-    m = BOT_LINK_RE.search(a)
-    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
-        return
-    cap, steps = AUTO_DEFAULT_CAP, ["kazanc", "kanallar"]
-    for x in context.args[1:]:
-        if x.isdigit():
-            cap = max(0, int(x))
-        else:
-            steps = [y.strip() for y in x.split(">") if y.strip()]
-    if AUTO_RUNNING:
-        await update.effective_message.reply_text("⏳ Zaten bir otomatik görev çalışıyor. Durdurmak için /dur")
-        return
-    await update.effective_message.reply_text(
-        f"🤖 @{name}: {' > '.join(steps)} yolundan {cap if cap > 0 else 'sınırsız'} görev otomatik başlıyor. Bitince özet gelecek. Durdurmak için /dur")
-    spawn(run_autotasks(name, steps, cap))
-
-
-@admin_only
-async def cmd_otopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.effective_message.reply_text(autopilot_status_text())
-        return
-    a = args[0].lower().lstrip("@")
-    if a in ("kapat", "off", "durdur", "dur"):
-        AUTOPILOT["on"] = False
-        await persist_autopilot()
-        await update.effective_message.reply_text(
-            "🛬 Otopilot kapatıldı. Görev taraması durdu; 7 günü dolan kanallardan çıkış takibi sürüyor.")
-        return
-    m = BOT_LINK_RE.search(a)
-    name = (m.group(1) if m else a).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Kullanım:\n/otopilot gram_prbot\n/otopilot kapat\n/otopilot (durum)")
-        return
-    steps = ["kazanc", "kanallar"]
-    if len(args) > 1:
-        steps = [y.strip() for y in args[1].split(">") if y.strip()] or steps
-    AUTOPILOT.update({"on": True, "bot": name, "steps": steps, "since": time.time()})
-    await persist_autopilot()
-    await update.effective_message.reply_text(
-        f"🛫 Otopilot açıldı: @{name} ({' > '.join(steps)})\n"
-        f"Şimdi ilk turu başlatıyorum. Sonra her {AUTOPILOT_MIN_MINUTES}-{AUTOPILOT_MAX_MINUTES} dk'da bir "
-        f"yeni görevleri tarar, hiç durmaz. Katıldığım kanallardan "
-        f"{LEAVE_AFTER_HOURS // 24} gün {LEAVE_AFTER_HOURS % 24} saat sonra çıkarım.\n"
-        f"Kapatmak için: /otopilot kapat")
-    spawn(run_autotasks(name, steps, 0))
-
-
-@admin_only
-async def cmd_cik(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Süresi dolan kanallar kontrol ediliyor...")
-    spawn(leave_and_report(True))
-
-
-@admin_only
-async def cmd_dur(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_STOP
-    if AUTO_RUNNING:
-        AUTO_STOP = True
-        await update.effective_message.reply_text("Durdurma isteği alındı, o anki görev bitince duracak." + (" Otopilot hâlâ açık, sonraki turda yeniden başlar; tamamen kapatmak için /otopilot kapat." if AUTOPILOT.get("on") else ""))
-    else:
-        await update.effective_message.reply_text("Çalışan otomatik görev yok.")
-
-
-@admin_only
-async def cmd_yetkiler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
-        await update.effective_message.reply_text("Bu sadece asıl sahibe açık.")
-        return
-    lines = ["🔑 Botu kullanabilenler:"]
-    rows = []
-    for uid in sorted(ADMIN_IDS):
-        info = EXTRA_ADMINS.get(str(uid), {})
-        tag = "asıl sahip" if uid == ADMIN_USER_ID else (info.get("name") or "eklenen")
-        lines.append(f"- {uid} ({tag})")
-        if str(uid) in EXTRA_ADMINS:
-            rows.append([InlineKeyboardButton(f"Yetkiyi kaldır: {uid}", callback_data=f"adm:del:{uid}")])
-    lines.append("\nYeni hesap eklemek için: o hesaptan bota /start yaz, sana onay butonu gelir.")
-    await update.effective_message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows) if rows else None)
-
-
-def routines_text_and_kb():
-    if not ROUTINES:
-        return "Rutin yok.\n\nBir botu /incele ile incele, bir butona bas, çıkan\n'🔁 Her gün otomatik' butonuna dokun.", None
-    lines = [f"Günlük rutinler ({len(ROUTINES)}):"]
-    rows = []
-    for rid, r in ROUTINES.items():
-        lines.append(f"- @{r['bot']} → '{r['label']}'")
-        rows.append([InlineKeyboardButton(f"Sil: {r['bot'][:14]} / {r['label'][:14]}", callback_data=f"rd:{rid}")])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
-
-
-@admin_only
-async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        if not REFS:
-            await update.effective_message.reply_text(
-                "Kayıtlı referans linki yok.\n\n/ref botadi → otomatik ara\n"
-                "/ref botadi https://t.me/... → elle kaydet\n/ref sil botadi")
-            return
-        lines = ["Kayıtlı referans linkleri:"] + [f"@{b}: {v['link']}" for b, v in REFS.items()]
-        await update.effective_message.reply_text("\n".join(lines)[:4000], disable_web_page_preview=True)
-        return
-    if args[0].lower() in ("sil", "del") and len(args) > 1:
-        name = args[1].lstrip("@").lower()
-        if REFS.pop(name, None) is not None:
-            await persist_refs()
-            await update.effective_message.reply_text(f"@{name} referans linki silindi.")
-        else:
-            await update.effective_message.reply_text("Böyle bir kayıt yok.")
-        return
-    m = BOT_LINK_RE.search(args[0])
-    name = (m.group(1) if m else args[0].strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
-        return
-    if len(args) >= 2 and args[1].lower().startswith(("http", "t.me")):
-        link = args[1] if args[1].lower().startswith("http") else "https://" + args[1]
-        if "t.me/" not in link.lower():
-            await update.effective_message.reply_text("Bu bir t.me linki değil.")
-            return
-        REFS[name] = {"link": link, "src": "elle", "t": time.time()}
-        await persist_refs()
-        await update.effective_message.reply_text(f"@{name} için referans linki kaydedildi.")
-        return
-    spawn(ref_finder(name))
-
-
-@admin_only
-async def cmd_rutin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text, kb = routines_text_and_kb()
-    await update.effective_message.reply_text(text, reply_markup=kb)
-
-
-def kb_without(markup, data: str):
-    if not markup:
-        return None
-    rows = [[b for b in row if b.callback_data != data] for row in markup.inline_keyboard]
-    rows = [r for r in rows if r]
-    return InlineKeyboardMarkup(rows) if rows else None
-
-
-@admin_only
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or not q.data:
-        return
-    data = q.data
-
-    if data.startswith("del:"):
-        await q.answer()
-        try:
-            cid = int(data[4:])
-        except ValueError:
-            await q.edit_message_text("Gecersiz ID")
-            return
-        msg = await del_source(cid)
-        await enrich_source_titles()
-        text = msg + "\n\n" + list_sources_text()
-        kb = build_list_keyboard()
-        try:
-            await q.edit_message_text(text[:4000], reply_markup=kb)
-        except Exception:
-            await q.message.reply_text(text[:4000], reply_markup=kb)
-
-    elif data.startswith("adm:"):
-        await q.answer()
-        if q.from_user.id != ADMIN_USER_ID:
-            await q.message.reply_text("Yetki verme/kaldırma sadece asıl sahibe açık.")
-            return
-        parts = data.split(":")
-        act = parts[1] if len(parts) > 1 else ""
-        uid = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
-        if act == "ok" and uid:
-            ADMIN_IDS.add(uid)
-            try:
-                chat = await context.bot.get_chat(uid)
-                nm = f"{chat.full_name} (@{chat.username})" if chat.username else str(chat.full_name)
-            except Exception:
-                nm = str(uid)
-            EXTRA_ADMINS[str(uid)] = {"name": nm, "t": time.time()}
-            await persist_admins()
-            await q.message.reply_text(f"✅ Yetki verildi: {nm} (ID {uid})")
-            try:
-                await context.bot.send_message(uid, "✅ Erişim verildi. /start yaz, komutlar orada.")
-            except Exception:
-                pass
-        elif act == "no" and uid:
-            await q.message.reply_text(f"❌ Reddedildi: ID {uid}")
-        elif act == "del" and uid and str(uid) in EXTRA_ADMINS:
-            ADMIN_IDS.discard(uid)
-            EXTRA_ADMINS.pop(str(uid), None)
-            await persist_admins()
-            await q.message.reply_text(f"Yetki kaldırıldı: ID {uid}")
-
-    elif data.startswith("ins:"):
-        await q.answer("İnceleniyor...")
-        name = data[4:].strip().lower()
-        if re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-            spawn(inspect_bot(name))
-            await q.message.reply_text(f"@{name} inceleniyor...")
-
-    elif data.startswith("a:"):
-        act = ACTIONS.get(data[2:])
-        if not act:
-            await q.answer("Bu buton eskimiş.", show_alert=True)
-            await q.message.reply_text("Bu işlemin süresi dolmuş (servis yeniden başlamış olabilir). "
-                                       "/incele botadi ile yeniden bak.")
-            return
-        await q.answer("İşleniyor...")
-        try:
-            await q.edit_message_reply_markup(reply_markup=kb_without(q.message.reply_markup, data))
-        except Exception:
-            pass
-        try:
-            await handle_action(act)
-        except Exception as e:
-            print("[ACTION]", repr(e))
-            await send_admin(f"⚠️ İşlem hatası: {e}")
-
-    elif data.startswith("rd:"):
-        await q.answer()
-        ROUTINES.pop(data[3:], None)
-        await persist_routines()
-        text, kb = routines_text_and_kb()
-        try:
-            await q.edit_message_text(text, reply_markup=kb)
-        except Exception:
-            await q.message.reply_text(text, reply_markup=kb)
-    else:
-        await q.answer()
-
-
-@admin_only
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n_bots = sum(1 for k in seen if k.startswith("bot:"))
-    await update.effective_message.reply_text(
-        f"Durum: aktif\n"
-        f"Dinlenen: {len(ACTIVE_SOURCES)}\n"
-        f"Gorulen/bilinen bot: {n_bots}\n"
-        f"Mod: {'sadece bot linkleri' if ONLY_BOTS else 'genis filtre'}\n"
-        f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
-        f"Kanal katilim limiti: {JOIN_DAILY_MAX if JOIN_DAILY_MAX > 0 else 'yok'}\n"
-        f"Otomatik gorev: {'calisiyor' if AUTO_RUNNING else 'bosta'}\n"
-        f"Otopilot: {autopilot_short()} | kayitli kanal: {len(JOINS)}\n"
-        f"Gunluk rutin: {len(ROUTINES)} ({'acik' if ROUTINES_ON else 'kapali'})\n"
-        f"Groq: {'acik' if GROQ_API_KEY else 'kapali'} ({GROQ_MODEL})\n"
-        f"Gemini (yedek): {'acik' if GEMINI_API_KEY else 'kapali'} ({GEMINI_MODEL})\n"
-        f"Upstash: {'acik' if UPSTASH_REDIS_REST_URL else 'kapali'}\n"
-        f"Keepalive: {'acik' if (KEEPALIVE and RENDER_URL) else 'kapali'}"
-    )
-
-
-# ===================== HTTP (Render port) =====================
-
-async def handle_health(request):
-    return web.Response(text=f"ok sources={len(ACTIVE_SOURCES)}", content_type="text/plain")
-
-
-async def start_http():
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_get("/health", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"[HTTP] Port {PORT} acik (Render health)")
-
-
-async def keepalive_loop():
-    if not (KEEPALIVE and RENDER_URL):
-        print("[KEEPALIVE] kapali")
-        return
-    print("[KEEPALIVE] acik:", RENDER_URL)
-    while True:
-        await asyncio.sleep(600)
-        try:
-            assert http_session is not None
-            async with http_session.get(
-                RENDER_URL + "/health", timeout=aiohttp.ClientTimeout(total=20)
-            ) as r:
-                await r.read()
-        except Exception as e:
-            print("[KEEPALIVE HATA]", repr(e))
-
-
-# ===================== MAIN =====================
-
-async def main():
-    global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK
-
-    if not API_ID or not API_HASH or not STRING_SESSION:
-        raise SystemExit("API_ID / API_HASH / STRING_SESSION zorunlu")
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN zorunlu (Airdrop radar bot)")
-    if not ADMIN_USER_ID:
-        raise SystemExit("ADMIN_USER_ID / ADMIN_CHAT_ID zorunlu")
-
-    TG_LOCK = asyncio.Lock()
-    INSPECT_LOCK = asyncio.Lock()
-
-    print("=" * 60)
-    print("AIRDROP RADARI v3 + GROQ")
-    print("=" * 60)
-    print("[KONFIG] ADMIN =", ADMIN_USER_ID)
-    print("[KONFIG] PORT =", PORT)
-    print("[KONFIG] GROQ =", GROQ_MODEL if GROQ_API_KEY else "yok")
-    print("[KONFIG] GEMINI =", GEMINI_MODEL if GEMINI_API_KEY else "yok")
-    print("[KONFIG] MOD =", "sadece bot linkleri" if ONLY_BOTS else "genis filtre")
-    print("[KONFIG] INSPECT =", INSPECT, "| RUTIN =", ROUTINES_ON)
-
-    http_session = aiohttp.ClientSession()
-    await start_http()
-
-    tg_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-    await tg_client.start()
-    me = await tg_client.get_me()
-    print("[TELETHON]", me.id, getattr(me, "username", None))
-    await tg_client.get_dialogs()
-
-    await load_seen()
-    await load_routines()
-    await load_joins()
-    await load_autopilot()
-    await load_admins()
-    await load_refs()
-
-    seed = []
-    seed.extend(parse_id_list(SOURCE_CHATS_EXTRA))
-    seed.extend(await load_persisted_sources())
-
-    for item in seed:
-        try:
-            entity = await resolve_entity(item)
-            cid = get_peer_id(entity)
-            ACTIVE_SOURCES.add(cid)
-            SOURCE_META[cid] = (
-                getattr(entity, "title", None) or getattr(entity, "username", None) or str(cid)
-            )
-            print("[KAYNAK OK]", item, "->", cid, SOURCE_META[cid])
-        except Exception as e:
-            try:
-                ACTIVE_SOURCES.add(int(item))
-                print("[KAYNAK ID]", item)
-            except Exception:
-                print("[KAYNAK HATA]", item, repr(e))
-
-    await persist_sources()
-    tg_client.add_event_handler(on_group_message, events.NewMessage(incoming=True))
-
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", cmd_start))
-    bot_app.add_handler(CommandHandler("help", cmd_help))
-    bot_app.add_handler(CommandHandler("yardim", cmd_help))
-    bot_app.add_handler(CommandHandler("add", cmd_add))
-    bot_app.add_handler(CommandHandler("del", cmd_del))
-    bot_app.add_handler(CommandHandler("remove", cmd_del))
-    bot_app.add_handler(CommandHandler("list", cmd_list))
-    bot_app.add_handler(CommandHandler("bil", cmd_bil))
-    bot_app.add_handler(CommandHandler("incele", cmd_incele))
-    bot_app.add_handler(CommandHandler("oyun", cmd_oyun))
-    bot_app.add_handler(CommandHandler("ref", cmd_ref))
-    bot_app.add_handler(CommandHandler("gorev", cmd_gorev))
-    bot_app.add_handler(CommandHandler("dur", cmd_dur))
-    bot_app.add_handler(CommandHandler("otopilot", cmd_otopilot))
-    bot_app.add_handler(CommandHandler("cik", cmd_cik))
-    bot_app.add_handler(CommandHandler("yetkiler", cmd_yetkiler))
-    bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
-    bot_app.add_handler(CommandHandler("status", cmd_status))
-    bot_app.add_handler(CallbackQueryHandler(on_callback))
-
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling(drop_pending_updates=True)
-
-    spawn(keepalive_loop())
-    spawn(routine_loop())
-    spawn(autopilot_loop())
-
-    try:
-        await bot_app.bot.send_message(
-            ADMIN_CHAT_ID,
-            f"Radar aktif (v3 + Groq)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
-            f"Groq: {'acik' if GROQ_API_KEY else 'kapali'}\n"
-            f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
-            f"Rutin: {len(ROUTINES)}\n\n"
-            f"/add -100... ile grup ekle, /incele botadi ile dene",
-        )
-    except Exception as e:
-        print("[ADMIN MSG HATA]", repr(e))
-
-    print("[HAZIR] Bot komutlari + Telethon + HTTP")
-    await tg_client.run_until_disconnected()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    ekle
