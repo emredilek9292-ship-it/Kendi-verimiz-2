@@ -961,6 +961,7 @@ NOISE_HOSTS = (
     "w3.org", "github.com", "reactjs.org", "fb.me", "google", "gstatic", "telegram.org", "t.me",
     "cloudflare", "apple.com", "mozilla.org", "npmjs", "sentry", "facebook", "twitter.com", "x.com",
     "youtube", "unpkg", "jsdelivr", "cdnjs", "yandex", "jquery", "schema.org", "w.org",
+    "game.com", "example.com", "example.org", "localhost",
 )
 
 
@@ -1854,18 +1855,56 @@ def scan_json(obj, path, links, codes, keys, depth: int = 0):
             links.append(obj)
 
 
+CHUNK_RE = re.compile(r"""["'`]((?:\.{0,2}/)?[A-Za-z0-9_\-./]{2,100}\.js)["'`]""")
+
+
 async def collect_site(pages: list):
-    """Sayfalari + JS dosyalarini indirir. (blobs, sunucu_adresleri, yol_adaylari) doner."""
-    blobs, scripts = [], []
+    """Sayfalari + JS dosyalarini (ve onlarin ek olarak istedigi parca/chunk dosyalarini) indirir.
+    (blobs, sunucu_adresleri, yol_adaylari) doner."""
+    origin = ""
+    if pages:
+        pu0 = urlparse(pages[0])
+        origin = f"{pu0.scheme}://{pu0.netloc}"
+    blobs, js_items, scripts, seen_urls = [], [], [], set()
     for pg in pages[:4]:
         t = await fetch_text(pg)
         if t:
             blobs.append(t)
+            js_items.append((pg, t))
+            seen_urls.add(pg.split("?")[0])
             scripts += [urljoin(pg, x) for x in SCRIPT_RE.findall(t)[:6]]
     for sj in list(dict.fromkeys(scripts))[:8]:
+        seen_urls.add(sj.split("?")[0])
         t = await fetch_text(sj)
         if t:
             blobs.append(t)
+            js_items.append((sj, t))
+
+    # Tembel yuklenen parcalar: Mine / Wallet / Forge gibi ekranlar ayri dosyada olabilir
+    cand = []
+    for url, txt in js_items:
+        for ref in CHUNK_RE.findall(txt):
+            if ref.startswith(("http://", "https://", "//")):
+                continue
+            if ref.startswith(("assets/", "static/", "_next/", "/")):
+                full = urljoin(origin + "/", ref)
+            else:
+                full = urljoin(url, ref)
+            if origin and full.startswith(origin) and full.split("?")[0] not in seen_urls:
+                cand.append(full)
+    cand = list(dict.fromkeys(cand))[:30]
+    sem = asyncio.Semaphore(6)
+
+    async def get(u):
+        async with sem:
+            return await fetch_text(u)
+
+    if cand:
+        for t in await asyncio.gather(*[get(u) for u in cand]):
+            # bazi siteler olmayan dosya icin ana sayfayi (HTML) dondurur: onu atla
+            if t and not t.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+                blobs.append(t)
+
     hosts, paths = [], []
     for t in blobs:
         for h in HOST_RE.findall(t):
@@ -1874,7 +1913,7 @@ async def collect_site(pages: list):
                 continue
             hosts.append(h[:90])
         paths += PATH_RE.findall(t)
-    return blobs, list(dict.fromkeys(hosts))[:20], list(dict.fromkeys(paths))[:60]
+    return blobs, list(dict.fromkeys(hosts))[:20], list(dict.fromkeys(paths))[:150]
 
 
 def tma_headers(base_hdr: dict, init: str) -> dict:
@@ -2192,7 +2231,16 @@ async def claim_discover(bot: str):
             if ctx["hosts"]:
                 extra += "\n\nSunucu adresleri:\n" + "\n".join("- " + h for h in ctx["hosts"][:8])
             if ctx["paths"]:
-                extra += "\n\nKodda geçen yol adayları:\n" + "\n".join("- " + p for p in ctx["paths"][:15])
+                extra += "\n\nKodda geçen yol adayları:\n" + "\n".join("- " + p for p in ctx["paths"][:25])
+            api_lines = []
+            for u, data in ctx["got"][:6]:
+                lk, cd, ks = [], [], []
+                scan_json(data, "", lk, cd, ks)
+                if ks:
+                    api_lines.append(f"GET {urlparse(u).path} → {', '.join(ks[:20])}")
+            if api_lines:
+                extra += "\n\nAPI'den okuduğum alanlar (değerler yazılmadı):\n" + "\n".join(
+                    "- " + a for a in dict.fromkeys(api_lines))
             await send_admin(f"❌ @{bot}: uygulamanın kodunda güvenli bir 'topla / oturum' yolu bulamadım.\n"
                              + "\n".join(ctx["notes"]) + extra)
             return
