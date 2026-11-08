@@ -97,6 +97,14 @@ AUTOPILOT_MAX_MINUTES = int(os.getenv("AUTOPILOT_MAX_MINUTES", "60") or 60)
 
 BOT_LINK_RE = re.compile(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{2,}bot)\b", re.I)
 
+
+def parse_bot_arg(a: str) -> str:
+    """'@ad', 'ad' ya da t.me/ad linkinden kullanici adini alir (adi 'bot' ile bitmeyen mini uygulama botlari dahil)."""
+    a = (a or "").strip()
+    m = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})", a, re.I)
+    name = (m.group(1) if m else a.lstrip("@")).lower()
+    return name if re.fullmatch(r"[a-z0-9_]{4,32}", name) else ""
+
 # Kanal / grup linkleri (bot olmayanlar): t.me/kanaladi, t.me/+davetkodu, t.me/joinchat/kod
 CH_RE = re.compile(
     r"(?:https?://)?(?:t\.me|telegram\.me)/"
@@ -2160,6 +2168,22 @@ def claim_candidates(ctx: dict) -> list:
     return out[:6]
 
 
+AUTO_SAFE_RE = re.compile(r"claim|collect|harvest|check-?in|daily", re.I)
+WAIT_HINT_RE = re.compile(r"already|wait|cooldown|too early|not ready|later|claimed|next|come back|bekle|hazır|zaten", re.I)  # onay istemeden denenebilen "dogrudan odul" yollari
+
+
+async def claim_post(ctx: dict, path: str):
+    """Yola POST {} atar (sirayla olasi sunucu adreslerinde). (base, durum, json, metin) doner."""
+    hdr = {**ctx["hdr"], "Content-Type": "application/json"}
+    last = (ctx["origin"], 0, None, "")
+    for base in ctx["bases"]:
+        st, data, txt = await http_call("POST", base.rstrip("/") + path, hdr, {})
+        last = (base, st, data, txt)
+        if st not in (0, 404):
+            break
+    return last
+
+
 def summarize_resp(data, txt: str) -> str:
     """Cevabin kisa ozeti (oturum anahtari / gizli alanlar yazilmaz)."""
     if isinstance(data, dict):
@@ -2211,14 +2235,16 @@ async def claim_run(c: dict):
     return st, summarize_resp(data, txt)
 
 
-async def claim_discover(bot: str):
+async def claim_discover(bot: str, auto: bool = False):
     """Uygulamaya girer, kodunda gecen guvenli toplama yollarini listeler (hicbirine istek atmaz)."""
     try:
         ent = await resolve_entity(bot)
         if not getattr(ent, "bot", False):
             await send_admin(f"ℹ️ @{bot} bir bot değil.")
             return
-        await send_admin(f"🔎 @{bot}: uygulamanın kendi kodundaki 'topla / oturum' yolları aranıyor (hiçbirine istek atmıyorum)...")
+        await send_admin(f"🔎 @{bot}: uygulamanın kendi kodundaki 'topla / oturum' yolları aranıyor "
+                         + ("(güvenli 'claim/collect/daily' yollarını otomatik deneyeceğim)..." if auto
+                            else "(hiçbirine istek atmıyorum)..."))
         async with TG_LOCK:
             url, how, pub = await get_webview_url(ent, bot)
         if not url:
@@ -2244,17 +2270,50 @@ async def claim_discover(bot: str):
             await send_admin(f"❌ @{bot}: uygulamanın kodunda güvenli bir 'topla / oturum' yolu bulamadım.\n"
                              + "\n".join(ctx["notes"]) + extra)
             return
-        lines = [f"🪙 @{bot}: uygulamanın kodunda şu 'topla / oturum' yolları geçiyor:"]
-        lines += [f"- {p}" for p in cands]
-        lines += ["", f"Giriş yöntemi: {ctx['mode'] or 'çözülemedi'}",
-                  "Henüz hiçbirine istek atmadım. Bir yolu denemek için butona bas (POST {} atarım).",
-                  "Para harcayan / yakan / çekim yapan yollar listeye alınmadı."]
+        auto_lines, done = [], set()
+        if auto and ctx["ok"]:
+            for p in [c for c in cands if AUTO_SAFE_RE.search(c)][:3]:
+                done.add(p)
+                base, st, data, txt = await claim_post(ctx, p)
+                ok = 200 <= st < 300
+                summ = summarize_resp(data, txt)
+                # "zaten alindi / sonra gel" gibi bekleme cevabi: yol dogru, sadece zamani gelmemis
+                cooldown = (not ok) and (st in (409, 425, 429) or (
+                    st == 400 and WAIT_HINT_RE.search(summ + " " + (txt or ""))))
+                tag = "✅" if ok else ("⏳" if cooldown else "⚠️")
+                auto_lines.append(f"{tag} POST {p} → {st} {summ}"
+                                  + (" (şu an bekleme süresinde, yine de otomatiğe aldım)" if cooldown else ""))
+                if ok or cooldown:
+                    CLAIMS[f"{bot}|{p}"] = {"bot": bot, "base": base, "path": p, "mode": ctx["mode"],
+                                            "auth": ctx["auth"], "every": CLAIM_EVERY_MIN, "last": time.time(),
+                                            "on": True, "n_ok": 1 if ok else 0, "n_err": 0,
+                                            "cls": "ok" if ok else "wait", "when": time.time()}
+            if done:
+                await persist_claims()
+        remaining = [p for p in cands if p not in done]
+        lines = []
+        if auto and not ctx["ok"]:
+            lines.append(f"⚠️ @{bot}: otomatik mod — uygulamaya giriş yapamadım, hiçbir istek atmadım.")
+        elif auto_lines:
+            lines += [f"🪙 @{bot}: otomatik mod — güvenli 'topla' yollarını denedim:"] + auto_lines
+            lines += ["", f"Başarılı olanlar otomatik toplamaya alındı (her {CLAIM_EVERY_MIN} dk, hata olursa haber "
+                          f"veririm). Liste / kapatma: /topla"]
+        elif auto:
+            lines.append(f"🪙 @{bot}: otomatik mod — 'claim / collect / daily' gibi doğrudan ödül yolu bulamadım.")
+        if remaining:
+            if lines:
+                lines.append("")
+            lines.append(f"🪙 @{bot}: uygulamanın kodunda şu {'onayını isteyen ' if auto else ''}'topla / oturum' yolları geçiyor:")
+            lines += [f"- {p}" for p in remaining]
+            lines += ["", f"Giriş yöntemi: {ctx['mode'] or 'çözülemedi'}",
+                      "Henüz bunlara istek atmadım. Bir yolu denemek için butona bas (POST {} atarım).",
+                      "Para harcayan / yakan / çekim yapan yollar listeye alınmadı."]
         rows = []
         if ctx["ok"]:
-            for p in cands[:4]:
+            for p in remaining[:4]:
                 aid = new_action({"t": "claimtry", "bot": bot, "path": p})
                 rows.append([InlineKeyboardButton(f"▶️ POST {p[:40]} dene", callback_data=f"a:{aid}")])
-        else:
+        elif remaining and not auto:
             lines.append("⚠️ Uygulamaya giriş yapamadığım için deneme butonu koymadım.")
         await send_admin("\n".join(lines), InlineKeyboardMarkup(rows) if rows else None)
     except Exception as e:
@@ -2557,10 +2616,9 @@ async def cmd_incele(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Kullanim:\n/incele hamster_kombat_bot")
         return
     a = context.args[0]
-    m = BOT_LINK_RE.search(a)
-    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+    name = parse_bot_arg(a)
+    if not name:
+        await update.effective_message.reply_text("Geçerli bir kullanıcı adı yaz (örnek: gram_prbot ya da MyAgeApp).")
         return
     await update.effective_message.reply_text(
         f"@{name} inceleniyor, 10-20 saniye (sırada başka varsa daha uzun)..."
@@ -2579,10 +2637,9 @@ async def cmd_oyun(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Site inceleniyor, 20-40 saniye...")
         spawn(recon_game(a))
         return
-    m = BOT_LINK_RE.search(a)
-    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten) ya da http adresi.")
+    name = parse_bot_arg(a)
+    if not name:
+        await update.effective_message.reply_text("Geçerli bir kullanıcı adı yaz (örnek: gram_prbot ya da MyAgeApp) ya da http adresi.")
         return
     await update.effective_message.reply_text(f"@{name} inceleniyor, 20-40 saniye...")
     spawn(recon_game(name))
@@ -2597,10 +2654,9 @@ async def cmd_gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Durdurmak için: /dur")
         return
     a = context.args[0]
-    m = BOT_LINK_RE.search(a)
-    name = (m.group(1) if m else a.strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+    name = parse_bot_arg(a)
+    if not name:
+        await update.effective_message.reply_text("Geçerli bir kullanıcı adı yaz (örnek: gram_prbot ya da MyAgeApp).")
         return
     cap, steps = AUTO_DEFAULT_CAP, ["kazanc", "kanallar"]
     for x in context.args[1:]:
@@ -2712,10 +2768,9 @@ async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.effective_message.reply_text("Böyle bir kayıt yok.")
         return
-    m = BOT_LINK_RE.search(args[0])
-    name = (m.group(1) if m else args[0].strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+    name = parse_bot_arg(args[0])
+    if not name:
+        await update.effective_message.reply_text("Geçerli bir kullanıcı adı yaz (örnek: gram_prbot ya da MyAgeApp).")
         return
     if len(args) >= 2 and args[1].lower().startswith(("http", "t.me")):
         link = args[1] if args[1].lower().startswith("http") else "https://" + args[1]
@@ -2736,7 +2791,7 @@ async def cmd_topla(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not CLAIMS:
             await update.effective_message.reply_text(
                 "Otomatik toplama yok.\n\n/topla botadi → uygulamanın kodundaki güvenli 'topla/oturum' "
-                "yollarını bul, onayınla dene\n/topla kapat botadi → o botun otomatik toplamalarını sil")
+                "yollarını bul, onayınla dene\n/topla botadi oto → onay istemeden güvenli claim/collect/daily yollarını dene, çalışanı otomatiğe al\n/topla kapat botadi → o botun otomatik toplamalarını sil")
             return
         now = time.time()
         lines = ["Otomatik toplamalar:"]
@@ -2754,12 +2809,12 @@ async def cmd_topla(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await persist_claims()
         await update.effective_message.reply_text(f"@{name}: {len(keys)} otomatik toplama silindi.")
         return
-    m = BOT_LINK_RE.search(args[0])
-    name = (m.group(1) if m else args[0].strip().lstrip("@")).lower()
-    if not re.fullmatch(r"[a-z0-9_]{2,}bot", name):
-        await update.effective_message.reply_text("Geçerli bir bot adı yaz (…bot ile biten).")
+    name = parse_bot_arg(args[0])
+    if not name:
+        await update.effective_message.reply_text("Geçerli bir kullanıcı adı yaz (örnek: gram_prbot ya da MyAgeApp).")
         return
-    spawn(claim_discover(name))
+    auto = any(x.lower() in ("oto", "otomatik", "auto") for x in args[1:])
+    spawn(claim_discover(name, auto))
 
 
 @admin_only
