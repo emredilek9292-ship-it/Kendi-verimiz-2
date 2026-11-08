@@ -953,7 +953,7 @@ DESKTOP_UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
 SCRIPT_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
 HOST_RE = re.compile(r"https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::\d+)?(?:/[A-Za-z0-9_\-./]*)?")
 PATH_RE = re.compile(
-    r"""["'`](/(?:api|v\d|auth|user|users|game|tasks?|claim|mine|mining|farm|reward|daily|upgrade|boost|referral)"""
+    r"""["'`](/(?:api|v\d|auth|users?|game|tasks?|claim|mine|mining|farm|rewards?|daily|upgrade|boost|referrals?|me(?![a-z])|profile|sessions?|state|config|init|bootstrap|wallet|forge|clash|invite|friends|stats|blocks?|leaderboard|shop|tickets?|crews?|levels?|trpc|graphql|rpc|rest)"""
     r"""[A-Za-z0-9_\-/.]{0,60})["'`]""",
     re.I,
 )
@@ -1707,7 +1707,9 @@ DEFAULT_GET_PATHS = [
 ]
 DEFAULT_AUTH_PATHS = [
     "/api/auth", "/api/auth/telegram", "/auth/telegram", "/api/login", "/api/telegram/auth",
-    "/api/v1/auth", "/api/v1/auth/telegram", "/api/v1/login",
+    "/api/v1/auth", "/api/v1/auth/telegram", "/api/v1/login", "/auth", "/login", "/api/auth/login",
+    "/api/v1/auth/login", "/api/session", "/api/v1/session", "/api/tg/auth", "/api/telegram",
+    "/api/user/auth", "/api/users/auth", "/api/webapp/auth", "/api/auth/webapp",
 ]
 
 
@@ -1743,6 +1745,9 @@ def find_ref_links(msgs, bot: str) -> list:
         for t in parts:
             for mm in rx.finditer(t):
                 link = mm.group(0)
+                pm = re.search(r"[?&](?:start|startapp)=([^&#\s]+)", link)
+                if pm and re.fullmatch(r"[a-z]+(?:_[a-z]+)+", pm.group(1)):
+                    continue  # 'rotate_restart' gibi: botun kendi eylem parametresi, kisisel referans degil
                 out.append(link if link.lower().startswith("http") else "https://" + link)
     return list(dict.fromkeys(out))
 
@@ -1872,6 +1877,12 @@ async def collect_site(pages: list):
     return blobs, list(dict.fromkeys(hosts))[:20], list(dict.fromkeys(paths))[:60]
 
 
+def tma_headers(base_hdr: dict, init: str) -> dict:
+    """Mini uygulama API'lerinin kullandigi yaygin giris basliklari (birlikte gonderilir)."""
+    return {**base_hdr, "Authorization": f"tma {init}", "X-Telegram-Init-Data": init, "X-Init-Data": init,
+            "X-Telegram-Web-App-Data": init, "Telegram-Init-Data": init, "Init-Data": init}
+
+
 def app_base_headers(origin: str) -> dict:
     return {"Origin": origin, "Referer": origin + "/", "User-Agent": DESKTOP_UA, "Accept": "application/json"}
 
@@ -1936,7 +1947,7 @@ async def app_context(webview_url: str) -> dict:
         out = await asyncio.gather(*[one(u, hdr) for u in urls])
         return [(u, d) for u, d in out if d]
 
-    tma_hdr = {**base_hdr, "Authorization": f"tma {init}", "X-Telegram-Init-Data": init}
+    tma_hdr = tma_headers(base_hdr, init)
     got = await run_gets(tma_hdr)
     if got:
         ctx.update(ok=True, mode="tma", hdr=tma_hdr, got=got)
@@ -1944,8 +1955,9 @@ async def app_context(webview_url: str) -> dict:
 
     # Bazi uygulamalar once giris yapip oturum anahtari (token) dagitir
     auth_paths = [p for p in paths if AUTH_PATH_RE.search(p) and not ACTION_PATH_RE.search(p)] + DEFAULT_AUTH_PATHS
-    auth_urls = [b.rstrip("/") + p for p in dict.fromkeys(auth_paths) for b in bases][:12]
-    bodies = [{"initData": init}, {"init_data": init}, {"initDataRaw": init}, {"data": init}]
+    auth_urls = [b.rstrip("/") + p for p in dict.fromkeys(auth_paths) for b in bases][:24]
+    bodies = [{"initData": init}, {"init_data": init}, {"initDataRaw": init}, {"data": init},
+              {"tgWebAppData": init}, {"init": init}, {"telegramInitData": init}]
     token, used, t0 = None, None, time.time()
     for au in auth_urls:
         for body in bodies:
@@ -1969,7 +1981,8 @@ async def app_context(webview_url: str) -> dict:
 async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
     """Mini uygulamanin JS'inden referans kalibi arar, giris verisiyle API'yi (yalniz GET) yoklar."""
     ctx = await app_context(webview_url)
-    res = {"links": [], "codes": [], "templates": [], "api": [], "notes": list(ctx["notes"])}
+    res = {"links": [], "codes": [], "templates": [], "api": [], "notes": list(ctx["notes"]),
+           "hosts": ctx["hosts"][:10], "paths": ctx["paths"][:25]}
 
     for t in ctx["blobs"]:
         found_tpl = re.findall(r"""[A-Za-z0-9_./:?&%\-]{0,80}startapp=[^\s"'`]{0,60}""", t)[:3]
@@ -2035,6 +2048,11 @@ async def ref_finder(bot: str):
                 lines += ["", "🧩 Kodda geçen link kalıbı:"] + [f"- {t}" for t in probe["templates"]]
             if probe["api"]:
                 lines += ["", "🌐 API'den okuduğum alanlar (değerler yazılmadı):"] + [f"- {a}" for a in probe["api"]]
+            else:
+                if probe.get("hosts"):
+                    lines += ["", "🖥 Uygulama kodunda bulduğum sunucu adresleri:"] + [f"- {h}" for h in probe["hosts"]]
+                if probe.get("paths"):
+                    lines += ["", "🧭 Kodda geçen yol adayları:"] + [f"- {p}" for p in probe["paths"][:20]]
             for n in probe["notes"]:
                 lines.append(f"ℹ️ {n}")
         if not found:
@@ -2127,7 +2145,7 @@ async def quick_auth(webview_url: str, c: dict):
     origin = f"{pu.scheme}://{pu.netloc}"
     base_hdr = app_base_headers(origin)
     if c.get("mode") == "tma":
-        return {**base_hdr, "Authorization": f"tma {init}", "X-Telegram-Init-Data": init}
+        return tma_headers(base_hdr, init)
     a = c.get("auth") or {}
     if c.get("mode") == "token" and a.get("url") and a.get("key"):
         st, data, _ = await http_call("POST", a["url"], {**base_hdr, "Content-Type": "application/json"},
@@ -2170,8 +2188,13 @@ async def claim_discover(bot: str):
         ctx = await app_context(url)
         cands = claim_candidates(ctx)
         if not cands:
+            extra = ""
+            if ctx["hosts"]:
+                extra += "\n\nSunucu adresleri:\n" + "\n".join("- " + h for h in ctx["hosts"][:8])
+            if ctx["paths"]:
+                extra += "\n\nKodda geçen yol adayları:\n" + "\n".join("- " + p for p in ctx["paths"][:15])
             await send_admin(f"❌ @{bot}: uygulamanın kodunda güvenli bir 'topla / oturum' yolu bulamadım.\n"
-                             + "\n".join(ctx["notes"]) + "\n\nİstersen /ref " + bot + " ile uygulamanın API yapısına bak.")
+                             + "\n".join(ctx["notes"]) + extra)
             return
         lines = [f"🪙 @{bot}: uygulamanın kodunda şu 'topla / oturum' yolları geçiyor:"]
         lines += [f"- {p}" for p in cands]
