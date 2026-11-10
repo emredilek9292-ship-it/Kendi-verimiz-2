@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V15 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v2
+# V16 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v3
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3225,7 +3225,7 @@ DANGER_CLICK_RE = re.compile(
 
 SAFE_CLICK_RE = re.compile(
     r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|"
-    r"al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck|open|start|play|get|tap",
+    r"al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck|open|start|play|get|tap|earn|task",
     re.I
 )
 
@@ -3400,7 +3400,6 @@ async def get_browser():
 
 
 def parse_balance_from_text(text: str):
-    """'Balance 79,443' gibi degeri yakalar."""
     m = re.search(r"balance\s*[:=]?\s*([\d.,]+)", (text or "").lower())
     if not m:
         return None
@@ -3412,7 +3411,7 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; Open -> Claim akisini dener."""
+    """Mini uygulamayı gerçek tarayıcıda açar; Open -> Earn/Tasks -> Claim akisini dener."""
     lines = []
     browser = await get_browser()
     if browser is None:
@@ -3430,10 +3429,56 @@ async def browser_auto(bot: str, url: str) -> list:
     async def shot(caption):
         try:
             s = await page.screenshot(type="png")
-            if botapp and botapp.bot:
-                await botapp.bot.send_photo(ADMIN_CHATID, photo=s, caption=caption)
+            if tgclient:
+                await tgclient.send_file(
+                    ADMIN_CHATID,
+                    io.BytesIO(s),
+                    caption=caption,
+                    force_document=False
+                )
         except Exception as e:
-            lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__}")
+            lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__} {e}")
+
+    async def click_first(pattern, max_wait=4000):
+        """Ekranda pattern'e uyan ilk guvenli tiklanabilir ogene basar."""
+        selectors = [
+            "button",
+            "[role=button]",
+            "a",
+            "div[onclick]",
+            "span[onclick]",
+            "div[class*=button]",
+            "span[class*=button]",
+        ]
+        for sel in selectors:
+            loc = page.locator(sel)
+            count = await loc.count()
+            for i in range(min(count, 60)):
+                try:
+                    el = loc.nth(i)
+                    label = (await el.inner_text()).strip()
+                except Exception:
+                    continue
+                if not label:
+                    continue
+                if DANGER_CLICK_RE.search(label):
+                    continue
+                if not re.search(pattern, label, re.I):
+                    continue
+                try:
+                    await el.click(timeout=5000)
+                    await page.wait_for_timeout(max_wait)
+                    return label
+                except Exception:
+                    continue
+        # text tabanli yedek
+        try:
+            t = page.get_by_text(re.compile(pattern, re.I)).first
+            await t.click(timeout=5000)
+            await page.wait_for_timeout(max_wait)
+            return "text-match"
+        except Exception:
+            return None
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -3460,51 +3505,25 @@ async def browser_auto(bot: str, url: str) -> list:
         if balance_before is not None:
             lines.append(f"Ekrandan okunan bakiye: {balance_before}")
 
-        clicked = []
-
-        async def click_if_matches(pattern, max_clicks=3):
-            nonlocal clicked
-            loc = page.locator(
-                "button, [role=button], a, div[onclick], span[onclick]"
-            )
-            count = await loc.count()
-            for i in range(min(count, 60)):
-                try:
-                    el = loc.nth(i)
-                    label = (await el.inner_text()).strip()
-                except Exception:
-                    continue
-                if not label:
-                    continue
-                if DANGER_CLICK_RE.search(label):
-                    continue
-                if not re.search(pattern, label, re.I):
-                    continue
-                if label in clicked:
-                    continue
-                try:
-                    await el.click(timeout=5000)
-                    clicked.append(label)
-                    await page.wait_for_timeout(4000)
-                    if len(clicked) >= max_clicks:
-                        return True
-                except Exception:
-                    continue
-            return bool(clicked)
-
-        # 1) Once Open/Start/Play ile uygulamaya gir
-        entered = await click_if_matches(r"^(open|start|play)$", 1)
+        # 1) Uygulamaya gir
+        entered = await click_first(r"open|start|play|launch|enter")
         if entered:
-            lines.append("Uygulamaya giriş butonuna basıldı.")
+            lines.append(f"Uygulamaya giriş butonu: {entered}")
             await page.wait_for_timeout(5000)
 
-        # 2) Claim/Daily/Collect ara
-        claimed = await click_if_matches(
-            r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck",
-            3
+        # 2) Earn/Tasks/Daily sekmelerini dene
+        for tab in ["earn", "tasks", "daily", "rewards", "check-in", "bonus"]:
+            res = await click_first(re.escape(tab))
+            if res:
+                lines.append(f"Sekme butonu: {res}")
+                break
+
+        # 3) Claim/Collect/Reward
+        claim_btn = await click_first(
+            r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck"
         )
-        if claimed:
-            lines.append(f"Claim adayı butonlar: {', '.join(clicked[-3:])}")
+        if claim_btn:
+            lines.append(f"Claim butonu: {claim_btn}")
         else:
             lines.append("Claim/Daily/Collect butonu bulunamadı.")
 
@@ -3556,7 +3575,7 @@ async def universal_miniapp(bot: str):
             f"UNIVERSAL MINIAPP başladı: {bot}\n"
             "1) Mini uygulama açılıyor\n"
             "2) Claim/daily yolları taranıyor\n"
-            "3) Tarayıcı ile Open -> Claim akisi deneniyor\n"
+            "3) Tarayıcı ile Open -> Earn/Tasks -> Claim akisi deneniyor\n"
             "Cüzdan, ödeme, swap, stake ve tehlikeli işlemler otomatik yapılmayacak."
         )
 
