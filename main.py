@@ -3217,42 +3217,39 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-async def v84_snapshot(page):
-    # Görünür, kısa ve sayı içeren metinleri sırayla toplar.
-    # Zamanlayıcılar hariç tutulur; kasa ve bakiye alanları karışmasın.
+async def v85_read_timer(page):
+    # Claim sonrasi gorunen geri sayimlari okur; en kisa sureyi dondurur.
     try:
         rows=await page.evaluate("""() => Array.from(document.querySelectorAll('body *'))
           .filter(e => e.children.length === 0 && e.getClientRects().length && !['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(e.tagName))
           .map(e => (e.innerText || '').trim())
-          .filter(t => /[0-9]/.test(t) && t.length <= 100 && !/\b\d+[d]\s+\d{1,2}:\d{2}:\d{2}\b/.test(t) && !/^\d{1,2}:\d{2}:\d{2}$/.test(t))
-          .map(t => t.replace(/\b[0-9]{6,}\b/g,'[uzun sayi gizlendi]'))
-          .slice(0,40)""")
-        return rows
+          .filter(t => /^(?:(\\d+)d\\s+)?(\\d{1,2}):(\\d{2}):(\\d{2})$/.test(t))
+          .slice(0,20)""")
     except Exception:
-        return []
+        rows=[]
+    best=None
+    for t in rows:
+        m=re.fullmatch(r"(?:(\\d+)d\\s+)?(\\d{1,2}):(\\d{2}):(\\d{2})",t)
+        if not m: continue
+        d=int(m.group(1) or 0); h=int(m.group(2)); mi=int(m.group(3)); s=int(m.group(4))
+        total=d*86400+h*3600+mi*60+s
+        if best is None or total<best:
+            best=total
+    return best
 
-async def v84_verify(before,after):
-    # MyAgeApp'te gözlemlenen eşleşme: kasa Alan 14, bakiye Alan 1.
-    # Başarı ancak kasa 0'a iner ve bakiye artarsa kabul edilir.
-    def get(rows,i):
-        return rows[i-1] if 0 <= i-1 < len(rows) else None
-    def num(s):
-        try:
-            return float((s or '').replace(',','').strip())
-        except Exception:
+async def v85_wait_for_next(page,max_wait=900):
+    # En kisa geri sayimi bekler; cok uzunsa 15 dk sonra yeniden kontrol eder.
+    waited=0
+    while waited<max_wait:
+        t=await v85_read_timer(page)
+        if t is None:
             return None
-    kasa_b=num(get(before,14)); kasa_a=num(get(after,14))
-    bak_b=num(get(before,1)); bak_a=num(get(after,1))
-    notes=[]
-    if kasa_b is None or kasa_a is None or bak_b is None or bak_a is None:
-        notes.append("Kasa/bakiye alanlari okunamadi; otomatik toplama dogrulanamadi.")
-        return notes
-    notes.append(f"Kasa: {kasa_b:g} -> {kasa_a:g}; bakiye: {bak_b:g} -> {bak_a:g}.")
-    if kasa_b>0 and kasa_a==0 and bak_a>bak_b:
-        notes.append("Kasa sifirlandi ve bakiye artti; toplama dogrulandi.")
-    else:
-        notes.append("Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.")
-    return notes
+        if t<=0:
+            return 0
+        step=min(t,max_wait-waited,300)
+        await page.wait_for_timeout(step*1000)
+        waited+=step
+    return None
 
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
@@ -3363,6 +3360,28 @@ async def v8_browser(name,url,state):
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after=await v84_snapshot(page)
             notes.extend(await v84_verify(before,after))
+            # Otomatik tekrar icin geri sayimi oku; yalnizca ayni claim butonu hala uygunsa tekrar dene.
+            timer=await v85_read_timer(page)
+            if timer is not None:
+                notes.append(f"Sonraki uygun zaman icin geri sayim: {timer} saniye.")
+                if timer<=600:
+                    notes.append("Geri sayim kisa; ayni oturumda bir kez daha kontrol edilecek.")
+                    await page.wait_for_timeout(min(timer+5,600)*1000)
+                    claim2=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
+                    if await claim2.count()==1 and await claim2.is_visible() and await claim2.is_enabled():
+                        before2=await v84_snapshot(page)
+                        try:
+                            await claim2.click(timeout=10000,no_wait_after=True)
+                        except PWTimeout:
+                            notes.append("Ikinci deneme icin Claim hala tiklanabilir degildi; zorlanmadi.")
+                        else:
+                            await page.wait_for_timeout(3000)
+                            after2=await v84_snapshot(page)
+                            notes.extend(await v84_verify(before2,after2))
+                    else:
+                        notes.append("Ikinci deneme icin tek Claim butonu uygun degildi; tekrar denenmedi.")
+                else:
+                    notes.append("Geri sayim uzun; ayni oturumda tekrar denenmedi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
