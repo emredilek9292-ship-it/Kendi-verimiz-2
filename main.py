@@ -3366,11 +3366,15 @@ async def v8_browser(name,url,state):
             # Kasa eslesmesini kullanici onayina bagla; otomatik tahmin yapma.
             try:
                 shot=await page.screenshot(type="png")
-                # Ekran goruntusunu kullaniciya gondermek icin mevcut Telegram gonderim fonksiyonunu kullan.
-                # Ornek: await send_admin("Kasa satirini belirlemek icin ekran goruntusu.")
+                await bot_app.bot.send_photo(
+                    chat_id=ADMIN_USER_ID,
+                    photo=shot,
+                    caption="MyAgeApp: Claim sonrasi ekran goruntusu. Kasa satirini belirlemek icin bu goruntuyu incele."
+                )
+                notes.append("Claim sonrasi ekran goruntusu Telegram'a gonderildi.")
             except Exception as e:
-                print("Ekran goruntusu alinamadi:", type(e).__name__, e)
-            notes.append("Kasa eslesmesi kullanici onayina baglandi; otomatik tahmin yapilmadi.")
+                notes.append(f"Ekran goruntusu gonderilemedi: {type(e).__name__}.")
+            notes.append("Kasa eslesmesi henuz yapilmadi; otomatik tahmin yapilmadi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
