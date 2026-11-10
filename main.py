@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V13.1 - UNIVERSAL MINIAPP ENGINE + BROWSER/CANVAS AUTOMATION
+# V14 - UNIVERSAL MINIAPP ENGINE + DEEP JS SCAN
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3247,13 +3247,20 @@ POPUP_ERROR_RE = re.compile(
     re.I
 )
 
+# Daha genis API yolu yakalama
 API_PATH_RE = re.compile(
-    r"['\"`](/api/[A-Za-z0-9_\-/.]{2,80}|/[A-Za-z0-9_\-/]{2,60}(?:claim|collect|harvest|check-?in|daily|reward|bonus)[A-Za-z0-9_\-/]*)['\"`]",
+    r"['\"`](/api/[A-Za-z0-9_\-/.]{2,100}|/v[0-9]+/[A-Za-z0-9_\-/.]{2,100}|"
+    r"/[A-Za-z0-9_\-/]{2,60}(?:claim|collect|harvest|check-?in|daily|reward|bonus)[A-Za-z0-9_\-/]*)['\"`]",
     re.I
 )
 
 SCRIPT_URL_RE = re.compile(
     r'(?:src=["\']|href=["\']|["\'])([^"\']*?\.js(?:\?[^"\']*)?)["\']',
+    re.I
+)
+
+DYNAMIC_IMPORT_RE = re.compile(
+    r'import\(\s*["\']([^"\']+)["\']\s*\)|import\(\s*`([^`]+)`\s*\)',
     re.I
 )
 
@@ -3326,29 +3333,56 @@ def balance_diff(before: dict, after: dict):
     return diffs
 
 
-async def deep_scan_claims(ctx: dict, webview_url: str) -> list:
-    extra = []
+async def deep_scan_claims(ctx: dict, webview_url: str):
+    """Inline script + JS chunk'larini derinlemesine tarar.
+
+    Donus: (claim_adaylari, taranan_dosya, tum_api_yollari)
+    """
+    claim_cands = []
+    all_paths = []
     base = webview_url.split("#")[0]
     seen_urls = set()
     queue = [(base, 0)]
     scanned = 0
 
-    while queue and scanned < 40 and len(extra) < 15:
+    def add_path(p):
+        if not p or len(p) > 120:
+            return
+        if p in all_paths:
+            return
+        all_paths.append(p)
+        if DANGEROUS_PATH_RE.search(p):
+            return
+        if not re.search(r"claim|collect|harvest|check-?in|daily|reward|bonus", p, re.I):
+            return
+        if p not in claim_cands:
+            claim_cands.append(p)
+
+    while queue and scanned < 60 and len(claim_cands) < 30:
         u, depth = queue.pop(0)
         if u in seen_urls:
             continue
         seen_urls.add(u)
-        txt = await fetch_text(u, 2000000)
+        txt = await fetch_text(u, 3000000)
         if not txt:
             continue
         scanned += 1
 
+        # 1) Statik string'ler
         for m in API_PATH_RE.finditer(txt):
-            p = m.group(1)
-            if p and p not in extra and not DANGEROUS_PATH_RE.search(p):
-                extra.append(p)
+            add_path(m.group(1))
 
-        if depth < 2:
+        # 2) Dinamik import / chunk
+        if depth < 3:
+            for m in DYNAMIC_IMPORT_RE.finditer(txt):
+                su = m.group(1) or m.group(2)
+                if not su or su.startswith("data:") or su.startswith("blob:"):
+                    continue
+                full = urljoin(u, su)
+                if full not in seen_urls:
+                    queue.append((full, depth + 1))
+
+            # 3) script src / href
             for sm in SCRIPT_URL_RE.finditer(txt):
                 su = sm.group(1)
                 if su.startswith("data:") or su.startswith("blob:"):
@@ -3357,7 +3391,7 @@ async def deep_scan_claims(ctx: dict, webview_url: str) -> list:
                 if full not in seen_urls:
                     queue.append((full, depth + 1))
 
-    return extra[:15], scanned
+    return claim_cands[:30], scanned, all_paths[:40]
 
 
 async def get_browser():
@@ -3374,7 +3408,7 @@ async def get_browser():
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; DOM butonu yoksa canvas'a dokunur."""
+    """Mini uygulamayı gerçek tarayıcıda açar; DOM/canvas butonlarını dener."""
     lines = []
     browser = await get_browser()
     if browser is None:
@@ -3391,20 +3425,47 @@ async def browser_auto(bot: str, url: str) -> list:
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(6000)
+        await page.wait_for_timeout(8000)
 
-        async def page_text():
-            try:
-                return await page.inner_text("body")
-            except Exception:
-                return ""
+        title = await page.title()
+        body_text = ""
+        try:
+            body_text = await page.inner_text("body")
+        except Exception:
+            pass
 
-        before_text = await page_text()
+        canvas_count = await page.locator("canvas").count()
+        iframe_count = await page.locator("iframe").count()
+        button_count = await page.locator("button, [role=button], a").count()
 
+        lines.append(f"Sayfa başlığı: {title[:80]}")
+        lines.append(f"DOM: canvas={canvas_count}, iframe={iframe_count}, buton={button_count}")
+        snippet = re.sub(r"\s+", " ", body_text)[:200]
+        lines.append(f"Ekran metni: {snippet or '(boş)'}")
+
+        try:
+            shot = await page.screenshot(type="png")
+            if bot_app and bot_app.bot:
+                await bot_app.bot.send_photo(ADMIN_CHATID, photo=shot, caption=f"{bot} mini uygulama ekranı")
+        except Exception as e:
+            lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__}")
+
+        target_frame = page
+        if canvas_count == 0:
+            for fr in page.frames:
+                try:
+                    if await fr.locator("canvas").count():
+                        target_frame = fr
+                        lines.append(f"Canvas iframe içinde bulundu: {fr.url[:80]}")
+                        break
+                except Exception:
+                    continue
+
+        before_text = body_text
         clicked = []
-        # 1) DOM butonlari
+
         for attempt in range(2):
-            buttons = page.locator("button, [role=button], a")
+            buttons = target_frame.locator("button, [role=button], a")
             count = await buttons.count()
             for i in range(min(count, 30)):
                 try:
@@ -3422,22 +3483,20 @@ async def browser_auto(bot: str, url: str) -> list:
                 try:
                     await buttons.nth(i).click(timeout=5000)
                     clicked.append(label)
-                    await page.wait_for_timeout(4000)
+                    await target_frame.wait_for_timeout(4000)
                 except Exception:
                     continue
             if clicked:
                 break
 
-        # 2) DOM butonu yoksa canvas dokunma
         canvas_taps = 0
         if not clicked:
-            canvas = page.locator("canvas").first
+            canvas = target_frame.locator("canvas").first
             if await canvas.count():
                 box = await canvas.bounding_box()
                 if box:
                     cx = box["x"] + box["width"] / 2
                     cy = box["y"] + box["height"] / 2
-                    # Merkez ve alt-orta dokunma (yaygin claim alani)
                     taps = [
                         (cx, cy),
                         (cx, box["y"] + box["height"] * 0.8),
@@ -3458,7 +3517,7 @@ async def browser_auto(bot: str, url: str) -> list:
         else:
             lines.append("Tarayıcıda güvenli claim/daily butonu veya canvas bulunamadı.")
 
-        after_text = await page_text()
+        after_text = await page.inner_text("body") if await page.locator("body").count() else ""
 
         def nums(t):
             return re.findall(r"\d[\d.,]*", t or "")
@@ -3535,10 +3594,12 @@ async def universal_miniapp(bot: str):
 
             cands = claim_candidates(ctx)
             if not cands:
-                deep, scanned = await deep_scan_claims(ctx, url)
+                deep, scanned, all_paths = await deep_scan_claims(ctx, url)
                 lines.append(f"Derin JS taraması: {scanned} dosya okundu, {len(deep)} claim adayı bulundu.")
                 if deep:
                     cands = deep
+                elif all_paths:
+                    lines.append("Bulunan API yolları: " + ", ".join(all_paths[:10]))
 
             if cands:
                 lines.append(f"Güvenli claim adayı: {len(cands)} yol bulundu.")
