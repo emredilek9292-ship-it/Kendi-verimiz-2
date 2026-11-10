@@ -3217,63 +3217,43 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-async def v88_screen_text(page):
-    # Claim oncesi/sonrasi ekran metnini okur; etiket tahmini yapmaz.
-    try:
-        return await page.locator("body").inner_text(timeout=5000)
-    except Exception:
-        return ""
+from decimal import Decimal
 
-def v88_diff_report(before,after):
-    # Ekrandaki sayisal satirlari kiyaslar; kasa/bakiye oldugunu varsaymaz.
-    def numeric_lines(text):
-        out=[]
-        for line in (text or "").splitlines():
-            line=line.strip()
-            if line and re.search(r"\d",line) and len(line)<=120:
-                out.append(line)
-        return out
-    b=numeric_lines(before)
-    a=numeric_lines(after)
-    notes=["Claim sonrasi ekran metni teshis raporu:"]
-    if not b and not a:
-        notes.append("Sayisal ekran satiri okunamadi.")
-        return notes
-    for i in range(min(len(b),len(a),12)):
-        if b[i]!=a[i]:
-            notes.append(f"Satir {i+1}: {b[i]} -> {a[i]}")
-    if len(b)!=len(a):
-        notes.append(f"Satir sayisi degisti: {len(b)} -> {len(a)}.")
-    if not any("Satir" in n for n in notes):
-        notes.append("Gorunur sayisal satirlarda degisim saptanmadi.")
-    return notes
+def v810_lines(text):
+    return [s.strip() for s in (text or '').splitlines() if s.strip() and re.search(r'\d',s) and len(s.strip())<=120]
 
-def v89_balance_check(before,after):
-    # MyAgeApp'te gozlemlenen bakiye satiri: Satir 7.
-    # Bu surum yalnizca bakiye artisini raporlar; kasa satiri yoksa ayri not verir.
-    def line(text,i):
-        try:
-            return (text or "").splitlines()[i-1].strip()
-        except Exception:
-            return ""
-    def amount(s):
-        try:
-            return float(s.replace(',',''))
-        except Exception:
-            return None
-    b=amount(line(before,7))
-    a=amount(line(after,7))
-    notes=[]
-    if b is None or a is None:
-        notes.append("Bakiye satiri (Satir 7) okunamadi; bakiye kontrolu yapilmadi.")
-        return notes
-    if a>b:
-        notes.append(f"Bakiye artti: {b:g} -> {a:g}; toplama muhtemel.")
-    elif a==b:
-        notes.append(f"Bakiye degismedi: {b:g} -> {a:g}.")
+def v810_integer(text):
+    text=(text or '').strip()
+    if re.fullmatch(r'[0-9]+',text):
+        return Decimal(text)
+    if re.fullmatch(r'[0-9]{1,3}(?:,[0-9]{3})+',text):
+        return Decimal(text.replace(',',''))
+    return None
+
+def v810_report(before,after):
+    b,a=v810_lines(before),v810_lines(after)
+    notes=['V8.10: ortak sayisal satir listesi kullanildi.']
+    if len(b)<7 or len(a)<7:
+        return notes+['7. sayisal satir okunamadi; bakiye yorumu yapilmadi.']
+    # Satir numarasi kimlik kaniti degildir; komsu satirlar da ayni kalmali.
+    stable=b[3:6]==a[3:6] and b[7:9]==a[7:9]
+    x,y=v810_integer(b[6]),v810_integer(a[6])
+    if x is None or y is None or not stable:
+        notes.append('7. sayisal satirin bicimi veya komsu satirlari degisti; bakiye yorumu yapilmadi.')
     else:
-        notes.append(f"Bakiye azaldi: {b:g} -> {a:g}.")
+        notes.append(f'7. sayisal satir (bakiye adayi): {b[6]} -> {a[6]}; fark: {y-x}.')
+        if y>x:
+            notes.append('Bu alanda artis goruldu. Alan kimligi ve kasa sifirlanmasi dogrulanmadigi icin odul basarisi ilan edilmedi.')
+        else:
+            notes.append('Bu alanda artis yok; odul dogrulanmadi.')
+    notes.append('Kasa icin guvenilir alan eslesmesi yok; sifirlandi varsayilmadi.')
     return notes
+
+async def v810_screen(page):
+    try:
+        return await page.locator('body').inner_text(timeout=3000)
+    except Exception:
+        return ''
 
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
@@ -3374,7 +3354,7 @@ async def v8_browser(name,url,state):
                 return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
             if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
                 return notes+["Claim baglami degisti; tiklanmadi."]
-            before_text=await v88_screen_text(page)
+            before_text=await v810_screen(page)
             state["stage"]="claim_tiklama"
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
@@ -3382,10 +3362,8 @@ async def v8_browser(name,url,state):
                 return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
-            after_text=await v88_screen_text(page)
-            notes.extend(v88_diff_report(before_text,after_text))
-            notes.extend(v89_balance_check(before_text,after_text))
-            notes.append("Otomatik odul dogrulamasi yapilmadi; ekran metni yalnizca teshis icin raporlanir.")
+            after_text=await v810_screen(page)
+            notes.extend(v810_report(before_text,after_text))
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
