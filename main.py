@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V17 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v4
+# V18 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v5
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3431,7 +3431,7 @@ async def browser_auto(bot: str, url: str) -> list:
             s = await page.screenshot(type="png")
             if tg_client:
                 await tg_client.send_file(
-                    ADMIN_CHATID,
+                    ADMIN_CHAT_ID,
                     io.BytesIO(s),
                     caption=caption,
                     force_document=False
