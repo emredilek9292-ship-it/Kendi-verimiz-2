@@ -3184,14 +3184,14 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V24 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v11
+# V25 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v12
 # MyAgeApp gibi DOM tabanli mini uygulamalar icin saglam otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
 
 import io as _io
 import json as _json
-from urllib.parse import unquote as _unquote, parse_qs as _parse_qs
+from urllib.parse import unquote as _unquote, parse_qs as _parse_qs, urlparse as _urlparse
 
 try:
     from playwright.async_api import async_playwright
@@ -3432,7 +3432,7 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; Telegram initData enjekte edilir.
+    """Mini uygulamayı gerçek tarayıcıda açar; Telegram initData header olarak enjekte edilir.
 
     "Claim bonus" exact-match ile tiklanir; /api/tasks cevabi yakalanir.
     """
@@ -3448,9 +3448,8 @@ async def browser_auto(bot: str, url: str) -> list:
         ),
         viewport={"width": 412, "height": 915},
     )
-    page = await context.new_page()
 
-    # 0) Telegram initData enjeksiyonu
+    # 0) Telegram initData enjeksiyonu (mock + header)
     initData, initDataUnsafe = extract_tg_init_data(url)
     if initData:
         init_script = f"""
@@ -3470,12 +3469,37 @@ window.Telegram.WebApp.setHeaderColor = function(){{}};
 window.Telegram.WebApp.setBackgroundColor = function(){{}};
 """
         try:
-            await page.add_init_script(init_script)
-            lines.append("Telegram initData enjekte edildi.")
+            await context.add_init_script(init_script)
+            lines.append("Telegram initData mock enjekte edildi.")
         except Exception as e:
-            lines.append(f"initData enjeksiyonu hatası: {type(e).__name__} {e}")
+            lines.append(f"initData mock enjeksiyonu hatası: {type(e).__name__} {e}")
+
+        # API isteklerine initData header ekle
+        app_host = _urlparse(url).netloc
+
+        async def add_auth_headers(route, request):
+            try:
+                u = request.url
+                if app_host in u:
+                    headers = dict(request.headers)
+                    headers["authorization"] = f"tma {initData}"
+                    headers["x-telegram-init-data"] = initData
+                    headers["x-init-data"] = initData
+                    await route.continue_(headers=headers)
+                    return
+            except Exception:
+                pass
+            await route.continue_()
+
+        try:
+            await context.route("**/*", add_auth_headers)
+            lines.append("API isteklerine initData header eklendi.")
+        except Exception as e:
+            lines.append(f"Header enjeksiyonu hatası: {type(e).__name__} {e}")
     else:
         lines.append("URL'de tgWebAppData bulunamadı; initData enjekte edilmedi.")
+
+    page = await context.new_page()
 
     api_calls = []
     captured = {}
