@@ -1,3 +1,4 @@
-aiohttp
-telethon
-python-telegram-bot>=22,<23
+aiohttp>=3.9,<4
+telethon>=1.40,<2
+python-telegram-bot>=21,<23
+playwright>=1.49,<2
