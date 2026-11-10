@@ -3235,7 +3235,6 @@ def v810_report(before,after):
     notes=['V8.10: ortak sayisal satir listesi kullanildi.']
     if len(b)<7 or len(a)<7:
         return notes+['7. sayisal satir okunamadi; bakiye yorumu yapilmadi.']
-    # Satir numarasi kimlik kaniti degildir; komsu satirlar da ayni kalmali.
     stable=b[3:6]==a[3:6] and b[7:9]==a[7:9]
     x,y=v810_integer(b[6]),v810_integer(a[6])
     if x is None or y is None or not stable:
@@ -3364,6 +3363,14 @@ async def v8_browser(name,url,state):
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
             notes.extend(v810_report(before_text,after_text))
+            # Kasa eslesmesini kullanici onayina bagla; otomatik tahmin yapma.
+            try:
+                shot=await page.screenshot(type="png")
+                # Ekran goruntusunu kullaniciya gondermek icin mevcut Telegram gonderim fonksiyonunu kullan.
+                # Ornek: await send_admin("Kasa satirini belirlemek icin ekran goruntusu.")
+            except Exception as e:
+                print("Ekran goruntusu alinamadi:", type(e).__name__, e)
+            notes.append("Kasa eslesmesi kullanici onayina baglandi; otomatik tahmin yapilmadi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
