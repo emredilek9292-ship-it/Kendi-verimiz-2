@@ -3184,13 +3184,23 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 
-# ===== V7 DIAGNOSTICS ONLY: no gameplay or reward clicks =====
-DIAG_LOCK=None
-DIAG_TASKS={}
+# ===== V8: exact MyAgeApp announcement only; single-run worker =====
+V8_TASKS={}
+V8_LOCK=None
 
 
-async def diag_public(url):
-    import ipaddress,socket
+def v8_canonical(text):
+    return re.sub(r"[^a-z0-9]","",(text or "").lower())
+
+
+def v8_known_announcement(text):
+    # User-transcribed notice only. No generic OK/continue acceptance.
+    text=v8_canonical(text)
+    return bool(re.fullmatch(r"agetokenislive(?:agetokenislive)?listing23novembercheckofficialchannelcompletenewtaskok",text))
+
+
+async def v8_public(url):
+    import socket,ipaddress
     p=urlparse(url)
     if p.scheme!="https" or not p.hostname or p.username or p.password:
         return False
@@ -3198,29 +3208,20 @@ async def diag_public(url):
         if p.port not in (None,443):
             return False
         rows=await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(p.hostname,443,type=socket.SOCK_STREAM),5)
-        return bool(rows) and all(ipaddress.ip_address(r[4][0]).is_global for r in rows)
+        return bool(rows) and all(ipaddress.ip_address(row[4][0]).is_global for row in rows)
     except Exception:
         return False
 
 
-async def diag_report(name,text):
-    # Only the resolved owner ID, never ADMIN_CHAT_ID (which may be a group).
-    await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V7 TESHIS\n{text}",disable_web_page_preview=True)
+async def v8_report(name,text):
+    await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-async def diag_owner_private():
-    chat=await bot_app.bot.get_chat(ADMIN_USER_ID)
-    return chat.type=="private"
-
-
-async def diag_browser(name,url,state):
+async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
-    import io
-    if not await diag_public(url):
-        await diag_report(name,"Acilis adresi guvenlik kontrolunden gecmedi.")
-        return
-    if not await diag_owner_private():
-        return
+    if not await v8_public(url):
+        return ["Adres guvenlik kontrolunden gecmedi."]
+    notes=[]
     async with async_playwright() as p:
         state["stage"]="chromium_baslatma"
         browser=await p.chromium.launch(headless=True,timeout=60000,args=["--disable-dev-shm-usage"])
@@ -3230,11 +3231,11 @@ async def diag_browser(name,url,state):
             cache={}
             async def guard(route):
                 u=route.request.url
-                h=urlparse(u).netloc
+                host=urlparse(u).netloc
                 try:
-                    if h not in cache:
-                        cache[h]=await diag_public(u)
-                    if cache[h] and urlparse(u).scheme=="https":
+                    if host not in cache:
+                        cache[host]=await v8_public(u)
+                    if cache[host] and urlparse(u).scheme=="https":
                         await route.continue_()
                     else:
                         await route.abort()
@@ -3247,52 +3248,83 @@ async def diag_browser(name,url,state):
             page=await context.new_page()
             page.set_default_timeout(10000)
             state["stage"]="sayfa_acilisi"
-            status=None
-            timed_out=False
             try:
                 response=await page.goto(url,wait_until="domcontentloaded",timeout=60000)
-                status=response.status if response else None
+                if response and response.status>=400:
+                    return [f"HTTP {response.status}; islem yapilmadi."]
             except PWTimeout:
-                timed_out=True
-            state["stage"]="ekran_bekleme"
+                notes.append("Acilis suresi asildi; yuklenen ekran kontrol ediliyor.")
             await page.locator("body").wait_for(state="attached",timeout=15000)
-            await page.wait_for_timeout(8000)
-            counts=await page.evaluate("""() => ({
-                buttons:document.querySelectorAll('button,[role="button"]').length,
-                dialogs:document.querySelectorAll('[role="dialog"],[aria-modal="true"],dialog[open]').length,
-                iframes:document.querySelectorAll('iframe').length,
-                canvas:document.querySelectorAll('canvas').length,
-                loading:document.querySelectorAll('[role="progressbar"],[aria-busy="true"]').length
-            })""")
-            # Never emit page body, titles, URLs, network payloads or arbitrary labels.
-            claim=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
-            claim_notes="claim adli dugme bulunamadi."
-            if await claim.count()==1:
+            await page.wait_for_timeout(5000)
+            notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
+            if name.lower()!="myageapp":
+                return notes+["Bu V8 duzeltmesi yalniz MyAgeApp duyurusu icindir. Baska uygulamada dugmeye basilmadi."]
+            state["stage"]="duyuru_tanima"
+            dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
+            closed=False
+            for i in range(min(await dialogs.count(),10)):
+                dialog=dialogs.nth(i)
+                if not await dialog.is_visible():
+                    continue
+                text=await dialog.inner_text(timeout=5000)
+                if not v8_known_announcement(text):
+                    continue
+                ok=dialog.get_by_role("button",name=re.compile(r"^\s*OK\s*$",re.I))
+                if await ok.count()!=1:
+                    return notes+["Taninmis duyuruda tek bir erisilebilir OK dugmesi bulunamadi; basilmadi."]
+                state["stage"]="duyuru_ok"
+                await ok.click(trial=True,timeout=10000)
+                # Recheck exact notice immediately before dismissal.
+                if not v8_known_announcement(await dialog.inner_text(timeout=3000)):
+                    return notes+["Duyuru metni degisti; OK basilmadi."]
+                await ok.click(timeout=10000,no_wait_after=True)
                 try:
-                    info=await claim.evaluate("""e => {
-                        const r=e.getBoundingClientRect();
-                        const top=document.elementFromPoint(Math.max(0,Math.min(innerWidth-1,r.left+r.width/2)),Math.max(0,Math.min(innerHeight-1,r.top+r.height/2)));
-                        return {covered:!!top&&top!==e&&!e.contains(top),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true'};
-                    }""")
-                    claim_notes=f"claim: ustu kapali={info['covered']}, devre disi={info['disabled']}."
-                except Exception:
-                    claim_notes="claim dugmesi goruldu ama incelenemedi."
-            # Mask common secret-entry fields; this cannot guarantee every secret is hidden.
-            # Frame content is covered entirely; frame counts remain available in the report.
-            masks=page.locator('input,textarea,[contenteditable="true"],pre,code,iframe,[class*="qr" i],[id*="qr" i],[data-sensitive]')
-            state["stage"]="ekran_goruntusu"
-            image=await page.screenshot(full_page=False,animations="disabled",mask=[masks],timeout=15000)
-            summary=(f"HTTP: {status if status is not None else 'bilinmiyor'}; acilis sure asimi: {timed_out}.\n"
-                f"Dugme: {counts['buttons']}; dialog: {counts['dialogs']}; iframe: {counts['iframes']}; "
-                f"canvas: {counts['canvas']}; yukleme gostergesi: {counts['loading']}.\n{claim_notes}\n"
-                "Hicbir dugmeye basilmadi. Oturum veya odul basarisi dogrulanmadi.")
-            await diag_report(name,summary)
-            state["stage"]="ozel_sohbete_gonderme"
-            photo=io.BytesIO(image)
-            photo.name="teshis.png"
-            await bot_app.bot.send_photo(ADMIN_USER_ID,photo=photo,
-                caption=f"@{name}: Sunucudaki tarayicinin ekrani. Giris alanlari ve iframe'ler maskelendi. "
-                "Hesap/bakiye bilgileri yine gorunebilir; paylasmadan once kontrol et.")
+                    await dialog.wait_for(state="hidden",timeout=10000)
+                except PWTimeout:
+                    return notes+["OK tiklamasi tamamlandi ancak pencerenin kapandigi dogrulanamadi; claim denenmedi."]
+                closed=True
+                notes.append("Yazdigin $AGE duyurusu tanindi. Kendi OK dugmesi tiklandi ve pencere kapandi.")
+                break
+            if not closed:
+                visible=False
+                for i in range(min(await dialogs.count(),10)):
+                    if await dialogs.nth(i).is_visible():
+                        visible=True
+                        break
+                if visible:
+                    return notes+["Farkli veya metni birebir eslesmeyen pencere var; onaylanmadi, claim denenmedi."]
+                notes.append("Gorunur duyuru penceresi yok; claim kontrolune geciliyor.")
+            # Never act while another modal remains visible.
+            for i in range(min(await dialogs.count(),10)):
+                if await dialogs.nth(i).is_visible():
+                    return notes+["Baska bir pencere hala acik; claim denenmedi."]
+            state["stage"]="claim_bulma"
+            claim=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
+            if await claim.count()!=1:
+                return notes+["Tek bir claim dugmesi bulunamadi; rastgele secim yapilmadi."]
+            if not await claim.is_visible() or not await claim.is_enabled():
+                return notes+["Claim gorunur/etkin degil; tiklanmadi."]
+            nearby=await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)
+            risk=re.compile(r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satın|satin|ucret|ücret|[$€₺]",re.I)
+            if risk.search(nearby):
+                return notes+["Claim cevresinde ucret/cuzdan benzeri ifade var; tiklanmadi."]
+            state["stage"]="claim_hazirlik"
+            try:
+                await claim.scroll_into_view_if_needed(timeout=5000)
+                await claim.click(trial=True,timeout=12000)
+            except PWTimeout:
+                return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
+            if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
+                return notes+["Claim baglami degisti; tiklanmadi."]
+            state["stage"]="claim_tiklama"
+            try:
+                await claim.click(timeout=10000,no_wait_after=True)
+            except PWTimeout:
+                return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
+            await page.wait_for_timeout(3000)
+            notes.append("Claim tiklamasi tamamlandi. Odul miktari veya bakiye artisi dogrulanmadi; toplandi kabul edilmedi.")
+            notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
+            return notes
         finally:
             try:
                 await asyncio.wait_for(browser.close(),15)
@@ -3300,69 +3332,66 @@ async def diag_browser(name,url,state):
                 pass
 
 
-async def diag_run(name,short="",start=""):
-    global DIAG_LOCK
-    if DIAG_LOCK is None:
-        DIAG_LOCK=asyncio.Lock()
-    async with DIAG_LOCK:
-        state={"stage":"telegram_hedefi"}
-        async def work():
-            ent=await asyncio.wait_for(resolve_entity(name),30)
-            if not getattr(ent,"bot",False):
-                await diag_report(name,"Hedef bir bot degil; atlandi.")
-                return
-            state["stage"]="telegram_kilidi"
-            if not await try_lock(TG_LOCK,30):
-                await diag_report(name,"Telegram islem sirasi bosalmadi.")
-                return
-            try:
-                state["stage"]="start_gonderme"
-                await asyncio.wait_for(tg_client.send_message(ent,f"/start {start}".strip()),30)
-                await asyncio.sleep(INSPECT_WAIT)
-            finally:
-                TG_LOCK.release()
-            state["stage"]="mini_uygulama_kilidi"
-            if not await try_lock(APP_LOCK,30):
-                await diag_report(name,"Mini uygulama islem sirasi bosalmadi.")
-                return
-            try:
-                state["stage"]="yetkili_adres_alma"
-                url,how,public=await asyncio.wait_for(get_webview_url(ent,name,short,start),90)
-            finally:
-                APP_LOCK.release()
-            if not url:
-                await diag_report(name,"Yetkili acilis adresi alinamadi. Gizli adres veya hata metni paylasilmadi.")
-                return
-            await diag_browser(name,url,state)
+async def v8_run(name,short="",start=""):
+    global V8_LOCK
+    if V8_LOCK is None:
+        V8_LOCK=asyncio.Lock()
+    state={"stage":"sirada"}
+    async def work():
+        state["stage"]="telegram_hedefi"
+        ent=await asyncio.wait_for(resolve_entity(name),30)
+        if not getattr(ent,"bot",False):
+            return ["Hedef bot degil."]
+        state["stage"]="telegram_kilidi"
+        if not await try_lock(TG_LOCK,30):
+            return ["Telegram sirasi bosalmadi."]
         try:
-            await asyncio.wait_for(work(),240)
+            state["stage"]="start_gonderme"
+            await asyncio.wait_for(tg_client.send_message(ent,f"/start {start}".strip()),30)
+            await asyncio.sleep(INSPECT_WAIT)
+        finally:
+            TG_LOCK.release()
+        state["stage"]="mini_uygulama_kilidi"
+        if not await try_lock(APP_LOCK,30):
+            return ["Mini uygulama sirasi bosalmadi."]
+        try:
+            state["stage"]="yetkili_adres_alma"
+            url,how,public=await asyncio.wait_for(get_webview_url(ent,name,short,start),90)
+        finally:
+            APP_LOCK.release()
+        if not url:
+            return ["Yetkili acilis adresi alinamadi."]
+        return await v8_browser(name,url,state)
+    async with V8_LOCK:
+        try:
+            notes=await asyncio.wait_for(work(),240)
+            await v8_report(name,"\n".join(notes))
         except asyncio.CancelledError:
             raise
         except Exception as e:
             import traceback
             stack=" > ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in traceback.extract_tb(e.__traceback__)[-6:])
-            print(f"[V7-DIAG] stage={state['stage']} type={type(e).__name__} stack={stack}",flush=True)
-            await diag_report(name,f"Asama: {state['stage']}\nHata: {type(e).__name__}\nGizli URL/hata metni rapora yazilmadi.")
+            print(f"[V8] stage={state['stage']} type={type(e).__name__} stack={stack}",flush=True)
+            await v8_report(name,f"Asama: {state['stage']}\nHata: {type(e).__name__}\nGizli bilgiler yazilmadi; odul basarisi dogrulanmadi.")
 
 
 async def auto_link(name: str,short: str="",start: str=""):
-    if name in DIAG_TASKS and not DIAG_TASKS[name].done():
-        await diag_report(name,"Zaten sirada veya calisiyor.")
+    if name in V8_TASKS and not V8_TASKS[name].done():
+        await v8_report(name,"Zaten sirada veya calisiyor.")
         return
-    await diag_report(name,"V7 teshis siraya alindi. /start ve mini uygulama acilisi denenecek; "
-        "gorev/claim dugmesine basilmayacak. Goruntu yalnizca bot sahibinin ozel sohbetine gonderilecek. dur yazarak iptal edebilirsin.")
-    DIAG_TASKS[name]=spawn(diag_run(name,short,start))
+    await v8_report(name,"V8 is siraya alindi. Yalniz taninmis MyAgeApp duyurusu kapatilacak; claim uygun bulunursa bir kez denenecek. Otomatik tekrar yok. dur ile iptal edebilirsin.")
+    V8_TASKS[name]=spawn(v8_run(name,short,start))
 
 
-async def diag_stop():
+async def v8_stop():
     global AUTO_STOP
     AUTO_STOP=True
-    tasks=[t for t in DIAG_TASKS.values() if not t.done()]
+    tasks=[t for t in V8_TASKS.values() if not t.done()]
     for t in tasks:
         t.cancel()
     if tasks:
         await asyncio.gather(*tasks,return_exceptions=True)
-    await bot_app.bot.send_message(ADMIN_USER_ID,"V7 teshis isleri durduruldu; otomatik tekrar yok.")
+    await bot_app.bot.send_message(ADMIN_USER_ID,"V8 isleri durduruldu. Gonderilmis islemler geri alinamaz.")
 
 
 async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -3370,11 +3399,11 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not user or not msg:
         return
     if user.id!=ADMIN_USER_ID or update.effective_chat.type!="private":
-        await msg.reply_text("V7 teshis yalnizca bot sahibinin ozel sohbetinde kullanilir.")
+        await msg.reply_text("V8 yalnizca bot sahibinin ozel sohbetinde kullanilir.")
         return
     text=msg.text or msg.caption or ""
     if text.strip().lower() in {"dur","durdur","kapat"}:
-        await diag_stop()
+        await v8_stop()
         return
     for e in list(msg.entities or [])+list(msg.caption_entities or []):
         if getattr(e,"url",None):
@@ -3384,22 +3413,20 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_incele(update: Update,context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id!=ADMIN_USER_ID or update.effective_chat.type!="private":
-        return
-    for name,short,start in parse_link_targets(" ".join(context.args)):
-        await auto_link(name,short,start)
+    if update.effective_user.id==ADMIN_USER_ID and update.effective_chat.type=="private":
+        for name,short,start in parse_link_targets(" ".join(context.args)):
+            await auto_link(name,short,start)
 
 
 async def cmd_dur(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id==ADMIN_USER_ID:
-        await diag_stop()
+        await v8_stop()
 
 
 @admin_only
 async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("V7 TESHIS MODU. Bot linkini veya @adini gonder. "
-        "Sunucudaki ekran bot sahibinin ozel sohbetine gonderilir. Gorev/claim otomasyonu ve "
-        "zamanli rutinler bu surumde baslatilmaz. dur ile iptal edilir.")
+    await update.effective_message.reply_text("V8: MyAgeApp icin bilinen duyuru OK + tek claim denemesi. "
+        "Bot sahibinin ozel sohbetinden @MyAgeApp gonder. Otomatik tekrar/rutin/otopilot kapali. dur ile iptal et.")
 
 
 async def main():
@@ -3494,9 +3521,9 @@ async def main():
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
     spawn(keepalive_loop())
-    print("[V7] routine_loop teshis icin baslatilmadi",flush=True)
-    print("[V7] autopilot_loop teshis icin baslatilmadi",flush=True)
-    print("[V7] claims_loop teshis icin baslatilmadi",flush=True)
+    print("[V8] routine_loop bu surumde baslatilmadi",flush=True)
+    print("[V8] autopilot_loop bu surumde baslatilmadi",flush=True)
+    print("[V8] claims_loop bu surumde baslatilmadi",flush=True)
 
     try:
         await bot_app.bot.send_message(
