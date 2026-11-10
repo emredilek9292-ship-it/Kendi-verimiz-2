@@ -3184,9 +3184,10 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V28 - V8'in calisan MyAgeApp claim cozumu + V26 universal header
-# V8'de calisan: duyuru dialogu OK -> role-based claim -> risk kontrol -> tiklama
-# V26'da calisan: route ile tma header enjeksiyonu
+# V29 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v15
+# V28 logu: mock telegram-web-app.js uygulamanin kendi script'ini bozuyor.
+# Cozum: mock KALDIRILDI; gercek telegram-web-app.js yuklenir, initData URL'den okunur.
+# Route ile tma header enjeksiyonu + V8 role-based claim birlesiyor.
 # ============================================================
 
 import io as _io
@@ -3438,11 +3439,11 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """V8'in calisan MyAgeApp claim cozumu + V26'nin universal header enjeksiyonu.
+    """Mini uygulamayı gerçek tarayıcıda açar.
 
-    1) telegram-web-app.js mock servisi (V27)
-    2) Route ile tma header enjeksiyonu (V26)
-    3) V8'in duyuru dialogu OK + role-based claim butonu (V8)
+    V28 logu: telegram-web-app.js mock'u uygulamanın kendi script'ini bozuyordu.
+    V29: mock KALDIRILDI; gerçek telegram-web-app.js yüklenir, initData URL'den okunur.
+    Route ile tma header enjeksiyonu + V8 role-based claim birleşiyor.
     """
     lines = []
     browser = await get_browser()
@@ -3461,70 +3462,7 @@ async def browser_auto(bot: str, url: str) -> list:
     if initData:
         app_host = _urlparse(url).netloc
 
-        # 1) telegram-web-app.js mock servisi
-        tg_mock_js = f"""
-window.Telegram = window.Telegram || {{}};
-window.Telegram.WebApp = {{
-    initData: {json.dumps(initData)},
-    initDataUnsafe: {json.dumps(initDataUnsafe)},
-    version: '7.0',
-    platform: 'android',
-    colorScheme: 'dark',
-    themeParams: {{}},
-    isExpanded: true,
-    viewportHeight: window.innerHeight,
-    viewportStableHeight: window.innerHeight,
-    ready: function(){{}},
-    expand: function(){{}},
-    close: function(){{}},
-    MainButton: {{
-        show: function(){{}}, hide: function(){{}}, setText: function(){{}},
-        onClick: function(){{}}, offClick: function(){{}}, showProgress: function(){{}},
-        hideProgress: function(){{}}, enable: function(){{}}, disable: function(){{}}
-    }},
-    BackButton: {{show: function(){{}}, hide: function(){{}}, onClick: function(){{}}, offClick: function(){{}}}},
-    HapticFeedback: {{
-        impactOccurred: function(){{}}, notificationOccurred: function(){{}},
-        selectionChanged: function(){{}}
-    }},
-    setHeaderColor: function(){{}},
-    setBackgroundColor: function(){{}},
-    setBottomBarColor: function(){{}},
-    enableClosingConfirmation: function(){{}},
-    disableClosingConfirmation: function(){{}},
-    onEvent: function(){{}},
-    offEvent: function(){{}},
-    sendData: function(){{}},
-    openLink: function(){{}},
-    openTelegramLink: function(){{}},
-    openInvoice: function(){{}},
-    showAlert: function(m){{ alert(m); }},
-    showConfirm: function(m, cb){{ if(cb) cb(true); }},
-    showPopup: function(p, cb){{ if(cb) cb(null); }},
-    requestFullscreen: function(){{}},
-    exitFullscreen: function(){{}},
-    isVersionAtLeast: function(v){{ return true; }}
-}};
-"""
-
-        async def serve_tg_mock(route, request):
-            u = request.url
-            if "telegram-web-app" in u:
-                await route.fulfill(
-                    status=200,
-                    content_type="application/javascript",
-                    body=tg_mock_js,
-                )
-                return
-            await route.continue_()
-
-        try:
-            await context.route("**/telegram-web-app*", serve_tg_mock)
-            lines.append("telegram-web-app.js mock servisi aktif.")
-        except Exception as e:
-            lines.append(f"telegram-web-app.js mock hatası: {type(e).__name__} {e}")
-
-        # 2) API isteklerine tma header ekle
+        # Route ile tma header enjeksiyonu (V26'dan)
         async def add_auth_headers(route, request):
             try:
                 u = request.url
