@@ -138,8 +138,6 @@ BAD_WORDS = [
     "deposit", "cüzdan bağla", "yatırım yap",
 ]
 
-BADWORDS = BAD_WORDS
-
 # Bu kelimeleri iceren butonlara bot ASLA basmaz (ve onay butonu da koymaz)
 DANGER_BTN_RE = re.compile(
     r"wallet|cüzdan|cuzdan|deposit|withdraw|çekim|cekim|yatır|yatir|buy|satın|satin|"
@@ -3186,199 +3184,247 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 
-# ===================== MINI APP BROWSER =====================
+# V4: bounded browser worker with secret-free stage diagnostics.
 BROWSER_JOBS = {}
 BROWSER_TASKS = {}
-BROWSER_PAUSED = False
 BROWSER_LOCK = None
+BROWSER_PAUSED = False
 BROWSER_INTERVAL = max(300, int(os.getenv("MINI_INTERVAL_SECONDS", "1800")))
 BROWSER_KEY = "radar:browser:jobs:v3"
 BROWSER_FILE = "/tmp/radar_browser_jobs_v3.json"
+BROWSER_ALLOWED = {"claim", "collect", "claim reward", "collect reward", "daily reward",
+    "daily rewards", "claim daily reward", "collect daily reward", "rewards", "tasks",
+    "check in", "daily check in", "odulu al", "odul al", "topla", "odulleri topla",
+    "gunluk odul", "gunluk oduller", "oduller", "gorevler"}
+BROWSER_DANGER = re.compile(r"buy|purchase|pay\b|deposit|withdraw|wallet|connect|stake|swap|upgrade|spin|bet\b|invite|refer|share|subscribe|join|premium|stars|ton\b|usdt|fee|cost|price|satin|odeme|yatir|cekim|cuzdan|davet|ucret|harca|abon|katil",re.I)
 
 
 def browser_label(text):
     return re.sub(r"[^a-z0-9 ]", " ", fold(text)).strip()
 
 
-BROWSER_ALLOWED = {
-    "claim", "claim reward", "collect", "collect reward", "claim daily reward",
-    "collect daily reward", "daily reward", "daily rewards", "rewards", "tasks",
-    "check in", "daily check in", "odulu al", "odul al", "topla", "odulleri topla",
-    "gunluk odul", "gunluk oduller", "oduller", "gorevler"
-}
-BROWSER_DANGER = re.compile(
-    r"buy|purchase|pay\b|deposit|withdraw|wallet|connect|stake|swap|upgrade|spin|bet\b|"
-    r"invite|refer|share|subscribe|join|premium|stars|ton\b|usdt|fee|cost|price|"
-    r"satin|odeme|yatir|cekim|cuzdan|davet|ucret|harca|abon|katil", re.I)
+async def browser_save():
+    await save_json(BROWSER_KEY,BROWSER_FILE,BROWSER_JOBS)
 
 
 async def browser_public(url):
     import socket, ipaddress
-    p = urlparse(url)
-    if p.scheme != "https" or not p.hostname or p.username or p.password:
+    p=urlparse(url)
+    if p.scheme!="https" or not p.hostname or p.username or p.password:
         return False
     try:
-        if p.port not in (None, 443):
+        if p.port not in (None,443):
             return False
-        rows = await asyncio.get_running_loop().getaddrinfo(p.hostname, 443, type=socket.SOCK_STREAM)
+        rows=await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(p.hostname,443,type=socket.SOCK_STREAM),5)
         return bool(rows) and all(ipaddress.ip_address(row[4][0]).is_global for row in rows)
     except Exception:
         return False
 
 
-async def browser_visit(url):
+async def browser_visit(name,url,state):
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    def stage(label):
+        state["stage"]=label
+        print(f"[BROWSER-V4] bot={name} stage={label}",flush=True)
+    stage("adres_guvenlik_kontrolu")
     if not await browser_public(url):
         return ["Acilis adresi guvenlik kontrolunden gecmedi."]
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        return ["Playwright kurulu degil. Docker paketiyle deploy gerekli."]
-    notes = []
+    notes=[]
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        stage("chromium_baslatma")
+        browser=await p.chromium.launch(headless=True,timeout=60000,args=["--disable-dev-shm-usage"])
         try:
-            context = await browser.new_context(viewport={"width":390,"height":844},
-                is_mobile=True, has_touch=True, user_agent=DESKTOP_UA, accept_downloads=False)
+            context=await browser.new_context(viewport={"width":390,"height":844},is_mobile=True,
+                has_touch=True,user_agent=DESKTOP_UA,accept_downloads=False)
+            cache={}
             async def guard(route):
-                if await browser_public(route.request.url):
-                    await route.continue_()
-                else:
-                    await route.abort()
-            await context.route("**/*", guard)
-            page = await context.new_page()
-            page.set_default_timeout(7000)
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(6000)
-            notes.append("Mini uygulama sunucudaki Chromium tarayicisinda yuklendi.")
-            attempted = set()
+                u=route.request.url
+                host=urlparse(u).netloc
+                try:
+                    if host not in cache:
+                        cache[host]=await browser_public(u)
+                    if cache[host] and urlparse(u).scheme=="https":
+                        await route.continue_()
+                    else:
+                        await route.abort()
+                except Exception:
+                    try:
+                        await route.abort()
+                    except Exception:
+                        pass
+            await context.route("**/*",guard)
+            page=await context.new_page()
+            page.set_default_timeout(10000)
+            stage("sayfa_acilisi")
+            try:
+                response=await page.goto(url,wait_until="domcontentloaded",timeout=60000)
+                if response and response.status>=400:
+                    return [f"Mini uygulama HTTP {response.status} verdi; islem yapilmadi."]
+            except PWTimeout:
+                notes.append("Sayfa acilisi 60 saniyeyi asti; kisman yuklenen ekran kontrol ediliyor.")
+            stage("sayfa_govdesi_bekleme")
+            await page.locator("body").wait_for(state="attached",timeout=15000)
+            await page.wait_for_timeout(5000)
+            notes.append("Sayfaya erisildi; girisin kabul edildigi henuz dogrulanmadi.")
+            attempted=set()
             for _ in range(8):
                 if BROWSER_PAUSED:
                     break
-                body = (await page.locator("body").inner_text())[:16000]
-                if re.search(r"captcha|verify you are human|insan oldugunuzu", body, re.I):
+                stage("ekran_kontrolu")
+                body=(await page.locator("body").inner_text())[:16000]
+                if re.search(r"captcha|verify you are human|insan oldugunuzu",body,re.I):
                     notes.append("Dogrulama istendi; atlatilmadi, tur durdu.")
                     break
-                controls = page.locator("button, [role=button]")
-                target = None
-                for i in range(min(await controls.count(), 100)):
-                    b = controls.nth(i)
-                    if not await b.is_visible() or not await b.is_enabled():
+                stage("dugme_arama")
+                controls=page.locator("button, [role=button]")
+                target=None
+                for i in range(min(await controls.count(),100)):
+                    b=controls.nth(i)
+                    try:
+                        if not await b.is_visible() or not await b.is_enabled():
+                            continue
+                        label=browser_label(await b.inner_text(timeout=2000))
+                        if label not in BROWSER_ALLOWED or label in attempted:
+                            continue
+                        nearby=await b.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,800)",timeout=2000)
+                        if BROWSER_DANGER.search(nearby) or re.search(r"[$€₺]|\b\d+[.,]?\d*\s*(TON|USDT|USD|stars)\b",nearby,re.I):
+                            continue
+                        target=b,label
+                        break
+                    except PWTimeout:
                         continue
-                    label = browser_label(await b.inner_text())
-                    if label not in BROWSER_ALLOWED or label in attempted:
-                        continue
-                    nearby = await b.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,800)")
-                    if BROWSER_DANGER.search(nearby) or re.search(r"[$€₺]|\b\d+[.,]?\d*\s*(TON|USDT|USD|stars)\b",nearby,re.I):
-                        continue
-                    target = b, label
-                    break
                 if target is None:
                     break
-                b, label = target
+                b,label=target
                 attempted.add(label)
-                await b.click(no_wait_after=True)
-                await page.wait_for_timeout(2500)
-                notes.append(f"Dugme denendi: {label}. Odul/bakiye artisi dogrulanmadi.")
+                stage("dugmeye_basma")
+                try:
+                    await b.click(timeout=10000,no_wait_after=True)
+                    await page.wait_for_timeout(2500)
+                    notes.append(f"Dugme denendi: {label}. Odul/bakiye artisi dogrulanmadi.")
+                except PWTimeout:
+                    notes.append(f"Dugme hazir olmadi: {label}. Zorla tiklanmadi; tur durdu.")
+                    break
             if not attempted:
-                notes.append("Taninmis ucretsiz toplama dugmesi bulunamadi; rastgele tiklanmadi.")
+                notes.append("Taninmis ucretsiz odul dugmesi bulunamadi; rastgele tiklanmadi.")
             return notes
         finally:
-            await browser.close()
+            try:
+                await asyncio.wait_for(browser.close(),15)
+            except Exception:
+                pass
 
 
-async def browser_save():
-    await save_json(BROWSER_KEY, BROWSER_FILE, BROWSER_JOBS)
-
-
-async def browser_run(name, short="", start=""):
+async def browser_run(name,short="",start=""):
     global BROWSER_LOCK
     if BROWSER_LOCK is None:
-        BROWSER_LOCK = asyncio.Lock()
+        BROWSER_LOCK=asyncio.Lock()
+    state={"stage":"sirada"}
+    def stage(label):
+        state["stage"]=label
+        print(f"[BROWSER-V4] bot={name} stage={label}",flush=True)
+    async def work():
+        stage("telegram_botu_bulma")
+        ent=await asyncio.wait_for(resolve_entity(name),30)
+        if not getattr(ent,"bot",False):
+            BROWSER_JOBS.pop(name,None)
+            return ["Hedef bir bot degil; atlandi."]
+        stage("telegram_kilidi_bekleme")
+        if not await try_lock(TG_LOCK,30):
+            return ["Telegram islem sirasi bosalmadi."]
+        try:
+            stage("telegram_start")
+            sent=await asyncio.wait_for(tg_client.send_message(ent,f"/start {start}".strip()),30)
+            await asyncio.sleep(INSPECT_WAIT)
+            stage("telegram_cevabi_okuma")
+            msgs=await asyncio.wait_for(fetch_incoming(ent,sent.id,limit=10),30)
+        finally:
+            TG_LOCK.release()
+        taskmsg=next((m for m in reversed(msgs) if parse_tasks(m)),None)
+        if taskmsg is not None and not BROWSER_PAUSED:
+            stage("telegram_gorev_turu")
+            await asyncio.wait_for(run_autotasks(name,[],20,msg_id=taskmsg.id,quiet=False),180)
+        if BROWSER_PAUSED:
+            return ["Durduruldu."]
+        stage("mini_uygulama_kilidi")
+        if not await try_lock(APP_LOCK,30):
+            return ["Mini uygulama islem sirasi bosalmadi."]
+        try:
+            stage("yetkili_acilis_adresi_alma")
+            url,how,public=await asyncio.wait_for(get_webview_url(ent,name,short,start),90)
+        finally:
+            APP_LOCK.release()
+        if not url:
+            return ["Yetkili mini uygulama acilis adresi alinamadi; tarayici islemi yapilmadi."]
+        return await browser_visit(name,url,state)
     async with BROWSER_LOCK:
         if BROWSER_PAUSED:
             return
+        started=time.monotonic()
         try:
-            ent = await resolve_entity(name)
-            if not getattr(ent, "bot", False):
-                await send_admin(f"@{name}: Bot olmayan hedef atlandi.")
-                BROWSER_JOBS.pop(name, None)
-                return
-            async with TG_LOCK:
-                sent = await tg_client.send_message(ent, f"/start {start}".strip())
-                await asyncio.sleep(INSPECT_WAIT)
-                msgs = await fetch_incoming(ent, sent.id, limit=10)
-            taskmsg = next((m for m in reversed(msgs) if parse_tasks(m)), None)
-            if taskmsg is not None and not BROWSER_PAUSED:
-                await run_autotasks(name, [], 20, msg_id=taskmsg.id, quiet=False)
-            if BROWSER_PAUSED:
-                return
-            async with APP_LOCK:
-                url, how, public = await get_webview_url(ent, name, short, start)
-            if url:
-                notes = await browser_visit(url)
-            else:
-                notes = ["Yetkili mini uygulama acilis adresi alinamadi; tarayici gorevi yapilmadi."]
-            await send_admin(f"@{name} — OTOMATIK TUR SONUCU\n" + "\n".join(notes))
+            notes=await asyncio.wait_for(work(),420)
+            await send_admin(f"@{name} — V4 TUR SONUCU\n"+"\n".join(notes))
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            await send_admin(f"@{name}: Tur tamamlanamadi ({type(e).__name__}). "
-                             "Oturum adresi ve gizli veriler rapora yazilmadi.")
+            import traceback
+            elapsed=int(time.monotonic()-started)
+            stack=" > ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in traceback.extract_tb(e.__traceback__)[-6:])
+            print(f"[BROWSER-V4-ERROR] bot={name} stage={state['stage']} type={type(e).__name__} stack={stack}",flush=True)
+            await send_admin(f"@{name}: V4 turu tamamlanamadi.\nAsama: {state['stage']}\nHata: {type(e).__name__}\nGecen sure: {elapsed} saniye.\nGizli bilgiler rapora yazilmadi. Gorev/odul basarisi dogrulanmadi.")
         finally:
             if name in BROWSER_JOBS:
-                BROWSER_JOBS[name]["last"] = time.time()
+                BROWSER_JOBS[name]["last"]=time.time()
             await browser_save()
 
 
-async def auto_link(name: str, short: str = "", start: str = ""):
+async def auto_link(name: str,short: str="",start: str=""):
     global BROWSER_PAUSED
-    BROWSER_PAUSED = False
+    BROWSER_PAUSED=False
     if name in BROWSER_TASKS and not BROWSER_TASKS[name].done():
         await send_admin(f"@{name}: Zaten sirada veya calisiyor.")
         return
-    BROWSER_JOBS[name] = {"short":short, "start":start, "last":time.time()}
+    BROWSER_JOBS[name]={"short":short,"start":start,"last":time.time()}
     await browser_save()
-    await send_admin(f"@{name}: Otomatik is siraya alindi. Telegram gorevleri ve mini uygulamadaki "
-                     "taninan ucretsiz odul dugmeleri denenecek. Durdurmak icin dur yaz.")
-    BROWSER_TASKS[name] = spawn(browser_run(name, short, start))
+    await send_admin(f"@{name}: V4 otomatik is siraya alindi. Sonucta asama bilgisi verilecek. Durdurmak icin dur yaz.")
+    BROWSER_TASKS[name]=spawn(browser_run(name,short,start))
 
 
 async def browser_stop():
-    global BROWSER_PAUSED, AUTO_STOP
-    BROWSER_PAUSED = True
-    AUTO_STOP = True
-    AUTOPILOT["on"] = False
+    global BROWSER_PAUSED,AUTO_STOP
+    BROWSER_PAUSED=True
+    AUTO_STOP=True
+    AUTOPILOT["on"]=False
     await persist_autopilot()
     for c in CLAIMS.values():
-        c["on"] = False
+        c["on"]=False
     await persist_claims()
-    tasks = [t for t in BROWSER_TASKS.values() if not t.done()]
+    tasks=[t for t in BROWSER_TASKS.values() if not t.done()]
     for t in tasks:
         t.cancel()
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks,return_exceptions=True)
     BROWSER_JOBS.clear()
     await browser_save()
-    await send_admin("Mini uygulama isleri silindi; otopilot ve claim kayitlari duraklatildi. "
-                     "Gonderilmis islemler geri alinamaz. Yeni link yeni is baslatir.")
+    await send_admin("Mini uygulama isleri silindi; otopilot ve claim duraklatildi. Gonderilmis islemler geri alinamaz.")
 
 
 async def browser_loop():
-    saved = await load_json(BROWSER_KEY, BROWSER_FILE)
-    if isinstance(saved, dict):
-        for name, j in saved.items():
+    saved=await load_json(BROWSER_KEY,BROWSER_FILE)
+    if isinstance(saved,dict):
+        for name,j in saved.items():
             if re.fullmatch(r"[a-z0-9_]{4,32}",name) and isinstance(j,dict):
                 BROWSER_JOBS.setdefault(name,j)
     while True:
         try:
             if not BROWSER_PAUSED:
-                for name, j in list(BROWSER_JOBS.items()):
-                    if time.time()-float(j.get("last",0)) < BROWSER_INTERVAL:
+                for name,j in list(BROWSER_JOBS.items()):
+                    if time.time()-float(j.get("last",0))<BROWSER_INTERVAL:
                         continue
                     if name in BROWSER_TASKS and not BROWSER_TASKS[name].done():
                         continue
-                    j["last"] = time.time()
-                    BROWSER_TASKS[name] = spawn(browser_run(name,j.get("short",""),j.get("start","")))
+                    j["last"]=time.time()
+                    BROWSER_TASKS[name]=spawn(browser_run(name,j.get("short",""),j.get("start","")))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3386,39 +3432,33 @@ async def browser_loop():
         await asyncio.sleep(30)
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user, msg = update.effective_user, update.effective_message
+async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
+    user,msg=update.effective_user,update.effective_message
     if not user or not msg:
         return
     if user.id not in ADMIN_IDS:
-        await msg.reply_text("Bu hesap yetkili degil; sahibine istek gonderildi.")
+        await msg.reply_text("Yetkin yok; sahibine istek gonderildi.")
         await ask_admin_access(user)
         return
-    text = msg.text or msg.caption or ""
+    text=msg.text or msg.caption or ""
     if text.strip().lower() in {"dur","durdur","kapat"}:
         await browser_stop()
         return
-    for e in list(msg.entities or []) + list(msg.caption_entities or []):
+    for e in list(msg.entities or [])+list(msg.caption_entities or []):
         if getattr(e,"url",None):
-            text += " " + e.url
-    targets = parse_link_targets(text)
-    if not targets:
-        await msg.reply_text("Baslatmak icin t.me bot linkini veya @kullaniciadini gonder. Durdurmak icin dur yaz.")
-    for name, short, start in targets:
+            text+=" "+e.url
+    for name,short,start in parse_link_targets(text):
         await auto_link(name,short,start)
 
 
 @admin_only
-async def cmd_dur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_dur(update: Update,context: ContextTypes.DEFAULT_TYPE):
     await browser_stop()
 
 
 @admin_only
-async def cmd_incele(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    targets = parse_link_targets(" ".join(context.args))
-    if not targets:
-        await update.effective_message.reply_text("Bot linkini veya @kullaniciadini gonder.")
-    for name, short, start in targets:
+async def cmd_incele(update: Update,context: ContextTypes.DEFAULT_TYPE):
+    for name,short,start in parse_link_targets(" ".join(context.args)):
         await auto_link(name,short,start)
 
 
