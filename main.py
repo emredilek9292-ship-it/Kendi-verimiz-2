@@ -3184,11 +3184,9 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V27 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v14
-# Canvas tabanli mini uygulamalar (OpFlex vb) icin kok cozum:
-# - telegram-web-app.js istegini yakala, kendi mock'umuzu servis et
-# - Boylece uygulamanin kendi script'i mock'u ezmez
-# - API header enjeksiyonu (tma) ayni kaliyor
+# V28 - V8'in calisan MyAgeApp claim cozumu + V26 universal header
+# V8'de calisan: duyuru dialogu OK -> role-based claim -> risk kontrol -> tiklama
+# V26'da calisan: route ile tma header enjeksiyonu
 # ============================================================
 
 import io as _io
@@ -3262,6 +3260,20 @@ DYNAMIC_IMPORT_RE = re.compile(
     r'import\(\s*["\']([^"\']+)["\']\s*\)|import\(\s*`([^`]+)`\s*\)',
     re.I
 )
+
+# V8'den alinan: MyAgeApp duyurusu exact match
+V8_KNOWN_ANNOUNCEMENT = re.compile(
+    r"^agetokenislive\?agetokenislive\?listing23novembercheckofficialchannelcompletenewtaskok$",
+    re.I
+)
+
+
+def v8_canonical_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def v8_known_announcement(text: str) -> bool:
+    return bool(V8_KNOWN_ANNOUNCEMENT.match(v8_canonical_text(text)))
 
 
 def extract_tg_init_data(url: str):
@@ -3426,8 +3438,11 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; telegram-web-app.js'i yakalayıp
-    kendi mock'umuzu servis eder. Böylece uygulamanın kendi script'i mock'u ezmez.
+    """V8'in calisan MyAgeApp claim cozumu + V26'nin universal header enjeksiyonu.
+
+    1) telegram-web-app.js mock servisi (V27)
+    2) Route ile tma header enjeksiyonu (V26)
+    3) V8'in duyuru dialogu OK + role-based claim butonu (V8)
     """
     lines = []
     browser = await get_browser()
@@ -3446,7 +3461,7 @@ async def browser_auto(bot: str, url: str) -> list:
     if initData:
         app_host = _urlparse(url).netloc
 
-        # 1) telegram-web-app.js'i yakala, kendi mock'umuzu servis et
+        # 1) telegram-web-app.js mock servisi
         tg_mock_js = f"""
 window.Telegram = window.Telegram || {{}};
 window.Telegram.WebApp = {{
@@ -3684,6 +3699,35 @@ window.Telegram.WebApp = {{
             f"initDataLen={tg_check.get('initDataLen')}"
         )
 
+        # V8'den alinan: MyAgeApp duyuru dialogu OK
+        if bot.lower() == "myageapp":
+            try:
+                dialogs = page.locator("role=dialog")
+                closed = False
+                for i in range(min(await dialogs.count(), 10)):
+                    dialog = dialogs.nth(i)
+                    if not await dialog.is_visible():
+                        continue
+                    text = await dialog.inner_text(timeout=5000)
+                    if not v8_known_announcement(text):
+                        continue
+                    ok = dialog.get_by_role("button", name=re.compile(r"^OK$", re.I))
+                    if await ok.count() != 1:
+                        lines.append("Duyuru dialogunda tek OK bulunamadı.")
+                        break
+                    await ok.click(trial=True, timeout=10000)
+                    try:
+                        await dialog.wait_for_state("hidden", timeout=10000)
+                    except Exception:
+                        pass
+                    closed = True
+                    lines.append("MyAgeApp duyurusu OK ile kapatıldı.")
+                    break
+                if not closed:
+                    lines.append("MyAgeApp duyurusu bulunamadı; claim kontrolüne geçiliyor.")
+            except Exception as e:
+                lines.append(f"Duyuru dialogu hatası: {type(e).__name__} {e}")
+
         # Uygulamaya gir
         entered = await js_click(r"^(open|start|play|launch|enter)$")
         if not entered:
@@ -3710,16 +3754,37 @@ window.Telegram.WebApp = {{
                     lines.append(f"API OK: {u[:80]}")
                     lines.append("API JSON özeti: " + ttxt)
 
-        # Claim dene
-        if tasks_ok:
-            labels = await dump_buttons()
-            lines.append("Görünür buton metinleri: " + " | ".join(labels[:25]))
-            for pat in [r"\b(start|check|go)\b", r"\b(claim|collect|reward|bonus|daily|check[- ]?in)\b"]:
-                res = await js_click(pat)
-                if res:
-                    lines.append(f"Tıklanan buton: {res}")
-                    await page.wait_for_timeout(3000)
-        else:
+        # V8'den alinan: role-based claim butonu
+        claim_clicked = False
+        try:
+            claim = page.get_by_role("button", name=re.compile(r"claim", re.I))
+            if await claim.count() == 1:
+                if await claim.is_visible() and await claim.is_enabled():
+                    nearby = await claim.evaluate(
+                        "e => (e.parentElement?.innerText || e.innerText || '').slice(0, 1000)"
+                    )
+                    risk = re.compile(
+                        r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|"
+                        r"stake|swap|premium|stars|usdt|c\u00fczdan|\u00f6deme|mesat\u0131n|sat\u0131n|"
+                        r"u\u00fcret|\u00fcret",
+                        re.I,
+                    )
+                    if not risk.search(nearby or ""):
+                        await claim.scroll_into_view_if_needed(timeout=5000)
+                        await claim.click(trial=True, timeout=12000)
+                        claim_clicked = True
+                        lines.append("Role-based claim butonu tıklandı.")
+                    else:
+                        lines.append("Claim çevresinde risk ifadesi var; tıklanmadı.")
+                else:
+                    lines.append("Claim butonu görünür/etkin değil.")
+            else:
+                lines.append(f"Role-based claim butonu sayısı: {await claim.count()}")
+        except Exception as e:
+            lines.append(f"Role-based claim hatası: {type(e).__name__} {e}")
+
+        # Role-based basarili olmazsa JS exact fallback
+        if not claim_clicked:
             claim_exact = await js_click_exact("claim bonus")
             if not claim_exact:
                 claim_exact = await js_click_exact("claim")
