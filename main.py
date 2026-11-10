@@ -3184,9 +3184,11 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V12 - UNIVERSAL MINIAPP ENGINE
+# V12.1 - UNIVERSAL MINIAPP ENGINE
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # ============================================================
+
+MINIAPP_BUSY = set()
 
 BALANCE_HINTS = (
     "balance", "balances", "coin", "coins", "point", "points",
@@ -3284,6 +3286,10 @@ def balance_diff(before: dict, after: dict):
 
 
 async def universal_miniapp(bot: str):
+    if bot in MINIAPP_BUSY:
+        await send_admin(f"{bot} icin mini uygulama otomasyonu zaten calisiyor.")
+        return
+    MINIAPP_BUSY.add(bot)
     try:
         ent = await resolve_entity(bot)
         if not getattr(ent, "bot", False):
@@ -3292,7 +3298,9 @@ async def universal_miniapp(bot: str):
 
         await send_admin(
             f"UNIVERSAL MINIAPP başladı: {bot}\n"
-            "Mini uygulama açılıyor, görev/claim/daily yapısı taranıyor.\n"
+            "1) Mini uygulama açılıyor\n"
+            "2) Claim/daily yolları taranıyor\n"
+            "3) Görev listesi arka planda taranacak\n"
             "Cüzdan, ödeme, swap, stake ve tehlikeli işlemler otomatik yapılmayacak."
         )
 
@@ -3351,11 +3359,16 @@ async def universal_miniapp(bot: str):
         else:
             lines.append("Bakiye alanları hiç okunamadı; claim sonucu doğrulanamadı.")
 
+        lines.append("Görev listesi taraması arka planda başladı; bitince özet gelecek.")
         await send_admin("\n".join(lines))
-        await run_autotasks(bot, [], 0, quiet=False)
+
+        # Uzun suren gorev taramasi ana akisi bloklamasin
+        spawn(run_autotasks(bot, [], 0, quiet=False))
 
     except Exception as e:
         await send_admin(f"{bot} universal miniapp hatası: {type(e).__name__} {e}")
+    finally:
+        MINIAPP_BUSY.discard(bot)
 
 
 def spawn_universal_miniapp(bot: str):
@@ -3370,7 +3383,7 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kullanım: miniapp botadi\n"
             "Örnek: miniapp atomicappbot\n"
             "Sistem mini uygulamayı açar, güvenli claim/daily yollarını dener, "
-            "görev listesini tarar ve sonucu raporlar."
+            "görev listesini arka planda tarar ve sonucu raporlar."
         )
         return
 
@@ -3378,6 +3391,12 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name:
         await update.effective_message.reply_text(
             "Geçerli bot adı yaz. Örnek: miniapp atomicappbot"
+        )
+        return
+
+    if name in MINIAPP_BUSY:
+        await update.effective_message.reply_text(
+            f"{name} için otomasyon zaten çalışıyor. Bitmesini bekle."
         )
         return
 
