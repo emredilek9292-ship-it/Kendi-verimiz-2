@@ -3184,12 +3184,12 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V19 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v6
+# V20 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v7
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
 
-import io
+import io as _io
 
 try:
     from playwright.async_api import async_playwright
@@ -3413,7 +3413,10 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; Open -> Earn/Tasks -> Claim akisini dener."""
+    """Mini uygulamayı gerçek tarayıcıda açar; JS ile güvenli butonları tıklar.
+
+    Network isteklerini de yakalar; claim/daily API çağrılarını raporlar.
+    """
     lines = []
     browser = await get_browser()
     if browser is None:
@@ -3428,57 +3431,53 @@ async def browser_auto(bot: str, url: str) -> list:
     )
     page = await context.new_page()
 
+    api_calls = []
+
+    def on_request(req):
+        u = req.url
+        if any(k in u.lower() for k in ("api", "claim", "daily", "reward", "check", "collect")):
+            api_calls.append(u)
+
+    page.on("request", on_request)
+
     async def shot(caption):
         try:
             s = await page.screenshot(type="png")
             if tg_client:
                 await tg_client.send_file(
                     ADMIN_CHAT_ID,
-                    io.BytesIO(s),
+                    _io.BytesIO(s),
                     caption=caption,
                     force_document=False
                 )
         except Exception as e:
             lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__} {e}")
 
-    async def click_first(pattern, max_wait=4000):
-        selectors = [
-            "button",
-            "[role=button]",
-            "a",
-            "div[onclick]",
-            "span[onclick]",
-            "div[class*=button]",
-            "span[class*=button]",
-        ]
-        for sel in selectors:
-            loc = page.locator(sel)
-            count = await loc.count()
-            for i in range(min(count, 60)):
-                try:
-                    el = loc.nth(i)
-                    label = (await el.inner_text()).strip()
-                except Exception:
-                    continue
-                if not label:
-                    continue
-                if DANGER_CLICK_RE.search(label):
-                    continue
-                if not re.search(pattern, label, re.I):
-                    continue
-                try:
-                    await el.click(timeout=5000)
-                    await page.wait_for_timeout(max_wait)
-                    return label
-                except Exception:
-                    continue
+    async def js_click(pattern: str, max_wait: int = 4000):
+        """Sayfadaki metne gore ilk guvenli elementi JS ile tiklar."""
         try:
-            t = page.get_by_text(re.compile(pattern, re.I)).first
-            await t.click(timeout=5000)
-            await page.wait_for_timeout(max_wait)
-            return "text-match"
-        except Exception:
+            label = await page.evaluate(
+                """(pattern) => {
+                    const rx = new RegExp(pattern, 'i');
+                    const bad = /wallet|cüzdan|deposit|withdraw|ekle|çekim|yatır|buy|satın|sat|swap|stake|invest|premium|stars|usdt|pay|ödeme|confirm|onayla|approve|sign|connect|login|giriş/i;
+                    const els = Array.from(document.querySelectorAll('button, a, [role=button], div, span'));
+                    for (const el of els) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (!t || t.length > 60) continue;
+                        if (!rx.test(t)) continue;
+                        if (bad.test(t)) continue;
+                        el.click();
+                        return t;
+                    }
+                    return null;
+                }""",
+                pattern,
+            )
+        except Exception as e:
             return None
+        if label:
+            await page.wait_for_timeout(max_wait)
+        return label
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -3505,18 +3504,23 @@ async def browser_auto(bot: str, url: str) -> list:
         if balance_before is not None:
             lines.append(f"Ekrandan okunan bakiye: {balance_before}")
 
-        entered = await click_first(r"open|start|play|launch|enter")
+        # 1) Uygulamaya gir
+        entered = await js_click(r"^(open|start|play|launch|enter)$")
+        if not entered:
+            entered = await js_click(r"open|start|play|launch|enter")
         if entered:
             lines.append(f"Uygulamaya giriş butonu: {entered}")
             await page.wait_for_timeout(5000)
 
+        # 2) Earn/Tasks/Daily sekmeleri
         for tab in ["earn", "tasks", "daily", "rewards", "check-in", "bonus"]:
-            res = await click_first(re.escape(tab))
+            res = await js_click(re.escape(tab))
             if res:
                 lines.append(f"Sekme butonu: {res}")
                 break
 
-        claim_btn = await click_first(
+        # 3) Claim/Collect/Reward
+        claim_btn = await js_click(
             r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck"
         )
         if claim_btn:
@@ -3524,6 +3528,7 @@ async def browser_auto(bot: str, url: str) -> list:
         else:
             lines.append("Claim/Daily/Collect butonu bulunamadı.")
 
+        await page.wait_for_timeout(3000)
         await shot(f"{bot} - işlem sonrası ekran")
 
         body_after = ""
@@ -3542,6 +3547,12 @@ async def browser_auto(bot: str, url: str) -> list:
                 lines.append(f"Bakiye azaldı: {balance_before} -> {balance_after}")
         else:
             lines.append("Bakiye ekran üzerinden doğrulanamadı.")
+
+        if api_calls:
+            uniq = list(dict.fromkeys(api_calls))[:6]
+            lines.append("Yakalanan API çağrıları: " + " | ".join(u[:80] for u in uniq))
+        else:
+            lines.append("Claim/daily API çağrısı yakalanmadı.")
 
         popup = classify_popup_text(body_after[:500])
         lines.append(f"Son ekran sınıfı: {popup}")
