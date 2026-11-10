@@ -3184,32 +3184,67 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 
-# ===== V10: hourly MyAgeApp + read-only Tasks discovery =====
-AUTO10_JOBS={}
-AUTO10_TASKS={}
-AUTO10_LOCK=None
-AUTO10_READY=False
-AUTO10_KEY="radar:scheduled:v10"
-AUTO10_FILE="/tmp/radar_scheduled_v10.json"
+# ===== V11: MyAgeApp main-page state + conservative hourly Vault claim =====
+A11_JOBS={}
+A11_TASKS={}
+A11_LOCK=None
+A11_READY=False
+A11_KEY="radar:scheduled:v11"
+A11_FILE="/tmp/radar_scheduled_v11.json"
 
 
-def a10_notice(text):
+def a11_notice(text):
     t=re.sub(r"[^a-z0-9]","",(text or "").lower())
     return bool(re.fullmatch(r"agetokenislive(?:agetokenislive)?listing23novembercheckofficialchannelcompletenewtaskok",t))
 
 
-async def a10_save():
-    await save_json(AUTO10_KEY,AUTO10_FILE,AUTO10_JOBS)
+def a11_state(text):
+    # Parse only named numeric fields. Never retain or report arbitrary page text.
+    out={}
+    vault=re.search(r"\bVault\b(.{0,500}?)(?:\bCode\b|\bToday\b|\bDaily reward\b|$)",text,re.I|re.S)
+    if vault:
+        v=vault.group(1)
+        amount=re.search(r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s+of\s+(\d+(?:[.,]\d+)?)\b",v,re.I)
+        if amount:
+            try:
+                out['vault']=float(amount.group(1).replace(',','.'))
+                out['capacity']=float(amount.group(2).replace(',','.'))
+            except ValueError: pass
+        full=re.search(r"Full\s+in\s+(\d{1,3}:\d{2}:\d{2})",v,re.I)
+        if full: out['full_in']=full.group(1)
+    for field,pattern in [
+        ('daily_in',r"Daily reward\s+Next\s+in\s+(\d{1,3}:\d{2}:\d{2})"),
+        ('spin_in',r"\bSpin\s+Next\s+in\s+(\d{1,3}:\d{2}:\d{2})"),
+        ('step1',r"\bStep\s+1\s+(\d+\s+of\s+\d+)"),
+        ('step2',r"\bStep\s+2\s+(\d+\s+of\s+\d+)"),
+        ('extra',r"Extra\s+tasks\s+(\d+\s+of\s+\d+)")]:
+        m=re.search(pattern,text,re.I)
+        if m: out[field]=re.sub(r'\s+',' ',m.group(1))
+    out['watch_task_present']=bool(re.search(r'Watch\s+Serials',text,re.I))
+    out['registration_tasks_present']=bool(re.search(r'Register\s+(?:at\s+)?(?:1WIN|Jetton|Tonplay)',text,re.I))
+    return out
 
 
-async def a10_report(name,text):
-    await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V10\n{text[:3700]}",disable_web_page_preview=True)
+def a11_summary(st):
+    rows=[]
+    if 'vault' in st: rows.append(f"Vault: {st['vault']:g} / {st['capacity']:g} AGE.")
+    for key,label in [('full_in','Kasanin dolmasina'),('daily_in','Daily reward sayaci'),('spin_in','Spin sayaci (otomasyon disi)'),('step1','Step 1'),('step2','Step 2'),('extra','Extra tasks')]:
+        if key in st: rows.append(f"{label}: {st[key]}.")
+    return rows or ['Bilinen sayisal durum alanlari okunamadi.']
 
 
-async def a10_public(url):
+async def a11_save():
+    await save_json(A11_KEY,A11_FILE,A11_JOBS)
+
+
+async def a11_report(name,text):
+    await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V11\n{text[:3700]}",disable_web_page_preview=True)
+
+
+async def a11_public(url):
     import socket,ipaddress
     p=urlparse(url)
-    if p.scheme!="https" or not p.hostname or p.username or p.password: return False
+    if p.scheme!='https' or not p.hostname or p.username or p.password: return False
     try:
         if p.port not in (None,443): return False
         rows=await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(p.hostname,443,type=socket.SOCK_STREAM),5)
@@ -3217,233 +3252,212 @@ async def a10_public(url):
     except Exception: return False
 
 
-A10_RISK=re.compile(r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satin|satın|ucret|ücret|[$€₺]",re.I)
-
-
-async def a10_safe(button):
-    try:
-        t=await button.evaluate("e => (e.parentElement?.innerText||e.innerText).slice(0,1000)",timeout=3000)
-        return not A10_RISK.search(t)
-    except Exception: return False
-
-
-def a10_redact(text):
-    text=re.sub(r"https?://\S+","[link gizlendi]",text or "")
-    text=re.sub(r"@[A-Za-z0-9_]+","[kullanici gizlendi]",text)
-    text=re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}","[eposta gizlendi]",text)
-    text=re.sub(r"[A-Za-z0-9_=-]{28,}","[uzun deger gizlendi]",text)
-    return re.sub(r"\s+"," ",text).strip()[:220]
-
-
-async def a10_tasks_read(page):
-    # Read-only inventory. No Start/Check/Join/task completion clicks.
-    rows=await page.locator('button,[role="button"],a').evaluate_all("""els => els
-      .filter(e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden')
-      .slice(0,80).map(e=>({label:(e.innerText||e.getAttribute('aria-label')||'').trim().slice(0,100),
-        context:(e.closest('li,article,[role="listitem"]')?.innerText || e.parentElement?.innerText || '').slice(0,350)}))""")
-    out=[]
-    for row in rows:
-        label=a10_redact(row.get("label",""))
-        context=a10_redact(row.get("context",""))
-        if label:
-            item=f"Dugme: {label}"+(f" | Yakini: {context}" if context and context!=label else "")
-            if item not in out: out.append(item)
-    return out[:15]
-
-
-async def a10_browser(name,url,state,job):
+async def a11_browser(name,url,state,job):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
-    if not await a10_public(url): return ["Adres guvenlik kontrolunden gecmedi."]
+    if not await a11_public(url): return ['Adres guvenlik kontrolunden gecmedi.']
     notes=[]
     async with async_playwright() as p:
-        state["stage"]="chromium"
-        browser=await p.chromium.launch(headless=True,timeout=60000,args=["--disable-dev-shm-usage"])
+        state['stage']='chromium'
+        browser=await p.chromium.launch(headless=True,timeout=60000,args=['--disable-dev-shm-usage'])
         try:
-            ctx=await browser.new_context(viewport={"width":390,"height":844},is_mobile=True,
+            ctx=await browser.new_context(viewport={'width':390,'height':844},is_mobile=True,
                 has_touch=True,user_agent=DESKTOP_UA,accept_downloads=False)
             cache={}
             async def guard(route):
                 u=route.request.url; host=urlparse(u).netloc
                 try:
-                    if host not in cache: cache[host]=await a10_public(u)
-                    if cache[host] and urlparse(u).scheme=="https": await route.continue_()
+                    if host not in cache: cache[host]=await a11_public(u)
+                    if cache[host] and urlparse(u).scheme=='https': await route.continue_()
                     else: await route.abort()
                 except Exception:
                     try: await route.abort()
                     except Exception: pass
-            await ctx.route("**/*",guard)
+            await ctx.route('**/*',guard)
             page=await ctx.new_page(); page.set_default_timeout(10000)
-            state["stage"]="sayfa_acilisi"
-            response=await page.goto(url,wait_until="domcontentloaded",timeout=60000)
-            if response and response.status>=400: return [f"HTTP {response.status}; islem yapilmadi."]
-            await page.locator('body').wait_for(state="attached",timeout=15000)
+            state['stage']='sayfa_acilisi'
+            response=await page.goto(url,wait_until='domcontentloaded',timeout=60000)
+            if response and response.status>=400: return [f'HTTP {response.status}; islem yapilmadi.']
+            await page.locator('body').wait_for(state='attached',timeout=15000)
             await page.wait_for_timeout(5000)
-            notes.append("Sayfa acildi; uygulama oturumu/bakiye dogrulanmadi.")
+            if name!='myageapp':
+                counts=await page.evaluate("""() => ({buttons:document.querySelectorAll('button,[role="button"]').length,
+                    dialogs:document.querySelectorAll('[role="dialog"],[aria-modal="true"],dialog[open]').length,
+                    canvas:document.querySelectorAll('canvas').length,frames:document.querySelectorAll('iframe').length})""")
+                return [f"Sayfa yuklendi: dugme={counts['buttons']}, pencere={counts['dialogs']}, canvas={counts['canvas']}, iframe={counts['frames']}.",
+                    'Bu oyun icin taninmis gorev/claim profili yok. Islem ve otomatik tekrar yapilmadi.']
             dialogs=page.locator('[role="dialog"],[aria-modal="true"],dialog[open]')
-            state["stage"]="pencere_kontrolu"
+            state['stage']='bilinen_duyuru'
             for i in range(min(await dialogs.count(),10)):
                 d=dialogs.nth(i)
                 if not await d.is_visible(): continue
-                if name!="myageapp" or not a10_notice(await d.inner_text(timeout=3000)):
-                    return notes+["Taninmayan pencere var; onaylanmadi. Gorev taramasi icin uygulamaya ozel tanim gerekir."]
+                if not a11_notice(await d.inner_text(timeout=3000)):
+                    return ['Baslangicta taninmayan pencere var; onaylanmadi.']
                 ok=d.get_by_role('button',name=re.compile(r'^\s*OK\s*$',re.I))
-                if await ok.count()!=1: return notes+["Duyurunun OK dugmesi tekil degil."]
+                if await ok.count()!=1: return ['Bilinen duyurunun OK dugmesi tekil degil.']
                 await ok.click(trial=True,timeout=10000)
-                if not a10_notice(await d.inner_text(timeout=3000)): return notes+["Duyuru degisti; duruldu."]
+                if not a11_notice(await d.inner_text(timeout=3000)): return ['Duyuru degisti; duruldu.']
                 await ok.click(timeout=10000,no_wait_after=True)
-                await d.wait_for(state="hidden",timeout=10000)
-                notes.append("Bilinen MyAgeApp duyurusu kapatildi.")
-            if name=="myageapp":
-                state["stage"]="claim"
-                claim=page.get_by_role('button',name=re.compile(r'^\s*claim\s*$',re.I))
-                if await claim.count()==1 and await claim.is_visible() and await claim.is_enabled() and await a10_safe(claim):
-                    try:
-                        await claim.click(trial=True,timeout=12000)
-                        if await a10_safe(claim):
-                            await claim.click(timeout=10000,no_wait_after=True)
-                            await page.wait_for_timeout(2500)
-                            notes.append("Claim tiklamasi tamamlandi; odul/bakiye artisi otomatik dogrulanmadi.")
-                    except PWTimeout:
-                        notes.append("Claim tiklamasi tamamlanamadi; tekrar veya zorla tiklama yapilmadi.")
-                else: notes.append("Claim uygun/etkin bulunmadi; bu tur atlandi.")
-            else: notes.append("Bu oyun icin claim/gorev tamamlama profili yok; rastgele islem yapilmadi.")
-            # Stop before navigation if a post-claim dialog is now present.
+                await d.wait_for(state='hidden',timeout=10000)
+                notes.append('Bilinen duyuru kapatildi.')
+            state['stage']='ana_sayfa_okuma'
+            before=a11_state((await page.locator('body').inner_text())[:40000])
+            notes+=a11_summary(before)
+            job['last_observation']=before
+            if before.get('step1')=='4 of 4': notes.append('Step 1 tamamlanmis; tekrar denenmedi.')
+            if before.get('step2')=='3 of 3': notes.append('Step 2 tamamlanmis; tekrar denenmedi.')
+            if before.get('watch_task_present'):
+                notes.append('Izleme gorevi goruldu; video izlenmeden Check basilmadi.')
+            if before.get('registration_tasks_present'):
+                notes.append('Ucuncu taraf kayit/bahis/bonus gorevleri kapsam disi; yapilmadi.')
+            if 'daily_in' in before:
+                notes.append('Daily reward bekleme sayaci okunuyor; bu surum Daily reward dugmesine basmaz.')
+            if 'vault' not in before:
+                return notes+['Kasa miktari guvenilir okunamadi; claim tiklanmadi.']
+            if not (0<before['vault']<=before['capacity']):
+                return notes+['Kasa bos veya deger tutarsiz; claim tiklanmadi.']
+            state['stage']='vault_claim'
+            # Only a unique exact-name claim button is considered after reading Vault.
+            claim=page.get_by_role('button',name=re.compile(r'^\s*claim\s*$',re.I))
+            if await claim.count()!=1 or not await claim.is_visible() or not await claim.is_enabled():
+                return notes+['Tek bir gorunur/etkin claim dugmesi bulunamadi.']
+            risk=re.compile(r'wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satin|satın|ucret|ücret|[$€₺]',re.I)
+            async def safe():
+                t=await claim.evaluate("e => (e.parentElement?.innerText||e.innerText).slice(0,1000)",timeout=3000)
+                return not risk.search(t)
+            if not await safe(): return notes+['Claim yakininda riskli baglam var; tiklanmadi.']
+            try:
+                await claim.click(trial=True,timeout=12000)
+                if not await safe(): return notes+['Dugme baglami degisti; tiklanmadi.']
+                await claim.click(timeout=10000,no_wait_after=True)
+            except PWTimeout:
+                return notes+['Claim tiklamasi tamamlanamadi; zorlanmadi ve tekrar tiklanmadi.']
+            await page.wait_for_timeout(3000)
+            notes.append('Claim tiklamasi tamamlandi.')
+            state['stage']='claim_sonrasi_okuma'
+            after=a11_state((await page.locator('body').inner_text())[:40000])
+            job['after_claim_observation']=after
+            if 'vault' in after and after['vault']<before['vault']:
+                notes.append(f"Gorunen kasa {before['vault']:g} -> {after['vault']:g} AGE azaldi. Bu, toplam bakiyeye aktarimin bagimsiz dogrulamasi degildir.")
+            else:
+                notes.append('Kasa azalmasi dogrulanamadi; odul alindi denmedi.')
             for i in range(min(await dialogs.count(),10)):
                 if await dialogs.nth(i).is_visible():
-                    return notes+["Acik pencere var; Tasks sayfasina gecilmedi, onay verilmedi."]
-            state["stage"]="tasks_sayfasi"
-            nav=page.get_by_role('button',name=re.compile(r'^\s*(tasks|görevler|gorevler)\s*$',re.I))
-            if await nav.count()!=1:
-                nav=page.get_by_role('link',name=re.compile(r'^\s*(tasks|görevler|gorevler)\s*$',re.I))
-            opened=False
-            if await nav.count()==1 and await nav.is_visible() and await nav.is_enabled() and await a10_safe(nav):
-                try:
-                    await nav.click(trial=True,timeout=8000)
-                    await nav.click(timeout=8000,no_wait_after=True)
-                    await page.wait_for_timeout(2500)
-                    opened=True
-                except PWTimeout: notes.append("Tasks gezinmesi tamamlanamadi; zorlanmadi.")
-            state["stage"]="tasks_okuma"
-            rows=await a10_tasks_read(page)
-            digest=hashlib.sha256(json.dumps(rows,ensure_ascii=False).encode()).hexdigest()
-            if digest!=job.get('task_digest'):
-                notes.append(("Tasks ekranindaki" if opened else "Mevcut ekrandaki (Tasks oldugu dogrulanmadi)")+" gorunur dugme listesi:")
-                notes.extend(rows or ["Okunabilir dugme bulunamadi; canvas/iframe/ozel ekran olabilir."])
-                job['task_digest']=digest
-            else: notes.append("Gorunur dugme listesi onceki turla ayni; tekrar gonderilmedi.")
-            notes.append("Tasks gorevleri okunur; Start/Check/Join veya satin alma dugmelerine otomatik basilmaz.")
+                    notes.append('Claim sonrasi pencere goruldu; kimligi bilinmedigi icin kapatilmadi veya onaylanmadi.')
+                    break
+            notes.append('Spin, bahis, sosyal paylasim, kayit ve izleme gorevlerine basilmaz.')
             return notes
         finally:
             try: await asyncio.wait_for(browser.close(),15)
             except Exception: pass
 
 
-async def a10_run(name):
-    global AUTO10_LOCK
-    if AUTO10_LOCK is None: AUTO10_LOCK=asyncio.Lock()
-    async with AUTO10_LOCK:
-        job=AUTO10_JOBS.get(name)
+async def a11_run(name):
+    global A11_LOCK
+    if A11_LOCK is None: A11_LOCK=asyncio.Lock()
+    async with A11_LOCK:
+        job=A11_JOBS.get(name)
         if not job or not job.get('on'): return
-        state={"stage":"telegram"}
+        state={'stage':'telegram'}
         async def work():
             ent=await asyncio.wait_for(resolve_entity(name),30)
             if not getattr(ent,'bot',False):
-                job['on']=False; return ["Hedef bot degil; takip kapandi."]
-            if not await try_lock(TG_LOCK,30): return ["Telegram sirasi bosalmadi."]
+                job['on']=False; return ['Hedef bot degil.']
+            if not await try_lock(TG_LOCK,30): return ['Telegram sirasi bosalmadi.']
             try:
                 await asyncio.wait_for(tg_client.send_message(ent,f"/start {job.get('start','')}".strip()),30)
                 await asyncio.sleep(INSPECT_WAIT)
             finally: TG_LOCK.release()
             state['stage']='yetkili_adres'
-            if not await try_lock(APP_LOCK,30): return ["Mini uygulama sirasi bosalmadi."]
+            if not await try_lock(APP_LOCK,30): return ['Mini uygulama sirasi bosalmadi.']
             try:
                 url,how,public=await asyncio.wait_for(get_webview_url(ent,name,job.get('short',''),job.get('start','')),90)
             finally: APP_LOCK.release()
-            if not url: return ["Yetkili uygulama adresi alinamadi."]
-            return await a10_browser(name,url,state,job)
+            if not url: return ['Yetkili uygulama adresi alinamadi.']
+            return await a11_browser(name,url,state,job)
         try:
             notes=await asyncio.wait_for(work(),300)
             job['errors']=0
-            if name!='myageapp':
-                job['on']=False
-                notes.append("Bu oyunda ozel profil olmadigi icin otomatik tekrar kapali. Yeni link yeniden inceler.")
-            else: notes.append("Sonraki kontrol yaklasik 60 dakika sonra; servis calisirsa.")
-            await a10_report(name,'\n'.join(notes))
+            if name!='myageapp': job['on']=False
+            notes.append('Sonraki kontrol yaklasik 60 dakika sonra (servis calisirsa).' if job.get('on') else 'Otomatik tekrar kapali.')
+            await a11_report(name,'\n'.join(notes))
         except asyncio.CancelledError: raise
         except Exception as e:
             job['errors']=int(job.get('errors',0))+1
             if job['errors']>=3: job['on']=False
-            print(f"[V10] bot={name} stage={state['stage']} type={type(e).__name__}",flush=True)
-            await a10_report(name,f"Asama: {state['stage']}; hata: {type(e).__name__}. Gizli bilgiler yazilmadi."+
-                (" Uc ardisik hatada takip kapatildi." if not job.get('on') else " Sonraki saat tekrar kontrol edilecek."))
+            print(f"[V11] bot={name} stage={state['stage']} type={type(e).__name__}",flush=True)
+            await a11_report(name,f"Asama: {state['stage']}; hata: {type(e).__name__}. Gizli veriler yazilmadi."+
+                (' Uc hata sonrasi takip kapandi.' if not job.get('on') else ' Sonraki saat yeniden kontrol edilecek.'))
         finally:
-            job['last']=time.time(); await a10_save()
+            job['last']=time.time(); await a11_save()
 
 
 async def auto_link(name: str,short: str='',start: str=''):
-    if name in AUTO10_TASKS and not AUTO10_TASKS[name].done():
-        await a10_report(name,'Zaten sirada veya calisiyor.'); return
-    AUTO10_JOBS[name]={'on':True,'short':short,'start':start,'last':time.time(),'errors':0}
-    await a10_save()
-    await a10_report(name,'V10 kaydedildi. MyAgeApp saatlik claim + Tasks okuma; diger oyunlar sadece sinirli inceleme. dur: hepsini durdur. durum: liste.')
-    AUTO10_TASKS[name]=spawn(a10_run(name))
+    if name in A11_TASKS and not A11_TASKS[name].done():
+        await a11_report(name,'Zaten sirada veya calisiyor.'); return
+    A11_JOBS[name]={'on':True,'short':short,'start':start,'last':time.time(),'errors':0}
+    await a11_save()
+    await a11_report(name,'V11 kaydedildi. MyAgeApp: ana sayfa durumu ve saatlik kasa kontrolu. Gorev tamamlamalari sinirlidir; raporu oku. dur: durdur; durum: liste.')
+    A11_TASKS[name]=spawn(a11_run(name))
 
 
-async def a10_stop():
+async def a11_stop():
     global AUTO_STOP
     AUTO_STOP=True
-    for job in AUTO10_JOBS.values(): job['on']=False
-    tasks=[t for t in AUTO10_TASKS.values() if not t.done()]
+    for j in A11_JOBS.values(): j['on']=False
+    tasks=[t for t in A11_TASKS.values() if not t.done()]
     for t in tasks: t.cancel()
     if tasks: await asyncio.gather(*tasks,return_exceptions=True)
-    await a10_save()
-    await bot_app.bot.send_message(ADMIN_USER_ID,'V10 saatlik takip durdu. Yeni link sadece o isi yeniden acar.')
+    await a11_save()
+    await bot_app.bot.send_message(ADMIN_USER_ID,'V11 takibi durdu. Gonderilmis islemler geri alinamaz.')
 
 
-async def a10_loop():
-    global AUTO10_READY
-    saved=await load_json(AUTO10_KEY,AUTO10_FILE)
-    if isinstance(saved,dict):
-        for name,j in saved.items():
-            if re.fullmatch(r'[a-z0-9_]{4,32}',name) and isinstance(j,dict): AUTO10_JOBS.setdefault(name,j)
-    AUTO10_READY=True
+async def a11_loop():
+    global A11_READY
+    saved=await load_json(A11_KEY,A11_FILE)
+    if not isinstance(saved,dict):
+        # Only import hourly jobs from V10 if no V11 state exists; other schedules remain stopped.
+        old=await load_json('radar:scheduled:v10','/tmp/radar_scheduled_v10.json')
+        saved={n:j for n,j in (old or {}).items() if n=='myageapp'} if isinstance(old,dict) else {}
+    for name,j in saved.items():
+        if re.fullmatch(r'[a-z0-9_]{4,32}',name) and isinstance(j,dict): A11_JOBS.setdefault(name,j)
+    A11_READY=True
     while True:
         try:
-            for name,j in list(AUTO10_JOBS.items()):
+            for name,j in list(A11_JOBS.items()):
                 if not j.get('on') or time.time()-float(j.get('last',0))<3600: continue
-                if name in AUTO10_TASKS and not AUTO10_TASKS[name].done(): continue
-                j['last']=time.time(); AUTO10_TASKS[name]=spawn(a10_run(name))
+                if name in A11_TASKS and not A11_TASKS[name].done(): continue
+                j['last']=time.time(); A11_TASKS[name]=spawn(a11_run(name))
         except asyncio.CancelledError: raise
-        except Exception as e: print('[V10-LOOP]',type(e).__name__)
+        except Exception as e: print('[V11-LOOP]',type(e).__name__)
         await asyncio.sleep(30)
 
 
 async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
-    user,msg=update.effective_user,update.effective_message
-    if not user or not msg or user.id!=ADMIN_USER_ID or update.effective_chat.type!='private': return
-    text=msg.text or msg.caption or ''
-    if text.strip().lower() in {'dur','durdur','kapat'}: await a10_stop(); return
+    u,m=update.effective_user,update.effective_message
+    if not u or not m or u.id!=ADMIN_USER_ID or update.effective_chat.type!='private': return
+    text=m.text or m.caption or ''
+    if text.strip().lower() in {'dur','durdur','kapat'}: await a11_stop(); return
     if text.strip().lower() in {'durum','liste'}:
-        await msg.reply_text('V10 takip:\n'+'\n'.join(f"@{n}: {'acik' if j.get('on') else 'kapali'}" for n,j in AUTO10_JOBS.items())); return
-    if not AUTO10_READY:
-        await msg.reply_text('Kayitlar yukleniyor; biraz sonra tekrar gonder.'); return
-    for e in list(msg.entities or [])+list(msg.caption_entities or []):
+        await m.reply_text('V11 takip:\n'+'\n'.join(f"@{n}: {'acik' if j.get('on') else 'kapali'}" for n,j in A11_JOBS.items())); return
+    if not A11_READY:
+        await m.reply_text('Kayitlar yukleniyor; biraz sonra tekrar gonder.'); return
+    for e in list(m.entities or [])+list(m.caption_entities or []):
         if getattr(e,'url',None): text+=' '+e.url
     for name,short,start in parse_link_targets(text): await auto_link(name,short,start)
 
 
 async def cmd_incele(update: Update,context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id==ADMIN_USER_ID and update.effective_chat.type=='private' and AUTO10_READY:
+    if update.effective_user.id==ADMIN_USER_ID and update.effective_chat.type=='private' and A11_READY:
         for name,short,start in parse_link_targets(' '.join(context.args)): await auto_link(name,short,start)
 
 
 async def cmd_dur(update: Update,context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id==ADMIN_USER_ID: await a10_stop()
+    if update.effective_user.id==ADMIN_USER_ID: await a11_stop()
 
 
 @admin_only
 async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text('V10: @MyAgeApp -> saatlik claim + Tasks okuma. Diger bot -> sinirli inceleme. Tasks tamamlama henuz desteklenmiyor. dur: durdur; durum: takip. Oturum/bakiye dogrulamasi yok.')
+    await update.effective_message.reply_text('V11: @MyAgeApp -> saatlik kasa kontrolu, bilinen duyuru ve claim. Ana sayfa sayaclarini raporlar. Task, spin, bahis, sosyal islem, kayit ve video izleme tamamlamaz. dur: durdur; durum: liste.')
 
 
 async def main():
@@ -3538,10 +3552,10 @@ async def main():
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
     spawn(keepalive_loop())
-    spawn(a10_loop())
-    print("[V10] eski routine_loop baslatilmadi",flush=True)
-    print("[V10] eski autopilot_loop baslatilmadi",flush=True)
-    print("[V10] eski claims_loop baslatilmadi",flush=True)
+    spawn(a11_loop())
+    print("[V11] eski routine_loop baslatilmadi",flush=True)
+    print("[V11] eski autopilot_loop baslatilmadi",flush=True)
+    print("[V11] eski claims_loop baslatilmadi",flush=True)
 
     try:
         await bot_app.bot.send_message(
