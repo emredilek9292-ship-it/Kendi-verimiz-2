@@ -138,6 +138,9 @@ BAD_WORDS = [
     "deposit", "cüzdan bağla", "yatırım yap",
 ]
 
+# Eski surumlerdeki isimle uyumluluk.
+BADWORDS = BAD_WORDS
+
 # Bu kelimeleri iceren butonlara bot ASLA basmaz (ve onay butonu da koymaz)
 DANGER_BTN_RE = re.compile(
     r"wallet|cüzdan|cuzdan|deposit|withdraw|çekim|cekim|yatır|yatir|buy|satın|satin|"
@@ -709,84 +712,68 @@ def summarize_msgs(msgs, bot: str) -> dict:
 
 
 async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] = None):
-    """Rapor gonderir; guvenli butonlari, gorevleri ve kanal katilimlarini onay istemeden baslatir."""
     info = summarize_msgs(msgs, bot)
-
     raw_text = "\n\n".join(info["texts"])
     labels = [l for l, _ in info["clicks"]] + info["webs"] + info["blocked"] + info["privs"]
-    combo = raw_text + "\n" + "\n".join(labels)
+    combo = raw_text + "\nBUTONLAR: " + ", ".join(labels)
+    warn = [w for w in BAD_WORDS if w in combo.lower()]
+    guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
 
-    warn = [w for w in BADWORDS if w in combo.lower()]
-    guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) > 20 else ""
-
-    lines = [f"🔍 {header}: @{bot}"]
-
-    if not guide or guide.startswith("⚠"):
-        lines.append("Özet çıkarılamadı.")
+    lines = [f"{header}: @{bot}", ""]
+    ozet_yok = (not guide) or guide.startswith("(")
+    if ozet_yok:
+        if guide:
+            lines.append(guide)
+        lines.append(("Botun mesajı:\n" + raw_text[:700]) if raw_text else "(Bot metin göndermedi.)")
     else:
         lines.append(guide)
-
-    lines.append(f"Bot {len(msgs)} mesaj gönderdi, {info['total']} buton gördüm.")
-
+    lines.append(f"ℹ️ Bot {len(msgs)} mesaj gönderdi, mesajlarda {info['total']} buton gördüm.")
+    if info["total"] == 0:
+        lines.append("Not: Çoğu oyun botunun 'Oyna' tuşu mesajda değil, sohbetin altındaki menü tuşunda durur. "
+                     "Onu otomatik göremiyorum.")
     if info["clicks"]:
-        lines.append("• Basılabilir butonlar: " + ", ".join(l for l, _ in info["clicks"]))
+        lines += ["", "▶️ Basılabilir: " + ", ".join(l for l, _ in info["clicks"])]
     if info["webs"]:
-        lines.append("• Mini uygulama: " + ", ".join(info["webs"]))
+        lines.append("📱 Mini uygulama (sen açarsın): " + ", ".join(info["webs"]))
     if info["linkbtns"]:
-        lines.append("• Link butonları: " + ", ".join(l for l, _ in info["linkbtns"]))
+        lines.append("🔗 Link butonları: " + " | ".join(f"{l} → {u}" for l, u in info["linkbtns"]))
+    if info["others"]:
+        lines.append("❔ Diğer butonlar: " + ", ".join(f"{l} ({t})" for l, t in info["others"]))
     if info["blocked"]:
-        lines.append("• Cüzdan/ödeme butonları atlandı: " + ", ".join(info["blocked"]))
+        lines.append("⛔ Ödeme/cüzdan butonları atlandı: " + ", ".join(info["blocked"]))
     if info["privs"]:
-        lines.append("• Telefon/konum isteyen buton var: " + ", ".join(info["privs"]))
+        lines.append("🚫 Telefon/konum isteyen buton var: " + ", ".join(info["privs"]))
     if warn:
-        lines.append("⚠ Riskli ifade bulundu, otomatik işlem yapılmadı: " + ", ".join(warn))
+        lines += ["", "⚠️ Dikkat, şu ifadeler geçiyor: " + ", ".join(warn),
+                  "Güvenlik için otomatik işlem butonu koymadım."]
+
     if bot in REFS:
-        lines.append(f"Senin referans linkin: {REFS[bot]['link']}")
+        lines += ["", f"🔗 Senin referans linkin: {REFS[bot]['link']}"]
 
-    # Aynı bot için kısa süre içinde tekrar otomatik işlem başlatma (döngü koruması)
-    now = time.time()
-    if now - AUTO_REPORT_TIMES.get(bot, 0) < AUTO_REPORT_COOLDOWN:
-        await send_admin("\n".join(lines))
-        return
-    AUTO_REPORT_TIMES[bot] = now
-
-    # 1) Güvenli Telegram inline butonlarına otomatik bas
-    for label, mid in info["clicks"][:5]:
-        spawn(handle_action({
-            "t": "click",
-            "bot": bot,
-            "msg_id": mid,
-            "label": label,
-        }))
-
-    # 2) Kanal görevlerini otomatik yap
-    n_tasks, task_msg = 0, None
-    for m in msgs:
-        tk = parse_tasks(m)
-        if tk:
-            n_tasks, task_msg = len(tk), m
-            break
-
-    if n_tasks and task_msg is not None:
-        spawn(run_autotasks(bot, [], 0, msg_id=task_msg.id, quiet=False))
-
-    # 3) Kanal linklerine otomatik katıl
-    for tgt in info["chans"][:3]:
-        spawn(handle_action({
-            "t": "join",
-            "target": tgt,
-        }))
-
-    # 4) Referans linkini otomatik bul
-    if not warn and bot not in REFS:
-        spawn(ref_finder(bot))
-
-    # 5) Mini uygulamada güvenli claim yollarını otomatik dene
+    rows = []
     if not warn:
-        spawn(claim_discover(bot, auto=True))
-
-    await send_admin("\n".join(lines))
-
+        n_tasks, task_msg = 0, None
+        for m_ in msgs:
+            tk = parse_tasks(m_)
+            if tk:
+                n_tasks, task_msg = len(tk), m_
+        if n_tasks and task_msg is not None:
+            aid = new_action({"t": "autotasks", "bot": bot, "msg_id": task_msg.id, "cap": 0})
+            rows.append([InlineKeyboardButton(f"🤖 Görevleri otomatik yap ({n_tasks}+ görev, sayfaları gezer)", callback_data=f"a:{aid}")])
+        if routine_label:
+            aid = new_action({"t": "routine", "bot": bot, "label": routine_label})
+            rows.append([InlineKeyboardButton(f"🔁 Her gün otomatik: {routine_label[:22]}", callback_data=f"a:{aid}")])
+        for label, mid in info["clicks"][:8]:
+            aid = new_action({"t": "click", "bot": bot, "msg_id": mid, "label": label})
+            rows.append([InlineKeyboardButton(f"▶️ Bas: {label[:28]}", callback_data=f"a:{aid}")])
+        for tgt in info["chans"]:
+            aid = new_action({"t": "join", "target": tgt})
+            rows.append([InlineKeyboardButton(f"📢 Katıl: {tgt[:22]}", callback_data=f"a:{aid}")])
+    if not warn and bot not in REFS:
+        aid = new_action({"t": "findref", "bot": bot})
+        rows.append([InlineKeyboardButton("🔗 Referans linkimi bul", callback_data=f"a:{aid}")])
+    rows.append([InlineKeyboardButton("🤖 Botu aç", url=f"https://t.me/{bot}")])
+    await send_admin("\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def fetch_incoming(ent, after_id: int, limit: int = 8):
@@ -2512,8 +2499,6 @@ APP_LINK_RE = re.compile(
 SKIP_LINK_NAMES = {"joinchat", "addstickers", "addemoji", "addlist", "share", "proxy", "socks", "iv", "login",
                    "boost", "setlanguage", "confirmphone", "invoice", "bg", "addtheme"}
 AUTO_LINK_BUSY: set = set()
-AUTO_REPORT_TIMES: dict = {}
-AUTO_REPORT_COOLDOWN: int = 120
 
 
 def parse_link_targets(text: str) -> list:
@@ -2539,79 +2524,91 @@ def parse_link_targets(text: str) -> list:
 
 
 async def auto_link(name: str, short: str = "", start: str = ""):
-    """Link atilinca hic sormadan: start -> mini app -> rapor -> otomatik buton/gorev/claim."""
+    """Gonderilen link/ad icin her seyi kendisi yapar: giris, referans bulma, otomatik odul toplama."""
     if name in AUTO_LINK_BUSY:
         return
-
     AUTO_LINK_BUSY.add(name)
-
     try:
         ent = await resolve_entity(name)
-
         if not getattr(ent, "bot", False):
-            await send_admin(f"⚠️ @{name} bir bot değil; kanal/grup/kişi olabilir. Atladım.")
+            await send_admin(f"ℹ️ @{name} bir bot / mini uygulama değil (kanal, grup ya da kişi), atladım.")
             return
-
-        await send_admin(
-            f"🚀 @{name} için tam otomatik mod başladı.\n"
-            "Sıra: /start → mini uygulama → güvenli butonlar → görevler → referans → claim."
-        )
-
-        # 1) Mini uygulamayı bulmaya çalış
+        await send_admin(f"🤖 @{name}: otomatik işlem başladı (giriş, referans, ödül toplama). Sormadan yapıyorum...")
         async with APP_LOCK:
             url, how, pub = await get_webview_url(ent, name, short, start)
+        out = [f"🤖 @{name} — otomatik sonuç"]
 
-        if url:
-            await send_admin(f"📱 Mini uygulama adresi alındı ({how}):\n{url}")
+        if not url:
+            out.append("📱 Mini uygulama açılamadı: " + (how.split("\n")[0])[:260])
+            links = []
+            if await try_lock(TG_LOCK, 8):
+                try:
+                    links = await ref_from_chat(ent, name)
+                finally:
+                    TG_LOCK.release()
+            if links:
+                REFS[name] = {"link": links[0], "src": "bot sohbeti", "t": time.time()}
+                await persist_refs()
+                out.append(f"🔗 Referans linkin (sohbetten) kaydedildi: {links[0]}")
+            out.append("💬 Sohbet botu gibi davranıp /start gönderiyorum; rapor ayrıca gelecek.")
+            await send_admin("\n".join(out))
+            spawn(inspect_bot(name, start))
+            return
+
+        out.append("📱 " + how)
+        ctx = await app_context(url)
+        res = analyze_ctx(ctx)
+        if res["links"]:
+            REFS[name] = {"link": res["links"][0], "src": "mini uygulama API", "t": time.time()}
+            await persist_refs()
+            out.append(f"🔗 Referans linkin kaydedildi: {res['links'][0]}")
+        elif res["codes"]:
+            out.append("🔑 Referansa benzeyen alanlar: " + ", ".join(f"{p}={v}" for p, v in res["codes"][:3]))
         else:
-            await send_admin(
-                f"⚠️ Mini uygulama adresi alınamadı.\n{how}\n"
-                "Bot sohbetine /start yazıp butonları tarıyorum."
-            )
+            out.append("🔗 Referans linkini bulamadım.")
 
-        # 2) Bota /start yaz
-        async with TG_LOCK:
-            await tg_client.send_message(ent, "/start")
-        await asyncio.sleep(INSPECT_WAIT)
-
-        # 3) Botun cevaplarını oku ve otomatik işlemi başlat
-        msgs = await fetch_incoming(ent, 0, limit=10)
-        await send_report(name, msgs, "🤖 OTOMATİK İNCELEME")
-
+        if ctx["ok"]:
+            cands = claim_candidates(ctx)
+            lines = []
+            if cands:
+                lines, done = await claim_auto_run(name, ctx, cands, True)
+            if lines:
+                out += lines
+                out.append(f"↻ Başarılı / bekleme süresindeki yollar otomatik toplamaya alındı "
+                           f"(her {CLAIM_EVERY_MIN} dk). Liste / kapatma: /topla")
+            else:
+                out.append("🪙 Kodda güvenli bir 'claim / collect / daily / oturum' yolu bulamadım.")
+                if res["paths"]:
+                    out.append("Kodda geçen yol adayları: " + ", ".join(res["paths"][:8]))
+        else:
+            out.append("⚠️ Uygulamanın API girişini çözemedim, istek atmadım. " + " ".join(ctx["notes"])[:200])
+            if res["hosts"]:
+                out.append("Sunucu adresleri: " + ", ".join(res["hosts"][:5]))
+            if res["paths"]:
+                out.append("Yol adayları: " + ", ".join(res["paths"][:8]))
+        await send_admin("\n".join(out))
     except Exception as e:
-        await send_admin(f"⚠️ @{name} otomatik işlem hatası: {type(e).__name__}: {e}")
-
+        print("[AUTO LINK]", repr(e))
+        try:
+            await send_admin(f"⚠️ @{name} otomatik işlem hatası: {type(e).__name__} {str(e)[:150]}")
+        except Exception:
+            pass
     finally:
         AUTO_LINK_BUSY.discard(name)
 
 
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Komut olmayan mesaj: link / @ad gelirse hic sormadan tam otomatik islem baslat."""
+    """Komut olmayan mesaj: link / @ad ise otomatik isleme al. Admin disindakileri sessizce yok sayar."""
     user = update.effective_user
     msg = update.effective_message
-
     if not user or not msg or user.id not in ADMIN_IDS:
         return
-
-    text = msg.text or msg.caption or ""
-
-    for e in (msg.entities or msg.caption_entities or []):
-        u = getattr(e, "url", None)
-        if u:
-            text += "\n" + u
-
-    targets = parse_link_targets(text)
-    if not targets:
-        return
-
-    for name, short, start in targets:
-        await send_admin(
-            f"🔗 @{name} alındı.\n"
-            "Onay istemeden otomatik işlem başlatıyorum."
-        )
+    text = (msg.text or msg.caption or "")
+    for e in (msg.entities or []) + (msg.caption_entities or []):
+        if getattr(e, "url", None):
+            text += " " + e.url
+    for name, short, start in parse_link_targets(text):
         spawn(auto_link(name, short, start))
-
 
 
 # ===================== GUNLUK RUTIN =====================
