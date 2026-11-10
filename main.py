@@ -3183,741 +3183,274 @@ async def keepalive_loop():
 
 # ===================== MAIN =====================
 
-# ============================================================
-# V29 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v15
-# V28 logu: mock telegram-web-app.js uygulamanin kendi script'ini bozuyor.
-# Cozum: mock KALDIRILDI; gercek telegram-web-app.js yuklenir, initData URL'den okunur.
-# Route ile tma header enjeksiyonu + V8 role-based claim birlesiyor.
-# ============================================================
 
-import io as _io
-import json as _json
-from urllib.parse import unquote as _unquote, parse_qs as _parse_qs, urlparse as _urlparse
-
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_OK = True
-except Exception:
-    PLAYWRIGHT_OK = False
-
-MINIAPP_BUSY = set()
-_BROWSER = None
-_PW = None
-
-BALANCE_HINTS = (
-    "balance", "balances", "coin", "coins", "point", "points",
-    "token", "tokens", "credit", "credits", "gem", "gems",
-    "amount", "total", "wallet", "cash", "money"
-)
-
-PRIORITY_BALANCE_PATHS = (
-    "api/user", "api/me", "api/profile", "api/account",
-    "api/v1/user", "api/v1/me", "api/v1/profile", "user", "me", "profile"
-)
-
-DANGEROUS_PATH_RE = re.compile(
-    r"deposit|withdraw|swap|stake|buy|sell|transfer|pay|purchase|"
-    r"wallet|connect|auth|login|sign-?in|session|revoke|logout|signout",
-    re.I
-)
-
-DANGER_CLICK_RE = re.compile(
-    r"wallet|c\u00fczdan|deposit|withdraw|ekle|cekim|\u00e7ekim|yat\u0131r|"
-    r"buy|sat\u0131n|sat|swap|stake|invest|premium|stars|usdt|"
-    r"pay|\u00f6deme|confirm|onayla|approve|sign|connect|login|giri\u015f|balance",
-    re.I
-)
-
-POPUP_SUCCESS_RE = re.compile(
-    r"success|successful|claimed|collected|received|added|completed|"
-    r"ba\u015far\u0131l\u0131|al\u0131nd\u0131|tamamland\u0131|kazand\u0131n",
-    re.I
-)
-
-POPUP_WAIT_RE = re.compile(
-    r"already|wait|cooldown|too early|not ready|later|come back|"
-    r"zaten|bekle|haz\u0131r de\u011fil|sonra|tekrar dene",
-    re.I
-)
-
-POPUP_ERROR_RE = re.compile(
-    r"error|failed|invalid|expired|denied|forbidden|"
-    r"hata|ba\u015far\u0131s\u0131z|ge\u00e7ersiz|s\u00fcre doldu",
-    re.I
-)
-
-API_PATH_RE = re.compile(
-    r"['\"`](/api/[A-Za-z0-9_\-/.]{2,100}|/v[0-9]+/[A-Za-z0-9_\-/.]{2,100}|"
-    r"/[A-Za-z0-9_\-/]{2,60}(?:claim|collect|harvest|check-?in|daily|reward|bonus)[A-Za-z0-9_\-/]*)['\"`]",
-    re.I
-)
-
-SCRIPT_URL_RE = re.compile(
-    r'(?:src=["\']|href=["\']|["\'])([^"\']*?\.js(?:\?[^"\']*)?)["\']',
-    re.I
-)
-
-DYNAMIC_IMPORT_RE = re.compile(
-    r'import\(\s*["\']([^"\']+)["\']\s*\)|import\(\s*`([^`]+)`\s*\)',
-    re.I
-)
-
-# V8'den alinan: MyAgeApp duyurusu exact match
-V8_KNOWN_ANNOUNCEMENT = re.compile(
-    r"^agetokenislive\?agetokenislive\?listing23novembercheckofficialchannelcompletenewtaskok$",
-    re.I
-)
+# ===== V8: exact MyAgeApp announcement only; single-run worker =====
+V8_TASKS={}
+V8_LOCK=None
 
 
-def v8_canonical_text(text: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+def v8_canonical(text):
+    return re.sub(r"[^a-z0-9]","",(text or "").lower())
 
 
-def v8_known_announcement(text: str) -> bool:
-    return bool(V8_KNOWN_ANNOUNCEMENT.match(v8_canonical_text(text)))
+def v8_known_announcement(text):
+    # User-transcribed notice only. No generic OK/continue acceptance.
+    text=v8_canonical(text)
+    return bool(re.fullmatch(r"agetokenislive(?:agetokenislive)?listing23novembercheckofficialchannelcompletenewtaskok",text))
 
 
-def extract_tg_init_data(url: str):
-    if "#" not in url:
-        return "", {}
-    frag = url.split("#", 1)[1]
-    params = _parse_qs(frag)
-    raw = params.get("tgWebAppData", [""])[0]
-    if not raw:
-        return "", {}
-    initData = _unquote(raw)
-    inner = _parse_qs(initData, keep_blank_values=True)
-    unsafe = {}
-    for k, v in inner.items():
-        if k in ("user", "receiver", "chat"):
-            try:
-                unsafe[k] = _json.loads(v[0])
-            except Exception:
-                unsafe[k] = v[0]
-        else:
-            unsafe[k] = v[0]
-    return initData, unsafe
-
-
-def classify_popup_text(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return "unknown"
-    if POPUP_SUCCESS_RE.search(t):
-        return "success"
-    if POPUP_WAIT_RE.search(t):
-        return "wait"
-    if POPUP_ERROR_RE.search(t):
-        return "error"
-    return "unknown"
-
-
-def extract_numeric_balances(obj, out=None, prefix=""):
-    if out is None:
-        out = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key = f"{prefix}.{k}" if prefix else str(k)
-            lk = k.lower()
-            if isinstance(v, (int, float)) and any(h in lk for h in BALANCE_HINTS):
-                out[key] = v
-            elif isinstance(v, (dict, list)):
-                extract_numeric_balances(v, out, key)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj[:20]):
-            extract_numeric_balances(v, out, f"{prefix}[{i}]")
-    return out
-
-
-async def universal_read_balance(ctx: dict):
-    bases = ctx.get("bases") or []
-    headers = ctx.get("hdr") or {}
-    found = {}
-    ordered = list(PRIORITY_BALANCE_PATHS) + [
-        p for p in DEFAULT_GET_PATHS if p not in PRIORITY_BALANCE_PATHS
-    ]
-    for path in ordered:
-        if DANGEROUS_PATH_RE.search(path):
-            continue
-        for base in bases:
-            url = base.rstrip("/") + "/" + path.lstrip("/")
-            st, data, txt = await http_call("GET", url, headers)
-            if st != 200:
-                continue
-            vals = extract_numeric_balances(data)
-            if vals:
-                found[path] = vals
-                break
-        if found:
-            break
-    return found
-
-
-def balance_diff(before: dict, after: dict):
-    diffs = {}
-    for k, after_val in after.items():
-        before_val = before.get(k)
-        if isinstance(before_val, (int, float)) and isinstance(after_val, (int, float)):
-            d = after_val - before_val
-            if d:
-                diffs[k] = d
-    return diffs
-
-
-async def deep_scan_claims(ctx: dict, webview_url: str):
-    extra = []
-    all_paths = []
-    base = webview_url.split("#")[0]
-    seen_urls = set()
-    queue = [(base, 0)]
-    scanned = 0
-
-    def add_path(p):
-        if not p or len(p) > 120:
-            return
-        if p in all_paths:
-            return
-        all_paths.append(p)
-        if DANGEROUS_PATH_RE.search(p):
-            return
-        if not re.search(r"claim|collect|harvest|check-?in|daily|reward|bonus", p, re.I):
-            return
-        if p not in extra:
-            extra.append(p)
-
-    while queue and scanned < 60 and len(extra) < 30:
-        u, depth = queue.pop(0)
-        if u in seen_urls:
-            continue
-        seen_urls.add(u)
-        txt = await fetch_text(u, 3000000)
-        if not txt:
-            continue
-        scanned += 1
-        for m in API_PATH_RE.finditer(txt):
-            add_path(m.group(1))
-        if depth < 3:
-            for m in DYNAMIC_IMPORT_RE.finditer(txt):
-                su = m.group(1) or m.group(2)
-                if not su or su.startswith("data:") or su.startswith("blob:"):
-                    continue
-                full = urljoin(u, su)
-                if full not in seen_urls:
-                    queue.append((full, depth + 1))
-            for sm in SCRIPT_URL_RE.finditer(txt):
-                su = sm.group(1)
-                if su.startswith("data:") or su.startswith("blob:"):
-                    continue
-                full = urljoin(u, su)
-                if full not in seen_urls:
-                    queue.append((full, depth + 1))
-    return extra[:30], scanned, all_paths[:40]
-
-
-async def get_browser():
-    global _PW, _BROWSER
-    if not PLAYWRIGHT_OK:
-        return None
-    if _BROWSER is None:
-        _PW = await async_playwright().start()
-        _BROWSER = await _PW.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-    return _BROWSER
-
-
-def parse_balance_from_text(text: str):
-    m = re.search(r"balance\s*[:=]?\s*([\d.,]+)", (text or "").lower())
-    if not m:
-        return None
-    raw = m.group(1).replace(",", "").replace(".", "") if "," in m.group(1) else m.group(1)
+async def v8_public(url):
+    import socket,ipaddress
+    p=urlparse(url)
+    if p.scheme!="https" or not p.hostname or p.username or p.password:
+        return False
     try:
-        return float(raw)
+        if p.port not in (None,443):
+            return False
+        rows=await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(p.hostname,443,type=socket.SOCK_STREAM),5)
+        return bool(rows) and all(ipaddress.ip_address(row[4][0]).is_global for row in rows)
     except Exception:
-        return None
+        return False
 
 
-async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar.
+async def v8_report(name,text):
+    await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
-    V28 logu: telegram-web-app.js mock'u uygulamanın kendi script'ini bozuyordu.
-    V29: mock KALDIRILDI; gerçek telegram-web-app.js yüklenir, initData URL'den okunur.
-    Route ile tma header enjeksiyonu + V8 role-based claim birleşiyor.
-    """
-    lines = []
-    browser = await get_browser()
-    if browser is None:
-        return ["Playwright kurulu değil; tarayıcı otomasyonu atlandı."]
 
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
-        ),
-        viewport={"width": 412, "height": 915},
-    )
-
-    initData, initDataUnsafe = extract_tg_init_data(url)
-    if initData:
-        app_host = _urlparse(url).netloc
-
-        # Route ile tma header enjeksiyonu (V26'dan)
-        async def add_auth_headers(route, request):
-            try:
-                u = request.url
-                if app_host in u:
-                    headers = dict(request.headers)
-                    headers["authorization"] = f"tma {initData}"
-                    headers["x-telegram-init-data"] = initData
-                    headers["x-init-data"] = initData
-                    await route.continue_(headers=headers)
-                    return
-            except Exception:
-                pass
-            await route.continue_()
-
+async def v8_browser(name,url,state):
+    from playwright.async_api import async_playwright,TimeoutError as PWTimeout
+    if not await v8_public(url):
+        return ["Adres guvenlik kontrolunden gecmedi."]
+    notes=[]
+    async with async_playwright() as p:
+        state["stage"]="chromium_baslatma"
+        browser=await p.chromium.launch(headless=True,timeout=60000,args=["--disable-dev-shm-usage"])
         try:
-            await context.route("**/*", add_auth_headers)
-            lines.append("Route ile tma header enjeksiyonu aktif.")
-        except Exception as e:
-            lines.append(f"Route header enjeksiyonu hatası: {type(e).__name__} {e}")
-    else:
-        lines.append("URL'de tgWebAppData bulunamadı; header enjeksiyonu atlandı.")
-
-    page = await context.new_page()
-
-    api_calls = []
-    captured = {}
-
-    def on_response(resp):
-        u = resp.url
-        if any(k in u for k in ("/api/", "/claim", "/checkin", "/reward", "/bonus")):
-            try:
-                captured[u] = {"status": resp.status, "text": ""}
-            except Exception:
-                pass
-
-    async def read_captured():
-        for u in list(captured.keys()):
-            try:
-                r = await page.request.get(u)
-                captured[u]["text"] = (await r.text())[:4000]
-            except Exception:
-                pass
-
-    page.on("response", on_response)
-
-    def on_request(req):
-        u = req.url
-        if any(k in u.lower() for k in ("api", "claim", "daily", "reward", "check", "collect", "bonus")):
-            api_calls.append(u)
-
-    page.on("request", on_request)
-
-    async def shot(caption):
-        try:
-            s = await page.screenshot(type="png")
-            if tg_client:
-                await tg_client.send_file(
-                    ADMIN_CHAT_ID,
-                    _io.BytesIO(s),
-                    caption=caption,
-                    force_document=False
-                )
-        except Exception as e:
-            lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__} {e}")
-
-    async def js_click_exact(target: str, max_wait: int = 5000):
-        try:
-            label = await page.evaluate(
-                """(target) => {
-                    const els = Array.from(document.querySelectorAll('button, a, [role=button], div, span'));
-                    for (const el of els) {
-                        const t = (el.innerText || el.textContent || '').trim();
-                        if (!t) continue;
-                        if (t.toLowerCase() === target.toLowerCase()) {
-                            el.click();
-                            return t;
-                        }
-                    }
-                    return null;
-                }""",
-                target,
-            )
-        except Exception:
-            return None
-        if label:
-            await page.wait_for_timeout(max_wait)
-        return label
-
-    async def js_click(pattern: str, max_wait: int = 4000):
-        try:
-            label = await page.evaluate(
-                """(pattern) => {
-                    const rx = new RegExp(pattern, 'i');
-                    const bad = /wallet|cüzdan|deposit|withdraw|ekle|çekim|yatır|buy|satın|sat|swap|stake|invest|premium|stars|usdt|pay|ödeme|confirm|onayla|approve|sign|connect|login|giriş|balance/i;
-                    const els = Array.from(document.querySelectorAll('button, a, [role=button], div, span'));
-                    for (const el of els) {
-                        const t = (el.innerText || el.textContent || '').trim();
-                        if (!t || t.length > 40) continue;
-                        if (!rx.test(t)) continue;
-                        if (bad.test(t)) continue;
-                        el.click();
-                        return t;
-                    }
-                    return null;
-                }""",
-                pattern,
-            )
-        except Exception:
-            return None
-        if label:
-            await page.wait_for_timeout(max_wait)
-        return label
-
-    async def dump_buttons():
-        try:
-            return await page.evaluate(
-                """() => {
-                    const els = Array.from(document.querySelectorAll('button, a, [role=button], div, span'));
-                    const out = [];
-                    for (const el of els) {
-                        const t = (el.innerText || el.textContent || '').trim();
-                        if (!t || t.length > 40) continue;
-                        if (out.includes(t)) continue;
-                        out.push(t);
-                        if (out.length >= 40) break;
-                    }
-                    return out;
-                }"""
-            )
-        except Exception:
-            return []
-
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(10000)
-
-        title = await page.title()
-        body_text = ""
-        try:
-            body_text = await page.inner_text("body")
-        except Exception:
-            pass
-
-        lines.append(f"Sayfa başlığı: {title[:80]}")
-        lines.append(
-            f"DOM: canvas={await page.locator('canvas').count()}, "
-            f"iframe={await page.locator('iframe').count()}, "
-            f"buton={await page.locator('button, [role=button], a').count()}"
-        )
-        lines.append("Ekran metni: " + (re.sub(r"\s+", " ", body_text)[:200] or "(boş)"))
-
-        await shot(f"{bot} - giriş ekranı")
-
-        balance_before = parse_balance_from_text(body_text)
-        if balance_before is not None:
-            lines.append(f"Ekrandan okunan bakiye: {balance_before}")
-
-        # Telegram env kontrolu
-        tg_check = await page.evaluate(
-            """() => {
-                const tg = window.Telegram && window.Telegram.WebApp;
-                return {
-                    hasTelegram: !!tg,
-                    hasInitData: !!(tg && tg.initData),
-                    initDataLen: tg && tg.initData ? tg.initData.length : 0
-                };
-            }"""
-        )
-        lines.append(
-            f"Telegram env: hasTelegram={tg_check.get('hasTelegram')}, "
-            f"hasInitData={tg_check.get('hasInitData')}, "
-            f"initDataLen={tg_check.get('initDataLen')}"
-        )
-
-        # V8'den alinan: MyAgeApp duyuru dialogu OK
-        if bot.lower() == "myageapp":
-            try:
-                dialogs = page.locator("role=dialog")
-                closed = False
-                for i in range(min(await dialogs.count(), 10)):
-                    dialog = dialogs.nth(i)
-                    if not await dialog.is_visible():
-                        continue
-                    text = await dialog.inner_text(timeout=5000)
-                    if not v8_known_announcement(text):
-                        continue
-                    ok = dialog.get_by_role("button", name=re.compile(r"^OK$", re.I))
-                    if await ok.count() != 1:
-                        lines.append("Duyuru dialogunda tek OK bulunamadı.")
-                        break
-                    await ok.click(trial=True, timeout=10000)
+            context=await browser.new_context(viewport={"width":390,"height":844},is_mobile=True,
+                has_touch=True,user_agent=DESKTOP_UA,accept_downloads=False)
+            cache={}
+            async def guard(route):
+                u=route.request.url
+                host=urlparse(u).netloc
+                try:
+                    if host not in cache:
+                        cache[host]=await v8_public(u)
+                    if cache[host] and urlparse(u).scheme=="https":
+                        await route.continue_()
+                    else:
+                        await route.abort()
+                except Exception:
                     try:
-                        await dialog.wait_for_state("hidden", timeout=10000)
+                        await route.abort()
                     except Exception:
                         pass
-                    closed = True
-                    lines.append("MyAgeApp duyurusu OK ile kapatıldı.")
-                    break
-                if not closed:
-                    lines.append("MyAgeApp duyurusu bulunamadı; claim kontrolüne geçiliyor.")
-            except Exception as e:
-                lines.append(f"Duyuru dialogu hatası: {type(e).__name__} {e}")
-
-        # Uygulamaya gir
-        entered = await js_click(r"^(open|start|play|launch|enter)$")
-        if not entered:
-            entered = await js_click(r"\b(open|start|play|launch|enter)\b")
-        if entered:
-            lines.append(f"Uygulamaya giriş butonu: {entered}")
+            await context.route("**/*",guard)
+            page=await context.new_page()
+            page.set_default_timeout(10000)
+            state["stage"]="sayfa_acilisi"
+            try:
+                response=await page.goto(url,wait_until="domcontentloaded",timeout=60000)
+                if response and response.status>=400:
+                    return [f"HTTP {response.status}; islem yapilmadi."]
+            except PWTimeout:
+                notes.append("Acilis suresi asildi; yuklenen ekran kontrol ediliyor.")
+            await page.locator("body").wait_for(state="attached",timeout=15000)
             await page.wait_for_timeout(5000)
-
-        # Earn/Tasks/Daily sekmeleri
-        for tab in ["earn", "tasks", "daily", "rewards", "check-in", "bonus"]:
-            res = await js_click(rf"\b{re.escape(tab)}\b")
-            if res:
-                lines.append(f"Sekme butonu: {res}")
+            notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
+            if name.lower()!="myageapp":
+                return notes+["Bu V8 duzeltmesi yalniz MyAgeApp duyurusu icindir. Baska uygulamada dugmeye basilmadi."]
+            state["stage"]="duyuru_tanima"
+            dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
+            closed=False
+            for i in range(min(await dialogs.count(),10)):
+                dialog=dialogs.nth(i)
+                if not await dialog.is_visible():
+                    continue
+                text=await dialog.inner_text(timeout=5000)
+                if not v8_known_announcement(text):
+                    continue
+                ok=dialog.get_by_role("button",name=re.compile(r"^\s*OK\s*$",re.I))
+                if await ok.count()!=1:
+                    return notes+["Taninmis duyuruda tek bir erisilebilir OK dugmesi bulunamadi; basilmadi."]
+                state["stage"]="duyuru_ok"
+                await ok.click(trial=True,timeout=10000)
+                # Recheck exact notice immediately before dismissal.
+                if not v8_known_announcement(await dialog.inner_text(timeout=3000)):
+                    return notes+["Duyuru metni degisti; OK basilmadi."]
+                await ok.click(timeout=10000,no_wait_after=True)
+                try:
+                    await dialog.wait_for(state="hidden",timeout=10000)
+                except PWTimeout:
+                    return notes+["OK tiklamasi tamamlandi ancak pencerenin kapandigi dogrulanamadi; claim denenmedi."]
+                closed=True
+                notes.append("Yazdigin $AGE duyurusu tanindi. Kendi OK dugmesi tiklandi ve pencere kapandi.")
                 break
+            if not closed:
+                visible=False
+                for i in range(min(await dialogs.count(),10)):
+                    if await dialogs.nth(i).is_visible():
+                        visible=True
+                        break
+                if visible:
+                    return notes+["Farkli veya metni birebir eslesmeyen pencere var; onaylanmadi, claim denenmedi."]
+                notes.append("Gorunur duyuru penceresi yok; claim kontrolune geciliyor.")
+            # Never act while another modal remains visible.
+            for i in range(min(await dialogs.count(),10)):
+                if await dialogs.nth(i).is_visible():
+                    return notes+["Baska bir pencere hala acik; claim denenmedi."]
+            state["stage"]="claim_bulma"
+            claim=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
+            if await claim.count()!=1:
+                return notes+["Tek bir claim dugmesi bulunamadi; rastgele secim yapilmadi."]
+            if not await claim.is_visible() or not await claim.is_enabled():
+                return notes+["Claim gorunur/etkin degil; tiklanmadi."]
+            nearby=await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)
+            risk=re.compile(r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satın|satin|ucret|ücret|[$€₺]",re.I)
+            if risk.search(nearby):
+                return notes+["Claim cevresinde ucret/cuzdan benzeri ifade var; tiklanmadi."]
+            state["stage"]="claim_hazirlik"
+            try:
+                await claim.scroll_into_view_if_needed(timeout=5000)
+                await claim.click(trial=True,timeout=12000)
+            except PWTimeout:
+                return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
+            if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
+                return notes+["Claim baglami degisti; tiklanmadi."]
+            state["stage"]="claim_tiklama"
+            try:
+                await claim.click(timeout=10000,no_wait_after=True)
+            except PWTimeout:
+                return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
+            await page.wait_for_timeout(3000)
+            notes.append("Claim tiklamasi tamamlandi. Odul miktari veya bakiye artisi dogrulanmadi; toplandi kabul edilmedi.")
+            notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
+            return notes
+        finally:
+            try:
+                await asyncio.wait_for(browser.close(),15)
+            except Exception:
+                pass
 
-        # /api/tasks veya benzeri cevabi yakala
-        await read_captured()
-        tasks_ok = False
-        for u, info in captured.items():
-            if "/api/" in u and info["status"] == 200:
-                ttxt = re.sub(r"\s+", " ", info["text"])[:800]
-                if '"error"' not in ttxt:
-                    tasks_ok = True
-                    lines.append(f"API OK: {u[:80]}")
-                    lines.append("API JSON özeti: " + ttxt)
 
-        # V8'den alinan: role-based claim butonu
-        claim_clicked = False
+async def v8_run(name,short="",start=""):
+    global V8_LOCK
+    if V8_LOCK is None:
+        V8_LOCK=asyncio.Lock()
+    state={"stage":"sirada"}
+    async def work():
+        state["stage"]="telegram_hedefi"
+        ent=await asyncio.wait_for(resolve_entity(name),30)
+        if not getattr(ent,"bot",False):
+            return ["Hedef bot degil."]
+        state["stage"]="telegram_kilidi"
+        if not await try_lock(TG_LOCK,30):
+            return ["Telegram sirasi bosalmadi."]
         try:
-            claim = page.get_by_role("button", name=re.compile(r"claim", re.I))
-            if await claim.count() == 1:
-                if await claim.is_visible() and await claim.is_enabled():
-                    nearby = await claim.evaluate(
-                        "e => (e.parentElement?.innerText || e.innerText || '').slice(0, 1000)"
-                    )
-                    risk = re.compile(
-                        r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|"
-                        r"stake|swap|premium|stars|usdt|c\u00fczdan|\u00f6deme|mesat\u0131n|sat\u0131n|"
-                        r"u\u00fcret|\u00fcret",
-                        re.I,
-                    )
-                    if not risk.search(nearby or ""):
-                        await claim.scroll_into_view_if_needed(timeout=5000)
-                        await claim.click(trial=True, timeout=12000)
-                        claim_clicked = True
-                        lines.append("Role-based claim butonu tıklandı.")
-                    else:
-                        lines.append("Claim çevresinde risk ifadesi var; tıklanmadı.")
-                else:
-                    lines.append("Claim butonu görünür/etkin değil.")
-            else:
-                lines.append(f"Role-based claim butonu sayısı: {await claim.count()}")
-        except Exception as e:
-            lines.append(f"Role-based claim hatası: {type(e).__name__} {e}")
-
-        # Role-based basarili olmazsa JS exact fallback
-        if not claim_clicked:
-            claim_exact = await js_click_exact("claim bonus")
-            if not claim_exact:
-                claim_exact = await js_click_exact("claim")
-            if claim_exact:
-                lines.append(f"Claim exact tıklandı: {claim_exact}")
-            else:
-                claim_btn = await js_click(
-                    r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
-                )
-                if claim_btn:
-                    lines.append(f"Claim butonu: {claim_btn}")
-                else:
-                    lines.append("Claim/Daily/Collect butonu bulunamadı.")
-
-        await page.wait_for_timeout(4000)
-        await shot(f"{bot} - işlem sonrası ekran")
-
-        await read_captured()
-        new_api = [u for u in captured if any(k in u for k in ("claim", "bonus", "reward", "checkin"))]
-        if new_api:
-            lines.append("Claim sonrası API: " + " | ".join(u[:80] for u in new_api[:5]))
-
-        body_after = ""
+            state["stage"]="start_gonderme"
+            await asyncio.wait_for(tg_client.send_message(ent,f"/start {start}".strip()),30)
+            await asyncio.sleep(INSPECT_WAIT)
+        finally:
+            TG_LOCK.release()
+        state["stage"]="mini_uygulama_kilidi"
+        if not await try_lock(APP_LOCK,30):
+            return ["Mini uygulama sirasi bosalmadi."]
         try:
-            body_after = await page.inner_text("body")
-        except Exception:
-            pass
-        balance_after = parse_balance_from_text(body_after)
-
-        if balance_before is not None and balance_after is not None:
-            if balance_after > balance_before:
-                lines.append(f"Bakiye arttı: {balance_before} -> {balance_after}")
-            elif balance_after == balance_before:
-                lines.append("Bakiye değişmedi.")
-            else:
-                lines.append(f"Bakiye azaldı: {balance_before} -> {balance_after}")
-        else:
-            lines.append("Bakiye ekran üzerinden doğrulanamadı.")
-
-        if api_calls:
-            uniq = list(dict.fromkeys(api_calls))[:6]
-            lines.append("Yakalanan API çağrıları: " + " | ".join(u[:80] for u in uniq))
-        else:
-            lines.append("Claim/daily API çağrısı yakalanmadı.")
-
-        popup = classify_popup_text(body_after[:500])
-        lines.append(f"Son ekran sınıfı: {popup}")
-
-    except Exception as e:
-        lines.append(f"Tarayıcı otomasyonu hatası: {type(e).__name__} {e}")
-    finally:
-        try:
-            await context.close()
-        except Exception:
-            pass
-
-    return lines
-
-
-async def universal_miniapp(bot: str):
-    if bot in MINIAPP_BUSY:
-        await send_admin(f"{bot} icin mini uygulama otomasyonu zaten calisiyor.")
-        return
-    MINIAPP_BUSY.add(bot)
-    try:
-        ent = await resolve_entity(bot)
-        if not getattr(ent, "bot", False):
-            await send_admin(f"{bot} bir bot değil; mini uygulama otomasyonu başlatmadım.")
-            return
-
-        await send_admin(
-            f"UNIVERSAL MINIAPP başladı: {bot}\n"
-            "1) Mini uygulama açılıyor\n"
-            "2) Claim/daily yolları taranıyor\n"
-            "3) Tarayıcı ile Open -> Earn/Tasks -> Claim akisi deneniyor\n"
-            "Cüzdan, ödeme, swap, stake ve tehlikeli işlemler otomatik yapılmayacak."
-        )
-
-        async with APP_LOCK:
-            url, how, pub = await get_webview_url(ent, bot)
-
+            state["stage"]="yetkili_adres_alma"
+            url,how,public=await asyncio.wait_for(get_webview_url(ent,name,short,start),90)
+        finally:
+            APP_LOCK.release()
         if not url:
-            await send_admin(
-                f"{bot} mini uygulaması açılamadı.\n{how}\n"
-                "Bot menüsünde 'Oyna / Play / Start' varsa önce onu elle aç; "
-                "sonra tekrar miniapp yaz."
-            )
-            return
-
-        ctx = await app_context(url)
-
-        lines = [
-            f"UNIVERSAL MINIAPP: {bot}",
-            f"Mini uygulama: {how}",
-        ]
-
-        if not ctx.get("ok"):
-            lines += [
-                "Uygulamaya otomatik giriş yapılamadı.",
-                "API taraması atlandı, tarayıcı deneniyor.",
-            ]
-        else:
-            before = await universal_read_balance(ctx)
-            if before:
-                first_path = next(iter(before))
-                lines.append(f"Claim öncesi bakiye alanı: {first_path}")
-            else:
-                lines.append("Claim öncesi bakiye alanı okunamadı.")
-
-            cands = claim_candidates(ctx)
-            if not cands:
-                deep, scanned, all_paths = await deep_scan_claims(ctx, url)
-                lines.append(f"Derin JS taraması: {scanned} dosya okundu, {len(deep)} claim adayı bulundu.")
-                if deep:
-                    cands = deep
-                elif all_paths:
-                    lines.append("Bulunan API yolları: " + ", ".join(all_paths[:10]))
-
-            if cands:
-                lines.append(f"Güvenli claim adayı: {len(cands)} yol bulundu.")
-                claim_lines, done = await claim_auto_run(bot, ctx, cands, True)
-                if claim_lines:
-                    lines += claim_lines
-            else:
-                lines.append("Kodda doğrudan güvenli claim/collect/daily yolu bulunamadı.")
-
-            after = await universal_read_balance(ctx)
-            diffs = balance_diff(before, after)
-            if diffs:
-                pretty = ", ".join(f"{k}: +{v}" for k, v in list(diffs.items())[:5])
-                lines.append(f"Claim sonrası bakiye değişimi doğrulandı: {pretty}")
-            elif before or after:
-                lines.append(
-                    "Claim sonrası bakiye değişimi doğrulanamadı; "
-                    "kasa sıfırlanmış olabilir ama toplam bakiye artışı kanıtlanamadı."
-                )
-            else:
-                lines.append("Bakiye alanları hiç okunamadı; claim sonucu doğrulanamadı.")
-
-        blines = await browser_auto(bot, url)
-        lines += blines
-
-        lines.append("Görev listesi taraması arka planda başladı; bitince özet gelecek.")
-        await send_admin("\n".join(lines))
-
-        spawn(run_autotasks(bot, [], 0, quiet=False))
-
-    except Exception as e:
-        await send_admin(f"{bot} universal miniapp hatası: {type(e).__name__} {e}")
-    finally:
-        MINIAPP_BUSY.discard(bot)
+            return ["Yetkili acilis adresi alinamadi."]
+        return await v8_browser(name,url,state)
+    async with V8_LOCK:
+        try:
+            notes=await asyncio.wait_for(work(),240)
+            await v8_report(name,"\n".join(notes))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            import traceback
+            stack=" > ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in traceback.extract_tb(e.__traceback__)[-6:])
+            print(f"[V8] stage={state['stage']} type={type(e).__name__} stack={stack}",flush=True)
+            await v8_report(name,f"Asama: {state['stage']}\nHata: {type(e).__name__}\nGizli bilgiler yazilmadi; odul basarisi dogrulanmadi.")
 
 
-def spawn_universal_miniapp(bot: str):
-    spawn(universal_miniapp(bot))
+async def auto_link(name: str,short: str="",start: str=""):
+    if name in V8_TASKS and not V8_TASKS[name].done():
+        await v8_report(name,"Zaten sirada veya calisiyor.")
+        return
+    await v8_report(name,"V8 is siraya alindi. Yalniz taninmis MyAgeApp duyurusu kapatilacak; claim uygun bulunursa bir kez denenecek. Otomatik tekrar yok. dur ile iptal edebilirsin.")
+    V8_TASKS[name]=spawn(v8_run(name,short,start))
+
+
+async def v8_stop():
+    global AUTO_STOP
+    AUTO_STOP=True
+    tasks=[t for t in V8_TASKS.values() if not t.done()]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks,return_exceptions=True)
+    await bot_app.bot.send_message(ADMIN_USER_ID,"V8 isleri durduruldu. Gonderilmis islemler geri alinamaz.")
+
+
+async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
+    user,msg=update.effective_user,update.effective_message
+    if not user or not msg:
+        return
+    if user.id!=ADMIN_USER_ID or update.effective_chat.type!="private":
+        await msg.reply_text("V8 yalnizca bot sahibinin ozel sohbetinde kullanilir.")
+        return
+    text=msg.text or msg.caption or ""
+    if text.strip().lower() in {"dur","durdur","kapat"}:
+        await v8_stop()
+        return
+    for e in list(msg.entities or [])+list(msg.caption_entities or []):
+        if getattr(e,"url",None):
+            text+=" "+e.url
+    for name,short,start in parse_link_targets(text):
+        await auto_link(name,short,start)
+
+
+async def cmd_incele(update: Update,context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id==ADMIN_USER_ID and update.effective_chat.type=="private":
+        for name,short,start in parse_link_targets(" ".join(context.args)):
+            await auto_link(name,short,start)
+
+
+async def cmd_dur(update: Update,context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id==ADMIN_USER_ID:
+        await v8_stop()
 
 
 @admin_only
-async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.effective_message.reply_text(
-            "Kullanım: miniapp botadi\n"
-            "Örnek: miniapp atomicappbot\n"
-            "Sistem mini uygulamayı açar, güvenli claim/daily yollarını dener, "
-            "gerekirse tarayıcı ile buton tıklaması yapar."
-        )
+async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("V8: MyAgeApp icin bilinen duyuru OK + tek claim denemesi. "
+        "Bot sahibinin ozel sohbetinden @MyAgeApp gonder. Otomatik tekrar/rutin/otopilot kapali. dur ile iptal et.")
+
+
+
+# V8.1: V8 tarayici ve claim akisi degistirilmeden miniapp komutu eklenir.
+async def cmd_miniapp_v81(update, context):
+    if (not update.effective_user or update.effective_user.id != ADMIN_USER_ID
+            or not update.effective_chat or update.effective_chat.type != "private"):
         return
-
-    name = parse_bot_arg(args[0])
-    if not name:
-        await update.effective_message.reply_text(
-            "Geçerli bot adı yaz. Örnek: miniapp atomicappbot"
-        )
+    if not context.args:
+        await update.effective_message.reply_text("Kullanim: /miniapp MyAgeApp veya miniapp MyAgeApp")
         return
-
-    if name in MINIAPP_BUSY:
-        await update.effective_message.reply_text(
-            f"{name} için otomasyon zaten çalışıyor. Bitmesini bekle."
-        )
+    targets = parse_link_targets(" ".join(context.args))
+    if len(targets) != 1:
+        await update.effective_message.reply_text("Tek bir mini uygulama adi veya Telegram linki gonder.")
         return
+    name, short, start = targets[0]
+    if name.lower() != "myageapp":
+        await update.effective_message.reply_text("Bu surum yalniz MyAgeApp'in V8 claim akisini destekler; baska uygulamada islem yapilmadi.")
+        return
+    await autolink(name, short, start)
 
-    await update.effective_message.reply_text(
-        f"{name} için genel mini uygulama otomasyonu başlatıldı.\n"
-        "Güvenli olmayan işlemler otomatik yapılmayacak."
-    )
-    spawn_universal_miniapp(name)
-
-
-async def miniapp_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.effective_message.text or "").strip()
-    parts = text.split()
-    context.args = parts[1:]
-    await cmd_miniapp(update, context)
-
+async def miniapp_text_v81(update, context):
+    context.args = (update.effective_message.text or "").strip().split()[1:]
+    await cmd_miniapp_v81(update, context)
 
 async def main():
     global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK, APP_LOCK
@@ -3984,6 +3517,8 @@ async def main():
     tg_client.add_event_handler(on_group_message, events.NewMessage(incoming=True))
 
     bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("miniapp", cmd_miniapp_v81))
+    bot_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"(?i)^\s*miniapp\b"), miniapp_text_v81))
     bot_app.add_handler(CommandHandler("start", cmd_start))
     bot_app.add_handler(CommandHandler("help", cmd_help))
     bot_app.add_handler(CommandHandler("yardim", cmd_help))
@@ -3996,7 +3531,6 @@ async def main():
     bot_app.add_handler(CommandHandler("oyun", cmd_oyun))
     bot_app.add_handler(CommandHandler("ref", cmd_ref))
     bot_app.add_handler(CommandHandler("topla", cmd_topla))
-    bot_app.add_handler(CommandHandler("miniapp", cmd_miniapp))
     bot_app.add_handler(CommandHandler("gorev", cmd_gorev))
     bot_app.add_handler(CommandHandler("dur", cmd_dur))
     bot_app.add_handler(CommandHandler("otopilot", cmd_otopilot))
@@ -4005,7 +3539,6 @@ async def main():
     bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
     bot_app.add_handler(CommandHandler("status", cmd_status))
     bot_app.add_handler(CallbackQueryHandler(on_callback))
-    bot_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*miniapp\b"), miniapp_text))
     bot_app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_text))
 
     await bot_app.initialize()
@@ -4013,9 +3546,9 @@ async def main():
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
     spawn(keepalive_loop())
-    spawn(routine_loop())
-    spawn(autopilot_loop())
-    spawn(claims_loop())
+    print("[V8] routine_loop bu surumde baslatilmadi",flush=True)
+    print("[V8] autopilot_loop bu surumde baslatilmadi",flush=True)
+    print("[V8] claims_loop bu surumde baslatilmadi",flush=True)
 
     try:
         await bot_app.bot.send_message(
