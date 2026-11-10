@@ -40,7 +40,8 @@ from telethon.tl.functions.channels import GetParticipantRequest, JoinChannelReq
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.utils import get_peer_id
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+                          MessageHandler, filters)
 
 # ===================== ENV =====================
 
@@ -172,6 +173,7 @@ LAST_INSPECT = 0.0
 http_session: Optional[aiohttp.ClientSession] = None
 tg_client: Optional[TelegramClient] = None
 bot_app: Optional[Application] = None
+APP_LOCK: Optional[asyncio.Lock] = None      # mini uygulama acma (sohbet islemlerinden bagimsiz)
 TG_LOCK: Optional[asyncio.Lock] = None       # Telegram hesabiyla yapilan islemler sirayla
 INSPECT_LOCK: Optional[asyncio.Lock] = None  # incelemeler sirayla + aralikli
 BG_TASKS: list = []
@@ -707,68 +709,84 @@ def summarize_msgs(msgs, bot: str) -> dict:
 
 
 async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] = None):
+    """Rapor gonderir; guvenli butonlari, gorevleri ve kanal katilimlarini onay istemeden baslatir."""
     info = summarize_msgs(msgs, bot)
+
     raw_text = "\n\n".join(info["texts"])
     labels = [l for l, _ in info["clicks"]] + info["webs"] + info["blocked"] + info["privs"]
-    combo = raw_text + "\nBUTONLAR: " + ", ".join(labels)
-    warn = [w for w in BAD_WORDS if w in combo.lower()]
-    guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
+    combo = raw_text + "\n" + "\n".join(labels)
 
-    lines = [f"{header}: @{bot}", ""]
-    ozet_yok = (not guide) or guide.startswith("(")
-    if ozet_yok:
-        if guide:
-            lines.append(guide)
-        lines.append(("Botun mesajı:\n" + raw_text[:700]) if raw_text else "(Bot metin göndermedi.)")
+    warn = [w for w in BADWORDS if w in combo.lower()]
+    guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) > 20 else ""
+
+    lines = [f"🔍 {header}: @{bot}"]
+
+    if not guide or guide.startswith("⚠"):
+        lines.append("Özet çıkarılamadı.")
     else:
         lines.append(guide)
-    lines.append(f"ℹ️ Bot {len(msgs)} mesaj gönderdi, mesajlarda {info['total']} buton gördüm.")
-    if info["total"] == 0:
-        lines.append("Not: Çoğu oyun botunun 'Oyna' tuşu mesajda değil, sohbetin altındaki menü tuşunda durur. "
-                     "Onu otomatik göremiyorum.")
+
+    lines.append(f"Bot {len(msgs)} mesaj gönderdi, {info['total']} buton gördüm.")
+
     if info["clicks"]:
-        lines += ["", "▶️ Basılabilir: " + ", ".join(l for l, _ in info["clicks"])]
+        lines.append("• Basılabilir butonlar: " + ", ".join(l for l, _ in info["clicks"]))
     if info["webs"]:
-        lines.append("📱 Mini uygulama (sen açarsın): " + ", ".join(info["webs"]))
+        lines.append("• Mini uygulama: " + ", ".join(info["webs"]))
     if info["linkbtns"]:
-        lines.append("🔗 Link butonları: " + " | ".join(f"{l} → {u}" for l, u in info["linkbtns"]))
-    if info["others"]:
-        lines.append("❔ Diğer butonlar: " + ", ".join(f"{l} ({t})" for l, t in info["others"]))
+        lines.append("• Link butonları: " + ", ".join(l for l, _ in info["linkbtns"]))
     if info["blocked"]:
-        lines.append("⛔ Ödeme/cüzdan butonları atlandı: " + ", ".join(info["blocked"]))
+        lines.append("• Cüzdan/ödeme butonları atlandı: " + ", ".join(info["blocked"]))
     if info["privs"]:
-        lines.append("🚫 Telefon/konum isteyen buton var: " + ", ".join(info["privs"]))
+        lines.append("• Telefon/konum isteyen buton var: " + ", ".join(info["privs"]))
     if warn:
-        lines += ["", "⚠️ Dikkat, şu ifadeler geçiyor: " + ", ".join(warn),
-                  "Güvenlik için otomatik işlem butonu koymadım."]
-
+        lines.append("⚠ Riskli ifade bulundu, otomatik işlem yapılmadı: " + ", ".join(warn))
     if bot in REFS:
-        lines += ["", f"🔗 Senin referans linkin: {REFS[bot]['link']}"]
+        lines.append(f"Senin referans linkin: {REFS[bot]['link']}")
 
-    rows = []
-    if not warn:
-        n_tasks, task_msg = 0, None
-        for m_ in msgs:
-            tk = parse_tasks(m_)
-            if tk:
-                n_tasks, task_msg = len(tk), m_
-        if n_tasks and task_msg is not None:
-            aid = new_action({"t": "autotasks", "bot": bot, "msg_id": task_msg.id, "cap": 0})
-            rows.append([InlineKeyboardButton(f"🤖 Görevleri otomatik yap ({n_tasks}+ görev, sayfaları gezer)", callback_data=f"a:{aid}")])
-        if routine_label:
-            aid = new_action({"t": "routine", "bot": bot, "label": routine_label})
-            rows.append([InlineKeyboardButton(f"🔁 Her gün otomatik: {routine_label[:22]}", callback_data=f"a:{aid}")])
-        for label, mid in info["clicks"][:8]:
-            aid = new_action({"t": "click", "bot": bot, "msg_id": mid, "label": label})
-            rows.append([InlineKeyboardButton(f"▶️ Bas: {label[:28]}", callback_data=f"a:{aid}")])
-        for tgt in info["chans"]:
-            aid = new_action({"t": "join", "target": tgt})
-            rows.append([InlineKeyboardButton(f"📢 Katıl: {tgt[:22]}", callback_data=f"a:{aid}")])
+    # Aynı bot için kısa süre içinde tekrar otomatik işlem başlatma (döngü koruması)
+    now = time.time()
+    if now - AUTO_REPORT_TIMES.get(bot, 0) < AUTO_REPORT_COOLDOWN:
+        await send_admin("\n".join(lines))
+        return
+    AUTO_REPORT_TIMES[bot] = now
+
+    # 1) Güvenli Telegram inline butonlarına otomatik bas
+    for label, mid in info["clicks"][:5]:
+        spawn(handle_action({
+            "t": "click",
+            "bot": bot,
+            "msg_id": mid,
+            "label": label,
+        }))
+
+    # 2) Kanal görevlerini otomatik yap
+    n_tasks, task_msg = 0, None
+    for m in msgs:
+        tk = parse_tasks(m)
+        if tk:
+            n_tasks, task_msg = len(tk), m
+            break
+
+    if n_tasks and task_msg is not None:
+        spawn(run_autotasks(bot, [], 0, msg_id=task_msg.id, quiet=False))
+
+    # 3) Kanal linklerine otomatik katıl
+    for tgt in info["chans"][:3]:
+        spawn(handle_action({
+            "t": "join",
+            "target": tgt,
+        }))
+
+    # 4) Referans linkini otomatik bul
     if not warn and bot not in REFS:
-        aid = new_action({"t": "findref", "bot": bot})
-        rows.append([InlineKeyboardButton("🔗 Referans linkimi bul", callback_data=f"a:{aid}")])
-    rows.append([InlineKeyboardButton("🤖 Botu aç", url=f"https://t.me/{bot}")])
-    await send_admin("\n".join(lines), InlineKeyboardMarkup(rows))
+        spawn(ref_finder(bot))
+
+    # 5) Mini uygulamada güvenli claim yollarını otomatik dene
+    if not warn:
+        spawn(claim_discover(bot, auto=True))
+
+    await send_admin("\n".join(lines))
+
 
 
 async def fetch_incoming(ent, after_id: int, limit: int = 8):
@@ -783,7 +801,7 @@ async def fetch_incoming(ent, after_id: int, limit: int = 8):
     return msgs
 
 
-async def inspect_bot(username: str):
+async def inspect_bot(username: str, start: str = ""):
     """Bota /start yazar, cevabini okur, rapor gonderir."""
     global LAST_INSPECT
     assert tg_client is not None
@@ -811,7 +829,7 @@ async def inspect_bot(username: str):
                 if not getattr(ent, "bot", False):
                     await send_admin(f"ℹ️ @{username} bir bot değil (kanal, grup ya da kişi). /start yazmadım.")
                     return
-                sent = await tg_client.send_message(ent, "/start")
+                sent = await tg_client.send_message(ent, ("/start " + start).strip())
                 LAST_INSPECT = time.time()
                 INSPECT_TIMES.append(LAST_INSPECT)
                 await asyncio.sleep(INSPECT_WAIT)
@@ -988,7 +1006,35 @@ async def fetch_text(url: str, limit: int = 3_000_000):
         return None
 
 
-async def get_webview_url(ent, username: str):
+async def try_lock(lock, timeout: float = 10) -> bool:
+    """Kilidi en cok 'timeout' sn bekleyerek almaya calisir (alinamazsa False)."""
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def friendly_err(e) -> str:
+    n = type(e).__name__
+    if "BotInvalid" in n:
+        return "bu botun (ana) mini uygulaması tanımlı değil"
+    if "AppInvalid" in n:
+        return "mini uygulama kısa adı geçersiz"
+    if "FloodWait" in n:
+        return f"Telegram bekletiyor ({int(getattr(e, 'seconds', 0) or 0)} sn)"
+    if "PeerIdInvalid" in n or "UsernameNotOccupied" in n or "UsernameInvalid" in n:
+        return "kullanıcı adı bulunamadı"
+    if "Blocked" in n:
+        return "bot engellenmiş"
+    return f"{n} {str(e)[:80]}"
+
+
+# Ana uygulamasi tanimli olmayan botlarda sik kullanilan mini uygulama kisa adlari (t.me/bot/<kisaad>)
+GUESS_SHORTS = ("app", "play", "game", "start", "main", "web", "webapp", "miniapp", "launch", "open", "home", "mine")
+
+
+async def get_webview_url(ent, username: str, short: str = "", start: str = "", _retry: bool = False):
     """Mini uygulamayi Telegram'in actigi gibi acar. (adres, aciklama, acik_siteler) doner.
     Adres kimlik verisi icerir: SADECE bellekte kalir, sohbete yazilmaz."""
     assert tg_client is not None
@@ -1023,6 +1069,8 @@ async def get_webview_url(ent, username: str):
                 if u and not re.match(r"https?://(?:t\.me|telegram\.me)/", u, re.I):
                     pub_urls.append(u)
     pub_urls = list(dict.fromkeys(pub_urls))
+    if short:
+        shorts.insert(0, short)
 
     # 1) t.me/bot/kisaad linki ile tanimli mini uygulama
     for sn in dict.fromkeys(shorts):
@@ -1034,10 +1082,11 @@ async def get_webview_url(ent, username: str):
                 app=InputBotAppShortName(bot_id=get_input_user(ent), short_name=sn),
                 platform="android",
                 write_allowed=True,
+                **({"start_param": start} if start else {}),
             ))
             return res.url, f"mini uygulama '{sn}' açıldı", pub_urls
         except Exception as e:
-            notes.append(f"'{sn}': {type(e).__name__} {e}")
+            notes.append(f"'{sn}': {friendly_err(e)}")
 
     # 2) mesajdaki mini uygulama (webview) butonu
     for u in dict.fromkeys(wv_urls):
@@ -1045,10 +1094,10 @@ async def get_webview_url(ent, username: str):
             res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", url=u))
             return res.url, "mesajdaki mini uygulama butonundan açıldı", pub_urls
         except Exception as e:
-            notes.append(f"webview butonu: {type(e).__name__} {e}")
+            notes.append(f"webview butonu: {friendly_err(e)}")
 
     # 3) botun ana mini uygulamasi
-    for sp in list(dict.fromkeys(main_params)) or [None]:
+    for sp in list(dict.fromkeys(([start] if start else []) + main_params)) or [None]:
         try:
             res = await tg_client(M.RequestMainWebViewRequest(
                 peer=ent, bot=ent, platform="android", start_param=sp))
@@ -1057,14 +1106,44 @@ async def get_webview_url(ent, username: str):
             notes.append("Telethon sürümü eski (ana mini uygulama desteği yok)")
             break
         except Exception as e:
-            notes.append(f"ana uygulama: {type(e).__name__} {e}")
+            notes.append(f"ana uygulama: {friendly_err(e)}")
 
     # 4) menu tusu
     try:
         res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", from_bot_menu=True))
         return res.url, "menü tuşundan açıldı", pub_urls
     except Exception as e:
-        notes.append(f"menü tuşu: {type(e).__name__} {e}")
+        notes.append(f"menü tuşu: {friendly_err(e)}")
+
+    # 5) yaygin kisa adlari dene (ana uygulama tanimli degilse t.me/bot/<kisaad> seklinde olabilir)
+    tried = set(shorts)
+    for sn in GUESS_SHORTS:
+        if sn in tried:
+            continue
+        try:
+            from telethon.tl.types import InputBotAppShortName
+            from telethon.utils import get_input_user
+            res = await tg_client(M.RequestAppWebViewRequest(
+                peer=ent,
+                app=InputBotAppShortName(bot_id=get_input_user(ent), short_name=sn),
+                platform="android",
+                write_allowed=True,
+                **({"start_param": start} if start else {}),
+            ))
+            return res.url, f"mini uygulama '{sn}' açıldı (kısa ad tahminle bulundu)", pub_urls
+        except Exception as e:
+            if "FloodWait" in type(e).__name__:
+                notes.append(friendly_err(e))
+                break
+
+    # 6) sohbet hic baslatilmamissa bota /start yazip mesajindaki mini uygulama butonuna bak
+    if not msgs and not _retry:
+        try:
+            await tg_client.send_message(ent, f"/start {start}".strip())
+            await asyncio.sleep(INSPECT_WAIT)
+            return await get_webview_url(ent, username, short, start, _retry=True)
+        except Exception as e:
+            notes.append(f"/start: {friendly_err(e)}")
 
     msg = "Açılamadı: " + " | ".join(notes)
     if seen_btns:
@@ -1133,7 +1212,7 @@ async def recon_game(target: str):
         if not getattr(ent, "bot", False):
             await send_admin(f"ℹ️ @{username} bir bot değil, mini uygulama araması yapmadım.")
             return
-        async with TG_LOCK:
+        async with APP_LOCK:
             url, how, pub = await get_webview_url(ent, username)
         lines = [f"🧪 OYUN KEŞFİ: @{username}", how]
         pages = []
@@ -2025,9 +2104,8 @@ async def app_context(webview_url: str) -> dict:
     return ctx
 
 
-async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
-    """Mini uygulamanin JS'inden referans kalibi arar, giris verisiyle API'yi (yalniz GET) yoklar."""
-    ctx = await app_context(webview_url)
+def analyze_ctx(ctx: dict) -> dict:
+    """Mini uygulama baglamindan (kod + API cevaplari) referans link/kod/kalip ve API ozetini cikarir."""
     res = {"links": [], "codes": [], "templates": [], "api": [], "notes": list(ctx["notes"]),
            "hosts": ctx["hosts"][:10], "paths": ctx["paths"][:25]}
 
@@ -2058,6 +2136,11 @@ async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
     return res
 
 
+async def probe_miniapp(bot: str, webview_url: str, how: str) -> dict:
+    """Mini uygulamanin JS'inden referans kalibi arar, giris verisiyle API'yi (yalniz GET) yoklar."""
+    return analyze_ctx(await app_context(webview_url))
+
+
 async def ref_finder(bot: str):
     """Referans linkini once bot sohbetinde, sonra mini uygulamanin API'sinde arar."""
     try:
@@ -2066,8 +2149,13 @@ async def ref_finder(bot: str):
             await send_admin(f"ℹ️ @{bot} bir bot değil, referans araması yapmadım.")
             return
         await send_admin(f"🔎 @{bot}: referans linki aranıyor (bot sohbeti + mini uygulama). 1-2 dakika sürebilir...")
-        async with TG_LOCK:
-            chat_links = await ref_from_chat(ent, bot)
+        chat_links = []
+        if await try_lock(TG_LOCK, 8):
+            try:
+                chat_links = await ref_from_chat(ent, bot)
+            finally:
+                TG_LOCK.release()
+        async with APP_LOCK:
             url, how, pub = await get_webview_url(ent, bot)
 
         found = [(l, "bot sohbeti") for l in chat_links]
@@ -2184,6 +2272,34 @@ async def claim_post(ctx: dict, path: str):
     return last
 
 
+async def claim_auto_run(bot: str, ctx: dict, cands: list, include_start: bool = False):
+    """Guvenli yollari onay istemeden dener; basarili / bekleme cevabi verenleri otomatik toplamaya alir.
+    (satirlar, denenen_yollar) doner. include_start: oturum/madencilik baslatma yollari da denensin."""
+    lines, done = [], set()
+    for p in sorted(cands, key=lambda x: not AUTO_SAFE_RE.search(x)):
+        is_claim = bool(AUTO_SAFE_RE.search(p))
+        if (not is_claim and not include_start) or len(done) >= 4:
+            continue
+        done.add(p)
+        base, st, data, txt = await claim_post(ctx, p)
+        ok = 200 <= st < 300
+        summ = summarize_resp(data, txt)
+        # "zaten alindi / sonra gel" gibi bekleme cevabi: yol dogru, sadece zamani gelmemis
+        cooldown = (not ok) and (st in (409, 425, 429) or (
+            st == 400 and WAIT_HINT_RE.search(summ + " " + (txt or ""))))
+        tag = "✅" if ok else ("⏳" if cooldown else "⚠️")
+        lines.append(f"{tag} POST {p} → {st} {summ}"
+                     + (" (şu an bekleme süresinde, yine de otomatiğe aldım)" if cooldown else ""))
+        if ok or cooldown:
+            CLAIMS[f"{bot}|{p}"] = {"bot": bot, "base": base, "path": p, "mode": ctx["mode"],
+                                    "auth": ctx["auth"], "every": CLAIM_EVERY_MIN if is_claim else CLAIM_EVERY_MIN * 3,
+                                    "last": time.time(), "on": True, "n_ok": 1 if ok else 0, "n_err": 0,
+                                    "cls": "ok" if ok else "wait", "when": time.time()}
+    if done:
+        await persist_claims()
+    return lines, done
+
+
 def summarize_resp(data, txt: str) -> str:
     """Cevabin kisa ozeti (oturum anahtari / gizli alanlar yazilmaz)."""
     if isinstance(data, dict):
@@ -2223,7 +2339,7 @@ async def claim_run(c: dict):
     """Kayitli bir toplama istegini taze giris verisiyle atar. (durum, ozet) doner."""
     bot = c["bot"]
     ent = await resolve_entity(bot)
-    async with TG_LOCK:
+    async with APP_LOCK:
         url, how, pub = await get_webview_url(ent, bot)
     if not url:
         return 0, "mini uygulama açılamadı"
@@ -2245,7 +2361,7 @@ async def claim_discover(bot: str, auto: bool = False):
         await send_admin(f"🔎 @{bot}: uygulamanın kendi kodundaki 'topla / oturum' yolları aranıyor "
                          + ("(güvenli 'claim/collect/daily' yollarını otomatik deneyeceğim)..." if auto
                             else "(hiçbirine istek atmıyorum)..."))
-        async with TG_LOCK:
+        async with APP_LOCK:
             url, how, pub = await get_webview_url(ent, bot)
         if not url:
             await send_admin(f"⚠️ @{bot}: mini uygulama açılamadı. {how[:300]}")
@@ -2272,24 +2388,7 @@ async def claim_discover(bot: str, auto: bool = False):
             return
         auto_lines, done = [], set()
         if auto and ctx["ok"]:
-            for p in [c for c in cands if AUTO_SAFE_RE.search(c)][:3]:
-                done.add(p)
-                base, st, data, txt = await claim_post(ctx, p)
-                ok = 200 <= st < 300
-                summ = summarize_resp(data, txt)
-                # "zaten alindi / sonra gel" gibi bekleme cevabi: yol dogru, sadece zamani gelmemis
-                cooldown = (not ok) and (st in (409, 425, 429) or (
-                    st == 400 and WAIT_HINT_RE.search(summ + " " + (txt or ""))))
-                tag = "✅" if ok else ("⏳" if cooldown else "⚠️")
-                auto_lines.append(f"{tag} POST {p} → {st} {summ}"
-                                  + (" (şu an bekleme süresinde, yine de otomatiğe aldım)" if cooldown else ""))
-                if ok or cooldown:
-                    CLAIMS[f"{bot}|{p}"] = {"bot": bot, "base": base, "path": p, "mode": ctx["mode"],
-                                            "auth": ctx["auth"], "every": CLAIM_EVERY_MIN, "last": time.time(),
-                                            "on": True, "n_ok": 1 if ok else 0, "n_err": 0,
-                                            "cls": "ok" if ok else "wait", "when": time.time()}
-            if done:
-                await persist_claims()
+            auto_lines, done = await claim_auto_run(bot, ctx, cands, False)
         remaining = [p for p in cands if p not in done]
         lines = []
         if auto and not ctx["ok"]:
@@ -2329,7 +2428,7 @@ async def claim_try(act: dict):
     bot, path = act["bot"], act["path"]
     try:
         ent = await resolve_entity(bot)
-        async with TG_LOCK:
+        async with APP_LOCK:
             url, how, pub = await get_webview_url(ent, bot)
         if not url:
             await send_admin(f"⚠️ @{bot}: mini uygulama açılamadı. {how[:200]}")
@@ -2402,6 +2501,117 @@ async def claims_loop():
         except Exception as e:
             print("[CLAIMS LOOP]", repr(e))
         await asyncio.sleep(60)
+
+
+# ===================== LINK AT, GERISINI BOT YAPSIN =====================
+# Admin bota (komut yazmadan) bir t.me linki / @kullaniciadi atar; bot sormadan: mini uygulamaya girer,
+# referans linkini bulup kaydeder, guvenli odul (claim/collect/daily) yollarini bulup otomatik toplamaya alir.
+
+APP_LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})(?:/([A-Za-z0-9_]+))?(?:\?([^\s#]*))?", re.I)
+SKIP_LINK_NAMES = {"joinchat", "addstickers", "addemoji", "addlist", "share", "proxy", "socks", "iv", "login",
+                   "boost", "setlanguage", "confirmphone", "invoice", "bg", "addtheme"}
+AUTO_LINK_BUSY: set = set()
+AUTO_REPORT_TIMES: dict = {}
+AUTO_REPORT_COOLDOWN: int = 120
+
+
+def parse_link_targets(text: str) -> list:
+    """Mesajdaki t.me linklerinden / @kullaniciadlarindan [(ad, kisa_ad, baslangic_parametresi)] cikarir."""
+    out = []
+    for m in APP_LINK_RE.finditer(text or ""):
+        name = m.group(1).lower()
+        if name in SKIP_LINK_NAMES:
+            continue
+        qs = parse_qs(m.group(3) or "")
+        start = (qs.get("startapp") or qs.get("start") or [""])[0]
+        out.append((name, m.group(2) or "", start))
+    if not out:
+        for tok in re.split(r"[\s,;]+", (text or "").strip()):
+            if re.fullmatch(r"@[A-Za-z0-9_]{4,32}", tok) or re.fullmatch(r"[A-Za-z0-9_]{2,}[Bb][Oo][Tt]", tok):
+                out.append((tok.lstrip("@").lower(), "", ""))
+    seen_n, uniq = set(), []
+    for t in out:
+        if t[0] not in seen_n:
+            seen_n.add(t[0])
+            uniq.append(t)
+    return uniq[:5]
+
+
+async def auto_link(name: str, short: str = "", start: str = ""):
+    """Link atilinca hic sormadan: start -> mini app -> rapor -> otomatik buton/gorev/claim."""
+    if name in AUTO_LINK_BUSY:
+        return
+
+    AUTO_LINK_BUSY.add(name)
+
+    try:
+        ent = await resolve_entity(name)
+
+        if not getattr(ent, "bot", False):
+            await send_admin(f"⚠️ @{name} bir bot değil; kanal/grup/kişi olabilir. Atladım.")
+            return
+
+        await send_admin(
+            f"🚀 @{name} için tam otomatik mod başladı.\n"
+            "Sıra: /start → mini uygulama → güvenli butonlar → görevler → referans → claim."
+        )
+
+        # 1) Mini uygulamayı bulmaya çalış
+        async with APP_LOCK:
+            url, how, pub = await get_webview_url(ent, name, short, start)
+
+        if url:
+            await send_admin(f"📱 Mini uygulama adresi alındı ({how}):\n{url}")
+        else:
+            await send_admin(
+                f"⚠️ Mini uygulama adresi alınamadı.\n{how}\n"
+                "Bot sohbetine /start yazıp butonları tarıyorum."
+            )
+
+        # 2) Bota /start yaz
+        async with TG_LOCK:
+            await tg_client.send_message(ent, "/start")
+        await asyncio.sleep(INSPECT_WAIT)
+
+        # 3) Botun cevaplarını oku ve otomatik işlemi başlat
+        msgs = await fetch_incoming(ent, 0, limit=10)
+        await send_report(name, msgs, "🤖 OTOMATİK İNCELEME")
+
+    except Exception as e:
+        await send_admin(f"⚠️ @{name} otomatik işlem hatası: {type(e).__name__}: {e}")
+
+    finally:
+        AUTO_LINK_BUSY.discard(name)
+
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Komut olmayan mesaj: link / @ad gelirse hic sormadan tam otomatik islem baslat."""
+    user = update.effective_user
+    msg = update.effective_message
+
+    if not user or not msg or user.id not in ADMIN_IDS:
+        return
+
+    text = msg.text or msg.caption or ""
+
+    for e in (msg.entities or msg.caption_entities or []):
+        u = getattr(e, "url", None)
+        if u:
+            text += "\n" + u
+
+    targets = parse_link_targets(text)
+    if not targets:
+        return
+
+    for name, short, start in targets:
+        await send_admin(
+            f"🔗 @{name} alındı.\n"
+            "Onay istemeden otomatik işlem başlatıyorum."
+        )
+        spawn(auto_link(name, short, start))
+
 
 
 # ===================== GUNLUK RUTIN =====================
@@ -2534,6 +2744,7 @@ async def on_group_message(event):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Airdrop / oyun bot radari\n\n"
+        "👉 Komut yazmana gerek yok: bir t.me linki ya da @kullaniciadi gönder, giriş + referans + ödül toplamayı sormadan kendisi yapar.\n\n"
         "Komutlar:\n"
         "/add -1001234567890  (grup ekle)\n"
         "/del -1001234567890\n"
@@ -2979,7 +3190,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 async def main():
-    global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK
+    global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK, APP_LOCK
 
     if not API_ID or not API_HASH or not STRING_SESSION:
         raise SystemExit("API_ID / API_HASH / STRING_SESSION zorunlu")
@@ -2989,6 +3200,7 @@ async def main():
         raise SystemExit("ADMIN_USER_ID / ADMIN_CHAT_ID zorunlu")
 
     TG_LOCK = asyncio.Lock()
+    APP_LOCK = asyncio.Lock()
     INSPECT_LOCK = asyncio.Lock()
 
     print("=" * 60)
@@ -3062,6 +3274,7 @@ async def main():
     bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
     bot_app.add_handler(CommandHandler("status", cmd_status))
     bot_app.add_handler(CallbackQueryHandler(on_callback))
+    bot_app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_text))
 
     await bot_app.initialize()
     await bot_app.start()
