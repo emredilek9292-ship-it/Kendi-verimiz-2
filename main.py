@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V14 - UNIVERSAL MINIAPP ENGINE + DEEP JS SCAN
+# V15 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v2
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3247,7 +3247,6 @@ POPUP_ERROR_RE = re.compile(
     re.I
 )
 
-# Daha genis API yolu yakalama
 API_PATH_RE = re.compile(
     r"['\"`](/api/[A-Za-z0-9_\-/.]{2,100}|/v[0-9]+/[A-Za-z0-9_\-/.]{2,100}|"
     r"/[A-Za-z0-9_\-/]{2,60}(?:claim|collect|harvest|check-?in|daily|reward|bonus)[A-Za-z0-9_\-/]*)['\"`]",
@@ -3334,11 +3333,7 @@ def balance_diff(before: dict, after: dict):
 
 
 async def deep_scan_claims(ctx: dict, webview_url: str):
-    """Inline script + JS chunk'larini derinlemesine tarar.
-
-    Donus: (claim_adaylari, taranan_dosya, tum_api_yollari)
-    """
-    claim_cands = []
+    extra = []
     all_paths = []
     base = webview_url.split("#")[0]
     seen_urls = set()
@@ -3355,10 +3350,10 @@ async def deep_scan_claims(ctx: dict, webview_url: str):
             return
         if not re.search(r"claim|collect|harvest|check-?in|daily|reward|bonus", p, re.I):
             return
-        if p not in claim_cands:
-            claim_cands.append(p)
+        if p not in extra:
+            extra.append(p)
 
-    while queue and scanned < 60 and len(claim_cands) < 30:
+    while queue and scanned < 60 and len(extra) < 30:
         u, depth = queue.pop(0)
         if u in seen_urls:
             continue
@@ -3368,11 +3363,9 @@ async def deep_scan_claims(ctx: dict, webview_url: str):
             continue
         scanned += 1
 
-        # 1) Statik string'ler
         for m in API_PATH_RE.finditer(txt):
             add_path(m.group(1))
 
-        # 2) Dinamik import / chunk
         if depth < 3:
             for m in DYNAMIC_IMPORT_RE.finditer(txt):
                 su = m.group(1) or m.group(2)
@@ -3382,7 +3375,6 @@ async def deep_scan_claims(ctx: dict, webview_url: str):
                 if full not in seen_urls:
                     queue.append((full, depth + 1))
 
-            # 3) script src / href
             for sm in SCRIPT_URL_RE.finditer(txt):
                 su = sm.group(1)
                 if su.startswith("data:") or su.startswith("blob:"):
@@ -3391,7 +3383,7 @@ async def deep_scan_claims(ctx: dict, webview_url: str):
                 if full not in seen_urls:
                     queue.append((full, depth + 1))
 
-    return claim_cands[:30], scanned, all_paths[:40]
+    return extra[:30], scanned, all_paths[:40]
 
 
 async def get_browser():
@@ -3407,8 +3399,20 @@ async def get_browser():
     return _BROWSER
 
 
+def parse_balance_from_text(text: str):
+    """'Balance 79,443' gibi degeri yakalar."""
+    m = re.search(r"balance\s*[:=]?\s*([\d.,]+)", (text or "").lower())
+    if not m:
+        return None
+    raw = m.group(1).replace(",", "").replace(".", "") if "," in m.group(1) else m.group(1)
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; DOM/canvas butonlarını dener."""
+    """Mini uygulamayı gerçek tarayıcıda açar; Open -> Claim akisini dener."""
     lines = []
     browser = await get_browser()
     if browser is None:
@@ -3423,6 +3427,14 @@ async def browser_auto(bot: str, url: str) -> list:
     )
     page = await context.new_page()
 
+    async def shot(caption):
+        try:
+            s = await page.screenshot(type="png")
+            if botapp and botapp.bot:
+                await botapp.bot.send_photo(ADMIN_CHATID, photo=s, caption=caption)
+        except Exception as e:
+            lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__}")
+
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(8000)
@@ -3434,101 +3446,88 @@ async def browser_auto(bot: str, url: str) -> list:
         except Exception:
             pass
 
-        canvas_count = await page.locator("canvas").count()
-        iframe_count = await page.locator("iframe").count()
-        button_count = await page.locator("button, [role=button], a").count()
-
         lines.append(f"Sayfa başlığı: {title[:80]}")
-        lines.append(f"DOM: canvas={canvas_count}, iframe={iframe_count}, buton={button_count}")
-        snippet = re.sub(r"\s+", " ", body_text)[:200]
-        lines.append(f"Ekran metni: {snippet or '(boş)'}")
+        lines.append(
+            f"DOM: canvas={await page.locator('canvas').count()}, "
+            f"iframe={await page.locator('iframe').count()}, "
+            f"buton={await page.locator('button, [role=button], a').count()}"
+        )
+        lines.append("Ekran metni: " + (re.sub(r"\s+", " ", body_text)[:200] or "(boş)"))
 
-        try:
-            shot = await page.screenshot(type="png")
-            if bot_app and bot_app.bot:
-                await bot_app.bot.send_photo(ADMIN_CHATID, photo=shot, caption=f"{bot} mini uygulama ekranı")
-        except Exception as e:
-            lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__}")
+        await shot(f"{bot} - giriş ekranı")
 
-        target_frame = page
-        if canvas_count == 0:
-            for fr in page.frames:
-                try:
-                    if await fr.locator("canvas").count():
-                        target_frame = fr
-                        lines.append(f"Canvas iframe içinde bulundu: {fr.url[:80]}")
-                        break
-                except Exception:
-                    continue
+        balance_before = parse_balance_from_text(body_text)
+        if balance_before is not None:
+            lines.append(f"Ekrandan okunan bakiye: {balance_before}")
 
-        before_text = body_text
         clicked = []
 
-        for attempt in range(2):
-            buttons = target_frame.locator("button, [role=button], a")
-            count = await buttons.count()
-            for i in range(min(count, 30)):
+        async def click_if_matches(pattern, max_clicks=3):
+            nonlocal clicked
+            loc = page.locator(
+                "button, [role=button], a, div[onclick], span[onclick]"
+            )
+            count = await loc.count()
+            for i in range(min(count, 60)):
                 try:
-                    label = (await buttons.nth(i).inner_text()).strip()
+                    el = loc.nth(i)
+                    label = (await el.inner_text()).strip()
                 except Exception:
                     continue
                 if not label:
                     continue
                 if DANGER_CLICK_RE.search(label):
                     continue
-                if not SAFE_CLICK_RE.search(label):
+                if not re.search(pattern, label, re.I):
                     continue
                 if label in clicked:
                     continue
                 try:
-                    await buttons.nth(i).click(timeout=5000)
+                    await el.click(timeout=5000)
                     clicked.append(label)
-                    await target_frame.wait_for_timeout(4000)
+                    await page.wait_for_timeout(4000)
+                    if len(clicked) >= max_clicks:
+                        return True
                 except Exception:
                     continue
-            if clicked:
-                break
+            return bool(clicked)
 
-        canvas_taps = 0
-        if not clicked:
-            canvas = target_frame.locator("canvas").first
-            if await canvas.count():
-                box = await canvas.bounding_box()
-                if box:
-                    cx = box["x"] + box["width"] / 2
-                    cy = box["y"] + box["height"] / 2
-                    taps = [
-                        (cx, cy),
-                        (cx, box["y"] + box["height"] * 0.8),
-                        (cx, box["y"] + box["height"] * 0.65),
-                    ]
-                    for (tx, ty) in taps:
-                        try:
-                            await page.mouse.click(tx, ty)
-                            canvas_taps += 1
-                            await page.wait_for_timeout(3000)
-                        except Exception:
-                            continue
+        # 1) Once Open/Start/Play ile uygulamaya gir
+        entered = await click_if_matches(r"^(open|start|play)$", 1)
+        if entered:
+            lines.append("Uygulamaya giriş butonuna basıldı.")
+            await page.wait_for_timeout(5000)
 
-        if clicked:
-            lines.append(f"Tarayıcıda tıklanan butonlar: {', '.join(clicked[:6])}")
-        elif canvas_taps:
-            lines.append(f"Tarayıcıda canvas dokunması yapıldı: {canvas_taps} kez.")
+        # 2) Claim/Daily/Collect ara
+        claimed = await click_if_matches(
+            r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck",
+            3
+        )
+        if claimed:
+            lines.append(f"Claim adayı butonlar: {', '.join(clicked[-3:])}")
         else:
-            lines.append("Tarayıcıda güvenli claim/daily butonu veya canvas bulunamadı.")
+            lines.append("Claim/Daily/Collect butonu bulunamadı.")
 
-        after_text = await page.inner_text("body") if await page.locator("body").count() else ""
+        await shot(f"{bot} - işlem sonrası ekran")
 
-        def nums(t):
-            return re.findall(r"\d[\d.,]*", t or "")
+        body_after = ""
+        try:
+            body_after = await page.inner_text("body")
+        except Exception:
+            pass
+        balance_after = parse_balance_from_text(body_after)
 
-        b_nums, a_nums = nums(before_text), nums(after_text)
-        if b_nums != a_nums:
-            lines.append("Tarayıcıda ekran değerleri değişti; claim olası.")
+        if balance_before is not None and balance_after is not None:
+            if balance_after > balance_before:
+                lines.append(f"Bakiye arttı: {balance_before} -> {balance_after}")
+            elif balance_after == balance_before:
+                lines.append("Bakiye değişmedi.")
+            else:
+                lines.append(f"Bakiye azaldı: {balance_before} -> {balance_after}")
         else:
-            lines.append("Tarayıcıda ekran değerlerinde değişiklik görülmedi.")
+            lines.append("Bakiye ekran üzerinden doğrulanamadı.")
 
-        popup = classify_popup_text(after_text[:500])
+        popup = classify_popup_text(body_after[:500])
         lines.append(f"Son ekran sınıfı: {popup}")
 
     except Exception as e:
@@ -3557,7 +3556,7 @@ async def universal_miniapp(bot: str):
             f"UNIVERSAL MINIAPP başladı: {bot}\n"
             "1) Mini uygulama açılıyor\n"
             "2) Claim/daily yolları taranıyor\n"
-            "3) Gerekirse tarayıcı ile buton/canvas tıklaması yapılacak\n"
+            "3) Tarayıcı ile Open -> Claim akisi deneniyor\n"
             "Cüzdan, ödeme, swap, stake ve tehlikeli işlemler otomatik yapılmayacak."
         )
 
@@ -3648,7 +3647,7 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kullanım: miniapp botadi\n"
             "Örnek: miniapp atomicappbot\n"
             "Sistem mini uygulamayı açar, güvenli claim/daily yollarını dener, "
-            "gerekirse tarayıcı ile buton/canvas tıklaması yapar."
+            "gerekirse tarayıcı ile buton tıklaması yapar."
         )
         return
 
