@@ -3184,8 +3184,9 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V12.1 - UNIVERSAL MINIAPP ENGINE
+# V12.2 - UNIVERSAL MINIAPP ENGINE
 # Her Telegram mini uygulama botu icin ortak otomasyon.
+# "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
 
 MINIAPP_BUSY = set()
@@ -3362,7 +3363,6 @@ async def universal_miniapp(bot: str):
         lines.append("Görev listesi taraması arka planda başladı; bitince özet gelecek.")
         await send_admin("\n".join(lines))
 
-        # Uzun suren gorev taramasi ana akisi bloklamasin
         spawn(run_autotasks(bot, [], 0, quiet=False))
 
     except Exception as e:
@@ -3405,6 +3405,14 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Güvenli olmayan işlemler otomatik yapılmayacak."
     )
     spawn_universal_miniapp(name)
+
+
+async def miniapp_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Slash'siz 'miniapp botadi' yazimini da yakalar."""
+    text = (update.effective_message.text or "").strip()
+    parts = text.split()
+    context.args = parts[1:]
+    await cmd_miniapp(update, context)
 
 
 async def main():
@@ -3493,6 +3501,7 @@ async def main():
     bot_app.add_handler(CommandHandler("rutin", cmd_rutin))
     bot_app.add_handler(CommandHandler("status", cmd_status))
     bot_app.add_handler(CallbackQueryHandler(on_callback))
+    bot_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*miniapp\b"), miniapp_text))
     bot_app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_text))
 
     await bot_app.initialize()
