@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V22 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v9
+# V23 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v10
 # MyAgeApp gibi DOM tabanli mini uygulamalar icin saglam otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3410,7 +3410,7 @@ def parse_balance_from_text(text: str):
 async def browser_auto(bot: str, url: str) -> list:
     """Mini uygulamayı gerçek tarayıcıda açar; JS ile güvenli butonları tıklar.
 
-    /api/tasks cevabi otomatik yakalanir; EARN AGE sonrasi butun buton metinleri raporlanir.
+    "Claim bonus" exact-match ile tiklanir; /api/tasks cevabi yakalanir.
     """
     lines = []
     browser = await get_browser()
@@ -3431,14 +3431,13 @@ async def browser_auto(bot: str, url: str) -> list:
 
     def on_response(resp):
         u = resp.url
-        if any(k in u for k in ("/api/tasks", "/api/session")):
+        if any(k in u for k in ("/api/tasks", "/api/session", "/api/claim", "/api/bonus", "/api/reward")):
             try:
                 captured[u] = {"status": resp.status, "text": ""}
             except Exception:
                 pass
 
     async def read_captured():
-        # response body'yi async olarak okuyabilmek icin ayri fonksiyon
         for u in list(captured.keys()):
             try:
                 r = await page.request.get(u)
@@ -3450,7 +3449,7 @@ async def browser_auto(bot: str, url: str) -> list:
 
     def on_request(req):
         u = req.url
-        if any(k in u.lower() for k in ("api", "claim", "daily", "reward", "check", "collect")):
+        if any(k in u.lower() for k in ("api", "claim", "daily", "reward", "check", "collect", "bonus")):
             api_calls.append(u)
 
     page.on("request", on_request)
@@ -3467,6 +3466,30 @@ async def browser_auto(bot: str, url: str) -> list:
                 )
         except Exception as e:
             lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__} {e}")
+
+    async def js_click_exact(target: str, max_wait: int = 5000):
+        """Exact-match ile guvenli elementi JS ile tiklar."""
+        try:
+            label = await page.evaluate(
+                """(target) => {
+                    const els = Array.from(document.querySelectorAll('button, a, [role=button], div, span'));
+                    for (const el of els) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (!t) continue;
+                        if (t.toLowerCase() === target.toLowerCase()) {
+                            el.click();
+                            return t;
+                        }
+                    }
+                    return null;
+                }""",
+                target,
+            )
+        except Exception:
+            return None
+        if label:
+            await page.wait_for_timeout(max_wait)
+        return label
 
     async def js_click(pattern: str, max_wait: int = 4000):
         """Sayfadaki metne gore ilk guvenli elementi JS ile tiklar."""
@@ -3560,20 +3583,28 @@ async def browser_auto(bot: str, url: str) -> list:
                 lines.append(f"/api/tasks durumu: {info['status']}")
                 lines.append("Tasks JSON özeti: " + re.sub(r"\s+", " ", info["text"])[:800])
 
-        # 4) EARN AGE sonrasi butun tiklanabilir metinler
-        labels = await dump_buttons()
-        if labels:
-            lines.append("Görünür buton metinleri: " + " | ".join(labels[:25]))
+        # 4) Claim bonus exact-match
+        claim_exact = await js_click_exact("claim bonus")
+        if claim_exact:
+            lines.append(f"Claim bonus exact tıklandı: {claim_exact}")
+        else:
+            # 5) Genel claim desenleri
+            claim_btn = await js_click(
+                r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
+            )
+            if claim_btn:
+                lines.append(f"Claim butonu: {claim_btn}")
+            else:
+                lines.append("Claim/Daily/Collect butonu bulunamadı.")
 
-        # 5) Gorev butonlari (Start/Check/Go/Open)
-        for pat in [r"\b(start|check|go|open)\b", r"\b(claim|collect|reward|bonus|daily|check[- ]?in)\b"]:
-            res = await js_click(pat)
-            if res:
-                lines.append(f"Tıklanan buton: {res}")
-                await page.wait_for_timeout(3000)
-
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(4000)
         await shot(f"{bot} - işlem sonrası ekran")
+
+        # 6) Claim sonrasi yeni API cagrilarini yakala
+        await read_captured()
+        new_api = [u for u in captured if any(k in u for k in ("claim", "bonus", "reward"))]
+        if new_api:
+            lines.append("Claim sonrası API: " + " | ".join(u[:80] for u in new_api[:5]))
 
         body_after = ""
         try:
