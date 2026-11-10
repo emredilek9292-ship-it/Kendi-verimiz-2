@@ -3237,19 +3237,42 @@ async def v85_read_timer(page):
             best=total
     return best
 
-async def v85_wait_for_next(page,max_wait=900):
-    # En kisa geri sayimi bekler; cok uzunsa 15 dk sonra yeniden kontrol eder.
-    waited=0
-    while waited<max_wait:
-        t=await v85_read_timer(page)
-        if t is None:
+async def v84_snapshot(page):
+    # Görünür, kısa ve sayı içeren metinleri sırayla toplar.
+    # Zamanlayıcılar hariç tutulur; kasa ve bakiye alanları karışmasın.
+    try:
+        rows=await page.evaluate("""() => Array.from(document.querySelectorAll('body *'))
+          .filter(e => e.children.length === 0 && e.getClientRects().length && !['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(e.tagName))
+          .map(e => (e.innerText || '').trim())
+          .filter(t => /[0-9]/.test(t) && t.length <= 100 && !/\\b\\d+[d]\\s+\\d{1,2}:\\d{2}:\\d{2}\\b/.test(t) && !/^\\d{1,2}:\\d{2}:\\d{2}$/.test(t))
+          .map(t => t.replace(/\\b[0-9]{6,}\\b/g,'[uzun sayi gizlendi]'))
+          .slice(0,40)""")
+        return rows
+    except Exception:
+        return []
+
+async def v84_verify(before,after):
+    # MyAgeApp'te gözlemlenen eşleşme: kasa Alan 14, bakiye Alan 1.
+    # Başarı ancak kasa 0'a iner ve bakiye artarsa kabul edilir.
+    def get(rows,i):
+        return rows[i-1] if 0 <= i-1 < len(rows) else None
+    def num(s):
+        try:
+            return float((s or '').replace(',','').strip())
+        except Exception:
             return None
-        if t<=0:
-            return 0
-        step=min(t,max_wait-waited,300)
-        await page.wait_for_timeout(step*1000)
-        waited+=step
-    return None
+    kasa_b=num(get(before,14)); kasa_a=num(get(after,14))
+    bak_b=num(get(before,1)); bak_a=num(get(after,1))
+    notes=[]
+    if kasa_b is None or kasa_a is None or bak_b is None or bak_a is None:
+        notes.append("Kasa/bakiye alanlari okunamadi; otomatik toplama dogrulanamadi.")
+        return notes
+    notes.append(f"Kasa: {kasa_b:g} -> {kasa_a:g}; bakiye: {bak_b:g} -> {bak_a:g}.")
+    if kasa_b>0 and kasa_a==0 and bak_a>bak_b:
+        notes.append("Kasa sifirlandi ve bakiye artti; toplama dogrulandi.")
+    else:
+        notes.append("Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.")
+    return notes
 
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
@@ -3360,7 +3383,6 @@ async def v8_browser(name,url,state):
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after=await v84_snapshot(page)
             notes.extend(await v84_verify(before,after))
-            # Otomatik tekrar icin geri sayimi oku; yalnizca ayni claim butonu hala uygunsa tekrar dene.
             timer=await v85_read_timer(page)
             if timer is not None:
                 notes.append(f"Sonraki uygun zaman icin geri sayim: {timer} saniye.")
