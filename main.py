@@ -3184,12 +3184,13 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V20 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v7
-# Her Telegram mini uygulama botu icin ortak otomasyon.
+# V21 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v8
+# MyAgeApp gibi DOM tabanli mini uygulamalar icin saglam otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
 
 import io as _io
+import json as _json
 
 try:
     from playwright.async_api import async_playwright
@@ -3221,13 +3222,7 @@ DANGEROUS_PATH_RE = re.compile(
 DANGER_CLICK_RE = re.compile(
     r"wallet|c\u00fczdan|deposit|withdraw|ekle|cekim|\u00e7ekim|yat\u0131r|"
     r"buy|sat\u0131n|sat|swap|stake|invest|premium|stars|usdt|"
-    r"pay|\u00f6deme|confirm|onayla|approve|sign|connect|login|giri\u015f",
-    re.I
-)
-
-SAFE_CLICK_RE = re.compile(
-    r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|"
-    r"al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck|open|start|play|get|tap|earn|task",
+    r"pay|\u00f6deme|confirm|onayla|approve|sign|connect|login|giri\u015f|balance",
     re.I
 )
 
@@ -3459,11 +3454,11 @@ async def browser_auto(bot: str, url: str) -> list:
             label = await page.evaluate(
                 """(pattern) => {
                     const rx = new RegExp(pattern, 'i');
-                    const bad = /wallet|cüzdan|deposit|withdraw|ekle|çekim|yatır|buy|satın|sat|swap|stake|invest|premium|stars|usdt|pay|ödeme|confirm|onayla|approve|sign|connect|login|giriş/i;
+                    const bad = /wallet|cüzdan|deposit|withdraw|ekle|çekim|yatır|buy|satın|sat|swap|stake|invest|premium|stars|usdt|pay|ödeme|confirm|onayla|approve|sign|connect|login|giriş|balance/i;
                     const els = Array.from(document.querySelectorAll('button, a, [role=button], div, span'));
                     for (const el of els) {
                         const t = (el.innerText || el.textContent || '').trim();
-                        if (!t || t.length > 60) continue;
+                        if (!t || t.length > 40) continue;
                         if (!rx.test(t)) continue;
                         if (bad.test(t)) continue;
                         el.click();
@@ -3473,11 +3468,24 @@ async def browser_auto(bot: str, url: str) -> list:
                 }""",
                 pattern,
             )
-        except Exception as e:
+        except Exception:
             return None
         if label:
             await page.wait_for_timeout(max_wait)
         return label
+
+    async def page_fetch(path: str):
+        try:
+            return await page.evaluate(
+                """async (p) => {
+                    const r = await fetch(p, {credentials: 'include'});
+                    const t = await r.text();
+                    return {status: r.status, text: t.slice(0, 4000)};
+                }""",
+                path,
+            )
+        except Exception as e:
+            return {"status": 0, "text": f"{type(e).__name__} {e}"}
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -3507,21 +3515,27 @@ async def browser_auto(bot: str, url: str) -> list:
         # 1) Uygulamaya gir
         entered = await js_click(r"^(open|start|play|launch|enter)$")
         if not entered:
-            entered = await js_click(r"open|start|play|launch|enter")
+            entered = await js_click(r"\b(open|start|play|launch|enter)\b")
         if entered:
             lines.append(f"Uygulamaya giriş butonu: {entered}")
             await page.wait_for_timeout(5000)
 
         # 2) Earn/Tasks/Daily sekmeleri
         for tab in ["earn", "tasks", "daily", "rewards", "check-in", "bonus"]:
-            res = await js_click(re.escape(tab))
+            res = await js_click(rf"\b{re.escape(tab)}\b")
             if res:
                 lines.append(f"Sekme butonu: {res}")
                 break
 
-        # 3) Claim/Collect/Reward
+        # 3) /api/tasks icerigini sayfa icinden oku
+        tasks = await page_fetch("/api/tasks")
+        lines.append(f"/api/tasks durumu: {tasks.get('status')}")
+        ttxt = tasks.get("text") or ""
+        lines.append("Tasks JSON özeti: " + re.sub(r"\s+", " ", ttxt)[:600])
+
+        # 4) Claim/Collect/Reward butonu (Balance hariç)
         claim_btn = await js_click(
-            r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck"
+            r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
         )
         if claim_btn:
             lines.append(f"Claim butonu: {claim_btn}")
