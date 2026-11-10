@@ -3254,6 +3254,46 @@ async def v810_screen(page):
     except Exception:
         return ''
 
+def v813_verify(before,after):
+    # Kullanici gozlemi: kasa 2 ve Done; bakiye Satir 7.
+    # Basari yalnizca kasa 2 -> 0 ve bakiye artarsa kabul edilir.
+    def line(text,i):
+        try:
+            return (text or '').splitlines()[i-1].strip()
+        except Exception:
+            return ''
+    def amount(s):
+        try:
+            return float(s.replace(',',''))
+        except Exception:
+            return None
+    b=amount(line(before,7))
+    a=amount(line(after,7))
+    notes=[]
+    if b is None or a is None:
+        notes.append('Bakiye satiri (Satir 7) okunamadi; bakiye kontrolu yapilmadi.')
+        return notes
+    if a>b:
+        notes.append(f'Bakiye artti: {b:g} -> {a:g}.')
+    elif a==b:
+        notes.append(f'Bakiye degismedi: {b:g} -> {a:g}.')
+    else:
+        notes.append(f'Bakiye azaldi: {b:g} -> {a:g}.')
+    # Kasa kontrolu: kullanici gozlemine gore kasa 2 ve Done.
+    if '2' in before and 'Done' in before:
+        notes.append('Kasa oncesi 2 ve Done goruldu.')
+    else:
+        notes.append('Kasa oncesi 2 ve Done bulunamadi; kasa eslesmesi dogrulanmadi.')
+    if '0' in after and 'Done' not in after:
+        notes.append('Kasa sonrasi 0 goruldu; kasa sifirlandi.')
+    else:
+        notes.append('Kasa sonrasi 0 bulunamadi; kasa sifirlanmadi.')
+    if b is not None and a is not None and a>b and '2' in before and 'Done' in before and '0' in after and 'Done' not in after:
+        notes.append('Kasa 2 -> 0 ve bakiye artti; toplama dogrulandi.')
+    else:
+        notes.append('Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.')
+    return notes
+
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
     if not await v8_public(url):
@@ -3363,18 +3403,8 @@ async def v8_browser(name,url,state):
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
             notes.extend(v810_report(before_text,after_text))
-            # Kasa eslesmesini kullanici onayina bagla; otomatik tahmin yapma.
-            try:
-                shot=await page.screenshot(type="png")
-                await bot_app.bot.send_photo(
-                    chat_id=ADMIN_USER_ID,
-                    photo=shot,
-                    caption="MyAgeApp: Claim sonrasi ekran goruntusu. Kasa satirini belirlemek icin bu goruntuyu incele."
-                )
-                notes.append("Claim sonrasi ekran goruntusu Telegram'a gonderildi.")
-            except Exception as e:
-                notes.append(f"Ekran goruntusu gonderilemedi: {type(e).__name__}.")
-            notes.append("Kasa eslesmesi henuz yapilmadi; otomatik tahmin yapilmadi.")
+            notes.extend(v813_verify(before_text,after_text))
+            notes.append("Kasa eslesmesi kullanici gozlemine dayali: kasa 2 ve Done; bakiye Satir 7.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
