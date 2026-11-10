@@ -3217,27 +3217,7 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-async def v85_read_timer(page):
-    # Claim sonrasi gorunen geri sayimlari okur; en kisa sureyi dondurur.
-    try:
-        rows=await page.evaluate("""() => Array.from(document.querySelectorAll('body *'))
-          .filter(e => e.children.length === 0 && e.getClientRects().length && !['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(e.tagName))
-          .map(e => (e.innerText || '').trim())
-          .filter(t => /^(?:(\\d+)d\\s+)?(\\d{1,2}):(\\d{2}):(\\d{2})$/.test(t))
-          .slice(0,20)""")
-    except Exception:
-        rows=[]
-    best=None
-    for t in rows:
-        m=re.fullmatch(r"(?:(\\d+)d\\s+)?(\\d{1,2}):(\\d{2}):(\\d{2})",t)
-        if not m: continue
-        d=int(m.group(1) or 0); h=int(m.group(2)); mi=int(m.group(3)); s=int(m.group(4))
-        total=d*86400+h*3600+mi*60+s
-        if best is None or total<best:
-            best=total
-    return best
-
-async def v84_snapshot(page):
+async def v87_snapshot(page):
     # Görünür, kısa ve sayı içeren metinleri sırayla toplar.
     # Zamanlayıcılar hariç tutulur; kasa ve bakiye alanları karışmasın.
     try:
@@ -3251,24 +3231,56 @@ async def v84_snapshot(page):
     except Exception:
         return []
 
-async def v84_verify(before,after):
-    # MyAgeApp'te gözlemlenen eşleşme: kasa Alan 14, bakiye Alan 1.
-    # Başarı ancak kasa 0'a iner ve bakiye artarsa kabul edilir.
-    def get(rows,i):
-        return rows[i-1] if 0 <= i-1 < len(rows) else None
-    def num(s):
-        try:
-            return float((s or '').replace(',','').strip())
-        except Exception:
-            return None
-    kasa_b=num(get(before,14)); kasa_a=num(get(after,14))
-    bak_b=num(get(before,1)); bak_a=num(get(after,1))
+def v87_num(s):
+    try:
+        return float((s or '').replace(',','').strip())
+    except Exception:
+        return None
+
+async def v87_verify(before,after):
+    # Önceki canlı log: kasa 2 -> 0, bakiye 80,544 -> 80,546.
+    # Bu deseni esnek biçimde arar; sabit index varsaymaz.
+    def find_zero_to_nonzero(rows):
+        # Kasa: once 0'dan buyuk, sonra 0 olan deger.
+        for i in range(len(rows)):
+            x=v87_num(rows[i])
+            if x is not None and x>0:
+                return x
+        return None
+    def find_zero(rows):
+        for x in rows:
+            n=v87_num(x)
+            if n is not None and n==0:
+                return n
+        return None
+    def find_increase(rows_before,rows_after):
+        # Bakiye: onceki degerden buyuk olan ilk deger.
+        base=None
+        for x in rows_before:
+            n=v87_num(x)
+            if n is not None:
+                base=n
+                break
+        if base is None:
+            return None,None
+        for x in rows_after:
+            n=v87_num(x)
+            if n is not None and n>base:
+                return base,n
+        return base,None
+    kasa_b=find_zero_to_nonzero(before)
+    kasa_a=find_zero(after)
+    bak_b,bak_a=find_increase(before,after)
     notes=[]
-    if kasa_b is None or kasa_a is None or bak_b is None or bak_a is None:
-        notes.append("Kasa/bakiye alanlari okunamadi; otomatik toplama dogrulanamadi.")
-        return notes
-    notes.append(f"Kasa: {kasa_b:g} -> {kasa_a:g}; bakiye: {bak_b:g} -> {bak_a:g}.")
-    if kasa_b>0 and kasa_a==0 and bak_a>bak_b:
+    if kasa_b is None or kasa_a is None:
+        notes.append("Kasa sifirlanmasi ekranda dogrulanamadi.")
+    else:
+        notes.append(f"Kasa: {kasa_b:g} -> {kasa_a:g}.")
+    if bak_b is None or bak_a is None:
+        notes.append("Bakiye artisi ekranda dogrulanamadi.")
+    else:
+        notes.append(f"Bakiye: {bak_b:g} -> {bak_a:g}.")
+    if kasa_b is not None and kasa_a is not None and kasa_b>0 and kasa_a==0 and bak_a is not None and bak_b is not None and bak_a>bak_b:
         notes.append("Kasa sifirlandi ve bakiye artti; toplama dogrulandi.")
     else:
         notes.append("Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.")
@@ -3373,7 +3385,7 @@ async def v8_browser(name,url,state):
                 return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
             if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
                 return notes+["Claim baglami degisti; tiklanmadi."]
-            before=await v84_snapshot(page)
+            before=await v87_snapshot(page)
             state["stage"]="claim_tiklama"
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
@@ -3381,29 +3393,8 @@ async def v8_browser(name,url,state):
                 return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
-            after=await v84_snapshot(page)
-            notes.extend(await v84_verify(before,after))
-            timer=await v85_read_timer(page)
-            if timer is not None:
-                notes.append(f"Sonraki uygun zaman icin geri sayim: {timer} saniye.")
-                if timer<=600:
-                    notes.append("Geri sayim kisa; ayni oturumda bir kez daha kontrol edilecek.")
-                    await page.wait_for_timeout(min(timer+5,600)*1000)
-                    claim2=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
-                    if await claim2.count()==1 and await claim2.is_visible() and await claim2.is_enabled():
-                        before2=await v84_snapshot(page)
-                        try:
-                            await claim2.click(timeout=10000,no_wait_after=True)
-                        except PWTimeout:
-                            notes.append("Ikinci deneme icin Claim hala tiklanabilir degildi; zorlanmadi.")
-                        else:
-                            await page.wait_for_timeout(3000)
-                            after2=await v84_snapshot(page)
-                            notes.extend(await v84_verify(before2,after2))
-                    else:
-                        notes.append("Ikinci deneme icin tek Claim butonu uygun degildi; tekrar denenmedi.")
-                else:
-                    notes.append("Geri sayim uzun; ayni oturumda tekrar denenmedi.")
+            after=await v87_snapshot(page)
+            notes.extend(await v87_verify(before,after))
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
