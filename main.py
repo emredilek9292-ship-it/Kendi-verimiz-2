@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V16 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v3
+# V17 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v4
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3429,8 +3429,8 @@ async def browser_auto(bot: str, url: str) -> list:
     async def shot(caption):
         try:
             s = await page.screenshot(type="png")
-            if tgclient:
-                await tgclient.send_file(
+            if tg_client:
+                await tg_client.send_file(
                     ADMIN_CHATID,
                     io.BytesIO(s),
                     caption=caption,
@@ -3440,7 +3440,6 @@ async def browser_auto(bot: str, url: str) -> list:
             lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__} {e}")
 
     async def click_first(pattern, max_wait=4000):
-        """Ekranda pattern'e uyan ilk guvenli tiklanabilir ogene basar."""
         selectors = [
             "button",
             "[role=button]",
@@ -3471,7 +3470,6 @@ async def browser_auto(bot: str, url: str) -> list:
                     return label
                 except Exception:
                     continue
-        # text tabanli yedek
         try:
             t = page.get_by_text(re.compile(pattern, re.I)).first
             await t.click(timeout=5000)
@@ -3505,20 +3503,17 @@ async def browser_auto(bot: str, url: str) -> list:
         if balance_before is not None:
             lines.append(f"Ekrandan okunan bakiye: {balance_before}")
 
-        # 1) Uygulamaya gir
         entered = await click_first(r"open|start|play|launch|enter")
         if entered:
             lines.append(f"Uygulamaya giriş butonu: {entered}")
             await page.wait_for_timeout(5000)
 
-        # 2) Earn/Tasks/Daily sekmelerini dene
         for tab in ["earn", "tasks", "daily", "rewards", "check-in", "bonus"]:
             res = await click_first(re.escape(tab))
             if res:
                 lines.append(f"Sekme butonu: {res}")
                 break
 
-        # 3) Claim/Collect/Reward
         claim_btn = await click_first(
             r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck"
         )
