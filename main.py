@@ -3217,73 +3217,36 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-async def v87_snapshot(page):
-    # Görünür, kısa ve sayı içeren metinleri sırayla toplar.
-    # Zamanlayıcılar hariç tutulur; kasa ve bakiye alanları karışmasın.
+async def v88_screen_text(page):
+    # Claim oncesi/sonrasi ekran metnini okur; etiket tahmini yapmaz.
     try:
-        rows=await page.evaluate("""() => Array.from(document.querySelectorAll('body *'))
-          .filter(e => e.children.length === 0 && e.getClientRects().length && !['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(e.tagName))
-          .map(e => (e.innerText || '').trim())
-          .filter(t => /[0-9]/.test(t) && t.length <= 100 && !/\\b\\d+[d]\\s+\\d{1,2}:\\d{2}:\\d{2}\\b/.test(t) && !/^\\d{1,2}:\\d{2}:\\d{2}$/.test(t))
-          .map(t => t.replace(/\\b[0-9]{6,}\\b/g,'[uzun sayi gizlendi]'))
-          .slice(0,40)""")
-        return rows
+        return await page.locator("body").inner_text(timeout=5000)
     except Exception:
-        return []
+        return ""
 
-def v87_num(s):
-    try:
-        return float((s or '').replace(',','').strip())
-    except Exception:
-        return None
-
-async def v87_verify(before,after):
-    # Önceki canlı log: kasa 2 -> 0, bakiye 80,544 -> 80,546.
-    # Bu deseni esnek biçimde arar; sabit index varsaymaz.
-    def find_zero_to_nonzero(rows):
-        # Kasa: once 0'dan buyuk, sonra 0 olan deger.
-        for i in range(len(rows)):
-            x=v87_num(rows[i])
-            if x is not None and x>0:
-                return x
-        return None
-    def find_zero(rows):
-        for x in rows:
-            n=v87_num(x)
-            if n is not None and n==0:
-                return n
-        return None
-    def find_increase(rows_before,rows_after):
-        # Bakiye: onceki degerden buyuk olan ilk deger.
-        base=None
-        for x in rows_before:
-            n=v87_num(x)
-            if n is not None:
-                base=n
-                break
-        if base is None:
-            return None,None
-        for x in rows_after:
-            n=v87_num(x)
-            if n is not None and n>base:
-                return base,n
-        return base,None
-    kasa_b=find_zero_to_nonzero(before)
-    kasa_a=find_zero(after)
-    bak_b,bak_a=find_increase(before,after)
-    notes=[]
-    if kasa_b is None or kasa_a is None:
-        notes.append("Kasa sifirlanmasi ekranda dogrulanamadi.")
-    else:
-        notes.append(f"Kasa: {kasa_b:g} -> {kasa_a:g}.")
-    if bak_b is None or bak_a is None:
-        notes.append("Bakiye artisi ekranda dogrulanamadi.")
-    else:
-        notes.append(f"Bakiye: {bak_b:g} -> {bak_a:g}.")
-    if kasa_b is not None and kasa_a is not None and kasa_b>0 and kasa_a==0 and bak_a is not None and bak_b is not None and bak_a>bak_b:
-        notes.append("Kasa sifirlandi ve bakiye artti; toplama dogrulandi.")
-    else:
-        notes.append("Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.")
+def v88_diff_report(before,after):
+    # Ekrandaki sayisal satirlari kiyaslar; kasa/bakiye oldugunu varsaymaz.
+    def numeric_lines(text):
+        out=[]
+        for line in (text or "").splitlines():
+            line=line.strip()
+            if line and re.search(r"\d",line) and len(line)<=120:
+                out.append(line)
+        return out
+    b=numeric_lines(before)
+    a=numeric_lines(after)
+    notes=["Claim sonrasi ekran metni teshis raporu:"]
+    if not b and not a:
+        notes.append("Sayisal ekran satiri okunamadi.")
+        return notes
+    # Ayni sirada karsilastirilabilir en fazla 12 satir.
+    for i in range(min(len(b),len(a),12)):
+        if b[i]!=a[i]:
+            notes.append(f"Satir {i+1}: {b[i]} -> {a[i]}")
+    if len(b)!=len(a):
+        notes.append(f"Satir sayisi degisti: {len(b)} -> {len(a)}.")
+    if not any(f"Satir" in n for n in notes):
+        notes.append("Gorunur sayisal satirlarda degisim saptanmadi.")
     return notes
 
 async def v8_browser(name,url,state):
@@ -3385,7 +3348,7 @@ async def v8_browser(name,url,state):
                 return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
             if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
                 return notes+["Claim baglami degisti; tiklanmadi."]
-            before=await v87_snapshot(page)
+            before_text=await v88_screen_text(page)
             state["stage"]="claim_tiklama"
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
@@ -3393,8 +3356,9 @@ async def v8_browser(name,url,state):
                 return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
-            after=await v87_snapshot(page)
-            notes.extend(await v87_verify(before,after))
+            after_text=await v88_screen_text(page)
+            notes.extend(v88_diff_report(before_text,after_text))
+            notes.append("Otomatik odul dogrulamasi yapilmadi; ekran metni yalnizca teshis icin raporlanir.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
