@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V12.2 - UNIVERSAL MINIAPP ENGINE
+# V12.3 - UNIVERSAL MINIAPP ENGINE
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3194,7 +3194,12 @@ MINIAPP_BUSY = set()
 BALANCE_HINTS = (
     "balance", "balances", "coin", "coins", "point", "points",
     "token", "tokens", "credit", "credits", "gem", "gems",
-    "age", "amount", "total", "wallet", "cash", "money"
+    "amount", "total", "wallet", "cash", "money"
+)
+
+PRIORITY_BALANCE_PATHS = (
+    "api/user", "api/me", "api/profile", "api/account",
+    "api/v1/user", "api/v1/me", "api/v1/profile", "user", "me", "profile"
 )
 
 DANGEROUS_PATH_RE = re.compile(
@@ -3218,6 +3223,11 @@ POPUP_WAIT_RE = re.compile(
 POPUP_ERROR_RE = re.compile(
     r"error|failed|invalid|expired|denied|forbidden|"
     r"hata|ba\u015far\u0131s\u0131z|ge\u00e7ersiz|s\u00fcre doldu",
+    re.I
+)
+
+DEEP_CLAIM_RE = re.compile(
+    r"['\"`](/?[A-Za-z0-9_\-/]{2,60}(?:claim|collect|harvest|check-?in|daily|reward|bonus)[A-Za-z0-9_\-/]*)['\"`]",
     re.I
 )
 
@@ -3257,7 +3267,11 @@ async def universal_read_balance(ctx: dict):
     headers = ctx.get("hdr") or {}
     found = {}
 
-    for path in DEFAULT_GET_PATHS:
+    ordered = list(PRIORITY_BALANCE_PATHS) + [
+        p for p in DEFAULT_GET_PATHS if p not in PRIORITY_BALANCE_PATHS
+    ]
+
+    for path in ordered:
         if DANGEROUS_PATH_RE.search(path):
             continue
         for base in bases:
@@ -3284,6 +3298,35 @@ def balance_diff(before: dict, after: dict):
             if d:
                 diffs[k] = d
     return diffs
+
+
+async def deep_scan_claims(ctx: dict, webview_url: str) -> list:
+    """Ilk taramada claim bulunamazsa daha fazla JS dosyasini tarar."""
+    extra = []
+    base = webview_url.split("#")[0]
+    html = await fetch_text(base, 800000)
+    if not html:
+        return extra
+
+    scripts = re.findall(r'script[^>]+src=["\']([^"\']+)["\']', html, re.I)
+    urls = []
+    for s in scripts[:25]:
+        u = urljoin(base, s)
+        if u not in urls:
+            urls.append(u)
+
+    for u in urls:
+        txt = await fetch_text(u, 1500000)
+        if not txt:
+            continue
+        for m in DEEP_CLAIM_RE.finditer(txt):
+            p = m.group(1)
+            if p and p not in extra and not DANGEROUS_PATH_RE.search(p):
+                extra.append(p)
+        if len(extra) >= 12:
+            break
+
+    return extra[:12]
 
 
 async def universal_miniapp(bot: str):
@@ -3339,6 +3382,12 @@ async def universal_miniapp(bot: str):
             lines.append("Claim öncesi bakiye alanı okunamadı.")
 
         cands = claim_candidates(ctx)
+        if not cands:
+            deep = await deep_scan_claims(ctx, url)
+            if deep:
+                cands = deep
+                lines.append(f"Derin JS taraması: {len(deep)} claim adayı bulundu.")
+
         if cands:
             lines.append(f"Güvenli claim adayı: {len(cands)} yol bulundu.")
             claim_lines, done = await claim_auto_run(bot, ctx, cands, True)
