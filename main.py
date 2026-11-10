@@ -3184,10 +3184,12 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V18 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v5
+# V19 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v6
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
+
+import io
 
 try:
     from playwright.async_api import async_playwright
