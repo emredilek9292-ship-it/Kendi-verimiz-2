@@ -3184,12 +3184,20 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V12.4 - UNIVERSAL MINIAPP ENGINE
+# V13 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
 
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_OK = True
+except Exception:
+    PLAYWRIGHT_OK = False
+
 MINIAPP_BUSY = set()
+_BROWSER = None
+_PW = None
 
 BALANCE_HINTS = (
     "balance", "balances", "coin", "coins", "point", "points",
@@ -3205,6 +3213,18 @@ PRIORITY_BALANCE_PATHS = (
 DANGEROUS_PATH_RE = re.compile(
     r"deposit|withdraw|swap|stake|buy|sell|transfer|pay|purchase|"
     r"wallet|connect|auth|login|sign-?in|session|revoke|logout|signout",
+    re.I
+)
+
+DANGER_CLICK_RE = re.compile(
+    r"wallet|c\u00fczdan|deposit|withdraw|ekle|cekim|\u00e7ekim|yat\u0131r|"
+    r"buy|sat\u0131n|sat|swap|stake|invest|premium|stars|usdt|"
+    r"pay|\u00f6deme|confirm|onayla|approve|sign|connect|login|giri\u015f",
+    re.I
+)
+
+SAFE_CLICK_RE = re.compile(
+    r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|open|start|play",
     re.I
 )
 
@@ -3226,7 +3246,6 @@ POPUP_ERROR_RE = re.compile(
     re.I
 )
 
-# JS icindeki olasi API yollari: fetch("..."), axios.get('...'), "/api/xxx" etc.
 API_PATH_RE = re.compile(
     r"['\"`](/api/[A-Za-z0-9_\-/.]{2,80}|/[A-Za-z0-9_\-/]{2,60}(?:claim|collect|harvest|check-?in|daily|reward|bonus)[A-Za-z0-9_\-/]*)['\"`]",
     re.I
@@ -3341,6 +3360,99 @@ async def deep_scan_claims(ctx: dict, webview_url: str) -> list:
     return extra[:15], scanned
 
 
+async def get_browser():
+    """Playwright Chromium tarayıcısını tek örnek olarak açar."""
+    global _PW, _BROWSER
+    if not PLAYWRIGHT_OK:
+        return None
+    if _BROWSER is None:
+        _PW = await async_playwright().start()
+        _BROWSER = await _PW.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+    return _BROWSER
+
+
+async def browser_auto(bot: str, url: str) -> list:
+    """Mini uygulamayı gerçek tarayıcıda açar, güvenli butonları dener."""
+    lines = []
+    browser = await get_browser()
+    if browser is None:
+        return ["Playwright kurulu değil; tarayıcı otomasyonu atlandı."]
+
+    context = await browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+        ),
+        viewport={"width": 412, "height": 915},
+    )
+    page = await context.new_page()
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(6000)
+
+        before_text = await page.inner_text("body") if await page.locator("body").count() else ""
+
+        # 1) Önce güvenli claim/daily butonlarını dene
+        clicked = []
+        for attempt in range(2):
+            buttons = page.locator("button, [role=button], a")
+            count = await buttons.count()
+            for i in range(min(count, 30)):
+                try:
+                    label = (await buttons.nth(i).inner_text()).strip()
+                except Exception:
+                    continue
+                if not label:
+                    continue
+                if DANGER_CLICK_RE.search(label):
+                    continue
+                if not SAFE_CLICK_RE.search(label):
+                    continue
+                if label in clicked:
+                    continue
+                try:
+                    await buttons.nth(i).click(timeout=5000)
+                    clicked.append(label)
+                    await page.wait_for_timeout(4000)
+                except Exception:
+                    continue
+            if clicked:
+                break
+
+        if clicked:
+            lines.append(f"Tarayıcıda tıklanan butonlar: {', '.join(clicked[:6])}")
+        else:
+            lines.append("Tarayıcıda güvenli claim/daily butonu bulunamadı.")
+
+        after_text = await page.inner_text("body") if await page.locator("body").count() else ""
+
+        def nums(t):
+            return re.findall(r"\d[\d.,]*", t or "")
+
+        b_nums, a_nums = nums(before_text), nums(after_text)
+        if b_nums != a_nums:
+            lines.append("Tarayıcıda ekran değerleri değişti; claim olası.")
+        else:
+            lines.append("Tarayıcıda ekran değerlerinde değişiklik görülmedi.")
+
+        popup = classify_popup_text(after_text[:500])
+        lines.append(f"Son ekran sınıfı: {popup}")
+
+    except Exception as e:
+        lines.append(f"Tarayıcı otomasyonu hatası: {type(e).__name__} {e}")
+    finally:
+        try:
+            await context.close()
+        except Exception:
+            pass
+
+    return lines
+
+
 async def universal_miniapp(bot: str):
     if bot in MINIAPP_BUSY:
         await send_admin(f"{bot} icin mini uygulama otomasyonu zaten calisiyor.")
@@ -3356,7 +3468,7 @@ async def universal_miniapp(bot: str):
             f"UNIVERSAL MINIAPP başladı: {bot}\n"
             "1) Mini uygulama açılıyor\n"
             "2) Claim/daily yolları taranıyor\n"
-            "3) Görev listesi arka planda taranacak\n"
+            "3) Gerekirse tarayıcı ile buton tıklaması yapılacak\n"
             "Cüzdan, ödeme, swap, stake ve tehlikeli işlemler otomatik yapılmayacak."
         )
 
@@ -3381,45 +3493,47 @@ async def universal_miniapp(bot: str):
         if not ctx.get("ok"):
             lines += [
                 "Uygulamaya otomatik giriş yapılamadı.",
-                "Bu yüzden API isteği atılmadı.",
-            ] + [f"- {x}" for x in (ctx.get("notes") or [])][:8]
-            await send_admin("\n".join(lines))
-            return
-
-        before = await universal_read_balance(ctx)
-        if before:
-            first_path = next(iter(before))
-            lines.append(f"Claim öncesi bakiye alanı: {first_path}")
+                "API taraması atlandı, tarayıcı deneniyor.",
+            ]
         else:
-            lines.append("Claim öncesi bakiye alanı okunamadı.")
+            before = await universal_read_balance(ctx)
+            if before:
+                first_path = next(iter(before))
+                lines.append(f"Claim öncesi bakiye alanı: {first_path}")
+            else:
+                lines.append("Claim öncesi bakiye alanı okunamadı.")
 
-        cands = claim_candidates(ctx)
-        if not cands:
-            deep, scanned = await deep_scan_claims(ctx, url)
-            lines.append(f"Derin JS taraması: {scanned} dosya okundu, {len(deep)} claim adayı bulundu.")
-            if deep:
-                cands = deep
+            cands = claim_candidates(ctx)
+            if not cands:
+                deep, scanned = await deep_scan_claims(ctx, url)
+                lines.append(f"Derin JS taraması: {scanned} dosya okundu, {len(deep)} claim adayı bulundu.")
+                if deep:
+                    cands = deep
 
-        if cands:
-            lines.append(f"Güvenli claim adayı: {len(cands)} yol bulundu.")
-            claim_lines, done = await claim_auto_run(bot, ctx, cands, True)
-            if claim_lines:
-                lines += claim_lines
-        else:
-            lines.append("Kodda doğrudan güvenli claim/collect/daily yolu bulunamadı.")
+            if cands:
+                lines.append(f"Güvenli claim adayı: {len(cands)} yol bulundu.")
+                claim_lines, done = await claim_auto_run(bot, ctx, cands, True)
+                if claim_lines:
+                    lines += claim_lines
+            else:
+                lines.append("Kodda doğrudan güvenli claim/collect/daily yolu bulunamadı.")
 
-        after = await universal_read_balance(ctx)
-        diffs = balance_diff(before, after)
-        if diffs:
-            pretty = ", ".join(f"{k}: +{v}" for k, v in list(diffs.items())[:5])
-            lines.append(f"Claim sonrası bakiye değişimi doğrulandı: {pretty}")
-        elif before or after:
-            lines.append(
-                "Claim sonrası bakiye değişimi doğrulanamadı; "
-                "kasa sıfırlanmış olabilir ama toplam bakiye artışı kanıtlanamadı."
-            )
-        else:
-            lines.append("Bakiye alanları hiç okunamadı; claim sonucu doğrulanamadı.")
+            after = await universal_read_balance(ctx)
+            diffs = balance_diff(before, after)
+            if diffs:
+                pretty = ", ".join(f"{k}: +{v}" for k, v in list(diffs.items())[:5])
+                lines.append(f"Claim sonrası bakiye değişimi doğrulandı: {pretty}")
+            elif before or after:
+                lines.append(
+                    "Claim sonrası bakiye değişimi doğrulanamadı; "
+                    "kasa sıfırlanmış olabilir ama toplam bakiye artışı kanıtlanamadı."
+                )
+            else:
+                lines.append("Bakiye alanları hiç okunamadı; claim sonucu doğrulanamadı.")
+
+        # Tarayıcı otomasyonu: MyAgeApp gibi canvas/miniapp oyunları için
+        blines = await browser_auto(bot, url)
+        lines += blines
 
         lines.append("Görev listesi taraması arka planda başladı; bitince özet gelecek.")
         await send_admin("\n".join(lines))
@@ -3444,7 +3558,7 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kullanım: miniapp botadi\n"
             "Örnek: miniapp atomicappbot\n"
             "Sistem mini uygulamayı açar, güvenli claim/daily yollarını dener, "
-            "görev listesini arka planda tarar ve sonucu raporlar."
+            "gerekirse tarayıcı ile buton tıklaması yapar."
         )
         return
 
