@@ -3184,9 +3184,11 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V26 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v13
-# Kok neden: browser /api/tasks'a tma header gondermiyordu.
-# /api/friends ayni header ile calisiyor -> format dogru, browser'a uygula.
+# V27 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v14
+# Canvas tabanli mini uygulamalar (OpFlex vb) icin kok cozum:
+# - telegram-web-app.js istegini yakala, kendi mock'umuzu servis et
+# - Boylece uygulamanin kendi script'i mock'u ezmez
+# - API header enjeksiyonu (tma) ayni kaliyor
 # ============================================================
 
 import io as _io
@@ -3424,6 +3426,9 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
+    """Mini uygulamayı gerçek tarayıcıda açar; telegram-web-app.js'i yakalayıp
+    kendi mock'umuzu servis eder. Böylece uygulamanın kendi script'i mock'u ezmez.
+    """
     lines = []
     browser = await get_browser()
     if browser is None:
@@ -3441,6 +3446,70 @@ async def browser_auto(bot: str, url: str) -> list:
     if initData:
         app_host = _urlparse(url).netloc
 
+        # 1) telegram-web-app.js'i yakala, kendi mock'umuzu servis et
+        tg_mock_js = f"""
+window.Telegram = window.Telegram || {{}};
+window.Telegram.WebApp = {{
+    initData: {json.dumps(initData)},
+    initDataUnsafe: {json.dumps(initDataUnsafe)},
+    version: '7.0',
+    platform: 'android',
+    colorScheme: 'dark',
+    themeParams: {{}},
+    isExpanded: true,
+    viewportHeight: window.innerHeight,
+    viewportStableHeight: window.innerHeight,
+    ready: function(){{}},
+    expand: function(){{}},
+    close: function(){{}},
+    MainButton: {{
+        show: function(){{}}, hide: function(){{}}, setText: function(){{}},
+        onClick: function(){{}}, offClick: function(){{}}, showProgress: function(){{}},
+        hideProgress: function(){{}}, enable: function(){{}}, disable: function(){{}}
+    }},
+    BackButton: {{show: function(){{}}, hide: function(){{}}, onClick: function(){{}}, offClick: function(){{}}}},
+    HapticFeedback: {{
+        impactOccurred: function(){{}}, notificationOccurred: function(){{}},
+        selectionChanged: function(){{}}
+    }},
+    setHeaderColor: function(){{}},
+    setBackgroundColor: function(){{}},
+    setBottomBarColor: function(){{}},
+    enableClosingConfirmation: function(){{}},
+    disableClosingConfirmation: function(){{}},
+    onEvent: function(){{}},
+    offEvent: function(){{}},
+    sendData: function(){{}},
+    openLink: function(){{}},
+    openTelegramLink: function(){{}},
+    openInvoice: function(){{}},
+    showAlert: function(m){{ alert(m); }},
+    showConfirm: function(m, cb){{ if(cb) cb(true); }},
+    showPopup: function(p, cb){{ if(cb) cb(null); }},
+    requestFullscreen: function(){{}},
+    exitFullscreen: function(){{}},
+    isVersionAtLeast: function(v){{ return true; }}
+}};
+"""
+
+        async def serve_tg_mock(route, request):
+            u = request.url
+            if "telegram-web-app" in u:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/javascript",
+                    body=tg_mock_js,
+                )
+                return
+            await route.continue_()
+
+        try:
+            await context.route("**/telegram-web-app*", serve_tg_mock)
+            lines.append("telegram-web-app.js mock servisi aktif.")
+        except Exception as e:
+            lines.append(f"telegram-web-app.js mock hatası: {type(e).__name__} {e}")
+
+        # 2) API isteklerine tma header ekle
         async def add_auth_headers(route, request):
             try:
                 u = request.url
@@ -3470,7 +3539,7 @@ async def browser_auto(bot: str, url: str) -> list:
 
     def on_response(resp):
         u = resp.url
-        if any(k in u for k in ("/api/tasks", "/api/session", "/api/claim", "/api/bonus", "/api/reward")):
+        if any(k in u for k in ("/api/", "/claim", "/checkin", "/reward", "/bonus")):
             try:
                 captured[u] = {"status": resp.status, "text": ""}
             except Exception:
@@ -3575,7 +3644,7 @@ async def browser_auto(bot: str, url: str) -> list:
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(10000)
 
         title = await page.title()
         body_text = ""
@@ -3598,6 +3667,24 @@ async def browser_auto(bot: str, url: str) -> list:
         if balance_before is not None:
             lines.append(f"Ekrandan okunan bakiye: {balance_before}")
 
+        # Telegram env kontrolu
+        tg_check = await page.evaluate(
+            """() => {
+                const tg = window.Telegram && window.Telegram.WebApp;
+                return {
+                    hasTelegram: !!tg,
+                    hasInitData: !!(tg && tg.initData),
+                    initDataLen: tg && tg.initData ? tg.initData.length : 0
+                };
+            }"""
+        )
+        lines.append(
+            f"Telegram env: hasTelegram={tg_check.get('hasTelegram')}, "
+            f"hasInitData={tg_check.get('hasInitData')}, "
+            f"initDataLen={tg_check.get('initDataLen')}"
+        )
+
+        # Uygulamaya gir
         entered = await js_click(r"^(open|start|play|launch|enter)$")
         if not entered:
             entered = await js_click(r"\b(open|start|play|launch|enter)\b")
@@ -3605,22 +3692,25 @@ async def browser_auto(bot: str, url: str) -> list:
             lines.append(f"Uygulamaya giriş butonu: {entered}")
             await page.wait_for_timeout(5000)
 
+        # Earn/Tasks/Daily sekmeleri
         for tab in ["earn", "tasks", "daily", "rewards", "check-in", "bonus"]:
             res = await js_click(rf"\b{re.escape(tab)}\b")
             if res:
                 lines.append(f"Sekme butonu: {res}")
                 break
 
+        # /api/tasks veya benzeri cevabi yakala
         await read_captured()
         tasks_ok = False
         for u, info in captured.items():
-            if "/api/tasks" in u:
-                lines.append(f"/api/tasks durumu: {info['status']}")
+            if "/api/" in u and info["status"] == 200:
                 ttxt = re.sub(r"\s+", " ", info["text"])[:800]
-                lines.append("Tasks JSON özeti: " + ttxt)
-                if '"error"' not in ttxt and info["status"] == 200:
+                if '"error"' not in ttxt:
                     tasks_ok = True
+                    lines.append(f"API OK: {u[:80]}")
+                    lines.append("API JSON özeti: " + ttxt)
 
+        # Claim dene
         if tasks_ok:
             labels = await dump_buttons()
             lines.append("Görünür buton metinleri: " + " | ".join(labels[:25]))
@@ -3631,8 +3721,10 @@ async def browser_auto(bot: str, url: str) -> list:
                     await page.wait_for_timeout(3000)
         else:
             claim_exact = await js_click_exact("claim bonus")
+            if not claim_exact:
+                claim_exact = await js_click_exact("claim")
             if claim_exact:
-                lines.append(f"Claim bonus exact tıklandı: {claim_exact}")
+                lines.append(f"Claim exact tıklandı: {claim_exact}")
             else:
                 claim_btn = await js_click(
                     r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
@@ -3646,7 +3738,7 @@ async def browser_auto(bot: str, url: str) -> list:
         await shot(f"{bot} - işlem sonrası ekran")
 
         await read_captured()
-        new_api = [u for u in captured if any(k in u for k in ("claim", "bonus", "reward"))]
+        new_api = [u for u in captured if any(k in u for k in ("claim", "bonus", "reward", "checkin"))]
         if new_api:
             lines.append("Claim sonrası API: " + " | ".join(u[:80] for u in new_api[:5]))
 
