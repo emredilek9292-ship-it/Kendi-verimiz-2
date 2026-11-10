@@ -3184,13 +3184,14 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V23 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v10
+# V24 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v11
 # MyAgeApp gibi DOM tabanli mini uygulamalar icin saglam otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
 
 import io as _io
 import json as _json
+from urllib.parse import unquote as _unquote, parse_qs as _parse_qs
 
 try:
     from playwright.async_api import async_playwright
@@ -3259,6 +3260,29 @@ DYNAMIC_IMPORT_RE = re.compile(
     r'import\(\s*["\']([^"\']+)["\']\s*\)|import\(\s*`([^`]+)`\s*\)',
     re.I
 )
+
+
+def extract_tg_init_data(url: str):
+    """URL fragment'indan tgWebAppData (initData) cikarir."""
+    if "#" not in url:
+        return "", {}
+    frag = url.split("#", 1)[1]
+    params = _parse_qs(frag)
+    raw = params.get("tgWebAppData", [""])[0]
+    if not raw:
+        return "", {}
+    initData = _unquote(raw)
+    inner = _parse_qs(initData, keep_blank_values=True)
+    unsafe = {}
+    for k, v in inner.items():
+        if k in ("user", "receiver", "chat"):
+            try:
+                unsafe[k] = _json.loads(v[0])
+            except Exception:
+                unsafe[k] = v[0]
+        else:
+            unsafe[k] = v[0]
+    return initData, unsafe
 
 
 def classify_popup_text(text: str) -> str:
@@ -3408,7 +3432,7 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; JS ile güvenli butonları tıklar.
+    """Mini uygulamayı gerçek tarayıcıda açar; Telegram initData enjekte edilir.
 
     "Claim bonus" exact-match ile tiklanir; /api/tasks cevabi yakalanir.
     """
@@ -3425,6 +3449,33 @@ async def browser_auto(bot: str, url: str) -> list:
         viewport={"width": 412, "height": 915},
     )
     page = await context.new_page()
+
+    # 0) Telegram initData enjeksiyonu
+    initData, initDataUnsafe = extract_tg_init_data(url)
+    if initData:
+        init_script = f"""
+window.Telegram = window.Telegram || {{}};
+window.Telegram.WebApp = window.Telegram.WebApp || {{}};
+window.Telegram.WebApp.initData = {json.dumps(initData)};
+window.Telegram.WebApp.initDataUnsafe = {json.dumps(initDataUnsafe)};
+window.Telegram.WebApp.version = '7.0';
+window.Telegram.WebApp.platform = 'android';
+window.Telegram.WebApp.colorScheme = 'dark';
+window.Telegram.WebApp.ready = function(){{}};
+window.Telegram.WebApp.expand = function(){{}};
+window.Telegram.WebApp.close = function(){{}};
+window.Telegram.WebApp.MainButton = {{show:function(){{}}, hide:function(){{}}, setText:function(){{}}, onClick:function(){{}}}};
+window.Telegram.WebApp.HapticFeedback = {{impactOccurred:function(){{}}, notificationOccurred:function(){{}}}};
+window.Telegram.WebApp.setHeaderColor = function(){{}};
+window.Telegram.WebApp.setBackgroundColor = function(){{}};
+"""
+        try:
+            await page.add_init_script(init_script)
+            lines.append("Telegram initData enjekte edildi.")
+        except Exception as e:
+            lines.append(f"initData enjeksiyonu hatası: {type(e).__name__} {e}")
+    else:
+        lines.append("URL'de tgWebAppData bulunamadı; initData enjekte edilmedi.")
 
     api_calls = []
     captured = {}
@@ -3588,7 +3639,6 @@ async def browser_auto(bot: str, url: str) -> list:
         if claim_exact:
             lines.append(f"Claim bonus exact tıklandı: {claim_exact}")
         else:
-            # 5) Genel claim desenleri
             claim_btn = await js_click(
                 r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
             )
@@ -3600,7 +3650,7 @@ async def browser_auto(bot: str, url: str) -> list:
         await page.wait_for_timeout(4000)
         await shot(f"{bot} - işlem sonrası ekran")
 
-        # 6) Claim sonrasi yeni API cagrilarini yakala
+        # 5) Claim sonrasi yeni API cagrilarini yakala
         await read_captured()
         new_api = [u for u in captured if any(k in u for k in ("claim", "bonus", "reward"))]
         if new_api:
