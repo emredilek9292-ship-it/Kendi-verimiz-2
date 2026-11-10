@@ -3184,9 +3184,9 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V25 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v12
-# MyAgeApp gibi DOM tabanli mini uygulamalar icin saglam otomasyon.
-# "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
+# V26 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v13
+# Kok neden: browser /api/tasks'a tma header gondermiyordu.
+# /api/friends ayni header ile calisiyor -> format dogru, browser'a uygula.
 # ============================================================
 
 import io as _io
@@ -3263,7 +3263,6 @@ DYNAMIC_IMPORT_RE = re.compile(
 
 
 def extract_tg_init_data(url: str):
-    """URL fragment'indan tgWebAppData (initData) cikarir."""
     if "#" not in url:
         return "", {}
     frag = url.split("#", 1)[1]
@@ -3319,11 +3318,9 @@ async def universal_read_balance(ctx: dict):
     bases = ctx.get("bases") or []
     headers = ctx.get("hdr") or {}
     found = {}
-
     ordered = list(PRIORITY_BALANCE_PATHS) + [
         p for p in DEFAULT_GET_PATHS if p not in PRIORITY_BALANCE_PATHS
     ]
-
     for path in ordered:
         if DANGEROUS_PATH_RE.search(path):
             continue
@@ -3338,7 +3335,6 @@ async def universal_read_balance(ctx: dict):
                 break
         if found:
             break
-
     return found
 
 
@@ -3383,10 +3379,8 @@ async def deep_scan_claims(ctx: dict, webview_url: str):
         if not txt:
             continue
         scanned += 1
-
         for m in API_PATH_RE.finditer(txt):
             add_path(m.group(1))
-
         if depth < 3:
             for m in DYNAMIC_IMPORT_RE.finditer(txt):
                 su = m.group(1) or m.group(2)
@@ -3395,7 +3389,6 @@ async def deep_scan_claims(ctx: dict, webview_url: str):
                 full = urljoin(u, su)
                 if full not in seen_urls:
                     queue.append((full, depth + 1))
-
             for sm in SCRIPT_URL_RE.finditer(txt):
                 su = sm.group(1)
                 if su.startswith("data:") or su.startswith("blob:"):
@@ -3403,7 +3396,6 @@ async def deep_scan_claims(ctx: dict, webview_url: str):
                 full = urljoin(u, su)
                 if full not in seen_urls:
                     queue.append((full, depth + 1))
-
     return extra[:30], scanned, all_paths[:40]
 
 
@@ -3432,10 +3424,6 @@ def parse_balance_from_text(text: str):
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar; Telegram initData header olarak enjekte edilir.
-
-    "Claim bonus" exact-match ile tiklanir; /api/tasks cevabi yakalanir.
-    """
     lines = []
     browser = await get_browser()
     if browser is None:
@@ -3449,32 +3437,8 @@ async def browser_auto(bot: str, url: str) -> list:
         viewport={"width": 412, "height": 915},
     )
 
-    # 0) Telegram initData enjeksiyonu (mock + header)
     initData, initDataUnsafe = extract_tg_init_data(url)
     if initData:
-        init_script = f"""
-window.Telegram = window.Telegram || {{}};
-window.Telegram.WebApp = window.Telegram.WebApp || {{}};
-window.Telegram.WebApp.initData = {json.dumps(initData)};
-window.Telegram.WebApp.initDataUnsafe = {json.dumps(initDataUnsafe)};
-window.Telegram.WebApp.version = '7.0';
-window.Telegram.WebApp.platform = 'android';
-window.Telegram.WebApp.colorScheme = 'dark';
-window.Telegram.WebApp.ready = function(){{}};
-window.Telegram.WebApp.expand = function(){{}};
-window.Telegram.WebApp.close = function(){{}};
-window.Telegram.WebApp.MainButton = {{show:function(){{}}, hide:function(){{}}, setText:function(){{}}, onClick:function(){{}}}};
-window.Telegram.WebApp.HapticFeedback = {{impactOccurred:function(){{}}, notificationOccurred:function(){{}}}};
-window.Telegram.WebApp.setHeaderColor = function(){{}};
-window.Telegram.WebApp.setBackgroundColor = function(){{}};
-"""
-        try:
-            await context.add_init_script(init_script)
-            lines.append("Telegram initData mock enjekte edildi.")
-        except Exception as e:
-            lines.append(f"initData mock enjeksiyonu hatası: {type(e).__name__} {e}")
-
-        # API isteklerine initData header ekle
         app_host = _urlparse(url).netloc
 
         async def add_auth_headers(route, request):
@@ -3493,11 +3457,11 @@ window.Telegram.WebApp.setBackgroundColor = function(){{}};
 
         try:
             await context.route("**/*", add_auth_headers)
-            lines.append("API isteklerine initData header eklendi.")
+            lines.append("Route ile tma header enjeksiyonu aktif.")
         except Exception as e:
-            lines.append(f"Header enjeksiyonu hatası: {type(e).__name__} {e}")
+            lines.append(f"Route header enjeksiyonu hatası: {type(e).__name__} {e}")
     else:
-        lines.append("URL'de tgWebAppData bulunamadı; initData enjekte edilmedi.")
+        lines.append("URL'de tgWebAppData bulunamadı; header enjeksiyonu atlandı.")
 
     page = await context.new_page()
 
@@ -3543,7 +3507,6 @@ window.Telegram.WebApp.setBackgroundColor = function(){{}};
             lines.append(f"Ekran görüntüsü gönderilemedi: {type(e).__name__} {e}")
 
     async def js_click_exact(target: str, max_wait: int = 5000):
-        """Exact-match ile guvenli elementi JS ile tiklar."""
         try:
             label = await page.evaluate(
                 """(target) => {
@@ -3567,7 +3530,6 @@ window.Telegram.WebApp.setBackgroundColor = function(){{}};
         return label
 
     async def js_click(pattern: str, max_wait: int = 4000):
-        """Sayfadaki metne gore ilk guvenli elementi JS ile tiklar."""
         try:
             label = await page.evaluate(
                 """(pattern) => {
@@ -3636,7 +3598,6 @@ window.Telegram.WebApp.setBackgroundColor = function(){{}};
         if balance_before is not None:
             lines.append(f"Ekrandan okunan bakiye: {balance_before}")
 
-        # 1) Uygulamaya gir
         entered = await js_click(r"^(open|start|play|launch|enter)$")
         if not entered:
             entered = await js_click(r"\b(open|start|play|launch|enter)\b")
@@ -3644,37 +3605,46 @@ window.Telegram.WebApp.setBackgroundColor = function(){{}};
             lines.append(f"Uygulamaya giriş butonu: {entered}")
             await page.wait_for_timeout(5000)
 
-        # 2) Earn/Tasks/Daily sekmeleri
         for tab in ["earn", "tasks", "daily", "rewards", "check-in", "bonus"]:
             res = await js_click(rf"\b{re.escape(tab)}\b")
             if res:
                 lines.append(f"Sekme butonu: {res}")
                 break
 
-        # 3) /api/tasks cevabini yakala
         await read_captured()
+        tasks_ok = False
         for u, info in captured.items():
             if "/api/tasks" in u:
                 lines.append(f"/api/tasks durumu: {info['status']}")
-                lines.append("Tasks JSON özeti: " + re.sub(r"\s+", " ", info["text"])[:800])
+                ttxt = re.sub(r"\s+", " ", info["text"])[:800]
+                lines.append("Tasks JSON özeti: " + ttxt)
+                if '"error"' not in ttxt and info["status"] == 200:
+                    tasks_ok = True
 
-        # 4) Claim bonus exact-match
-        claim_exact = await js_click_exact("claim bonus")
-        if claim_exact:
-            lines.append(f"Claim bonus exact tıklandı: {claim_exact}")
+        if tasks_ok:
+            labels = await dump_buttons()
+            lines.append("Görünür buton metinleri: " + " | ".join(labels[:25]))
+            for pat in [r"\b(start|check|go)\b", r"\b(claim|collect|reward|bonus|daily|check[- ]?in)\b"]:
+                res = await js_click(pat)
+                if res:
+                    lines.append(f"Tıklanan buton: {res}")
+                    await page.wait_for_timeout(3000)
         else:
-            claim_btn = await js_click(
-                r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
-            )
-            if claim_btn:
-                lines.append(f"Claim butonu: {claim_btn}")
+            claim_exact = await js_click_exact("claim bonus")
+            if claim_exact:
+                lines.append(f"Claim bonus exact tıklandı: {claim_exact}")
             else:
-                lines.append("Claim/Daily/Collect butonu bulunamadı.")
+                claim_btn = await js_click(
+                    r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
+                )
+                if claim_btn:
+                    lines.append(f"Claim butonu: {claim_btn}")
+                else:
+                    lines.append("Claim/Daily/Collect butonu bulunamadı.")
 
         await page.wait_for_timeout(4000)
         await shot(f"{bot} - işlem sonrası ekran")
 
-        # 5) Claim sonrasi yeni API cagrilarini yakala
         await read_captured()
         new_api = [u for u in captured if any(k in u for k in ("claim", "bonus", "reward"))]
         if new_api:
