@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V13 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION
+# V13.1 - UNIVERSAL MINIAPP ENGINE + BROWSER/CANVAS AUTOMATION
 # Her Telegram mini uygulama botu icin ortak otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3224,7 +3224,8 @@ DANGER_CLICK_RE = re.compile(
 )
 
 SAFE_CLICK_RE = re.compile(
-    r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|open|start|play",
+    r"claim|collect|daily|check[- ]?in|reward|bonus|harvest|"
+    r"al|topla|\u00f6d\u00fcl|g\u00fcnl\u00fck|open|start|play|get|tap",
     re.I
 )
 
@@ -3326,7 +3327,6 @@ def balance_diff(before: dict, after: dict):
 
 
 async def deep_scan_claims(ctx: dict, webview_url: str) -> list:
-    """JS chunk'larini recursive tarar; claim/collect/daily yollarini arar."""
     extra = []
     base = webview_url.split("#")[0]
     seen_urls = set()
@@ -3361,7 +3361,6 @@ async def deep_scan_claims(ctx: dict, webview_url: str) -> list:
 
 
 async def get_browser():
-    """Playwright Chromium tarayıcısını tek örnek olarak açar."""
     global _PW, _BROWSER
     if not PLAYWRIGHT_OK:
         return None
@@ -3375,7 +3374,7 @@ async def get_browser():
 
 
 async def browser_auto(bot: str, url: str) -> list:
-    """Mini uygulamayı gerçek tarayıcıda açar, güvenli butonları dener."""
+    """Mini uygulamayı gerçek tarayıcıda açar; DOM butonu yoksa canvas'a dokunur."""
     lines = []
     browser = await get_browser()
     if browser is None:
@@ -3394,10 +3393,16 @@ async def browser_auto(bot: str, url: str) -> list:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(6000)
 
-        before_text = await page.inner_text("body") if await page.locator("body").count() else ""
+        async def page_text():
+            try:
+                return await page.inner_text("body")
+            except Exception:
+                return ""
 
-        # 1) Önce güvenli claim/daily butonlarını dene
+        before_text = await page_text()
+
         clicked = []
+        # 1) DOM butonlari
         for attempt in range(2):
             buttons = page.locator("button, [role=button], a")
             count = await buttons.count()
@@ -3423,12 +3428,37 @@ async def browser_auto(bot: str, url: str) -> list:
             if clicked:
                 break
 
+        # 2) DOM butonu yoksa canvas dokunma
+        canvas_taps = 0
+        if not clicked:
+            canvas = page.locator("canvas").first
+            if await canvas.count():
+                box = await canvas.bounding_box()
+                if box:
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    # Merkez ve alt-orta dokunma (yaygin claim alani)
+                    taps = [
+                        (cx, cy),
+                        (cx, box["y"] + box["height"] * 0.8),
+                        (cx, box["y"] + box["height"] * 0.65),
+                    ]
+                    for (tx, ty) in taps:
+                        try:
+                            await page.mouse.click(tx, ty)
+                            canvas_taps += 1
+                            await page.wait_for_timeout(3000)
+                        except Exception:
+                            continue
+
         if clicked:
             lines.append(f"Tarayıcıda tıklanan butonlar: {', '.join(clicked[:6])}")
+        elif canvas_taps:
+            lines.append(f"Tarayıcıda canvas dokunması yapıldı: {canvas_taps} kez.")
         else:
-            lines.append("Tarayıcıda güvenli claim/daily butonu bulunamadı.")
+            lines.append("Tarayıcıda güvenli claim/daily butonu veya canvas bulunamadı.")
 
-        after_text = await page.inner_text("body") if await page.locator("body").count() else ""
+        after_text = await page_text()
 
         def nums(t):
             return re.findall(r"\d[\d.,]*", t or "")
@@ -3468,7 +3498,7 @@ async def universal_miniapp(bot: str):
             f"UNIVERSAL MINIAPP başladı: {bot}\n"
             "1) Mini uygulama açılıyor\n"
             "2) Claim/daily yolları taranıyor\n"
-            "3) Gerekirse tarayıcı ile buton tıklaması yapılacak\n"
+            "3) Gerekirse tarayıcı ile buton/canvas tıklaması yapılacak\n"
             "Cüzdan, ödeme, swap, stake ve tehlikeli işlemler otomatik yapılmayacak."
         )
 
@@ -3531,7 +3561,6 @@ async def universal_miniapp(bot: str):
             else:
                 lines.append("Bakiye alanları hiç okunamadı; claim sonucu doğrulanamadı.")
 
-        # Tarayıcı otomasyonu: MyAgeApp gibi canvas/miniapp oyunları için
         blines = await browser_auto(bot, url)
         lines += blines
 
@@ -3558,7 +3587,7 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kullanım: miniapp botadi\n"
             "Örnek: miniapp atomicappbot\n"
             "Sistem mini uygulamayı açar, güvenli claim/daily yollarını dener, "
-            "gerekirse tarayıcı ile buton tıklaması yapar."
+            "gerekirse tarayıcı ile buton/canvas tıklaması yapar."
         )
         return
 
@@ -3583,7 +3612,6 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def miniapp_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Slash'siz 'miniapp botadi' yazimini da yakalar."""
     text = (update.effective_message.text or "").strip()
     parts = text.split()
     context.args = parts[1:]
