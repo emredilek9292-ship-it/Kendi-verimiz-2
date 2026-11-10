@@ -3217,51 +3217,29 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-from decimal import Decimal, InvalidOperation
-
-def v82_amount(raw):
-    raw=raw.strip().replace(" ","").replace("\u00a0","")
-    if not re.fullmatch(r"\d+(?:[.,]\d+)?",raw):
-        return None
-    if re.search(r"[.,]\d{3}$",raw):
-        return None  # Binlik/ondalik ayraci belirsiz: tahmin etme.
+async def v83_snapshot(page):
     try:
-        return Decimal(raw.replace(",","."))
-    except InvalidOperation:
-        return None
-
-def v82_fields(text):
-    labels={"balance":r"(?:balance|total balance|bakiye|toplam bakiye)",
-            "vault":r"(?:vault|kasa|claimable|available to claim)"}
-    fields={}
-    for key,label in labels.items():
-        pattern=r"^\s*"+label+r"\s*[:=]?\s*(?:\n\s*)?([0-9][0-9., \u00a0]*)(?:\s*(?:AGE|\$AGE))?\s*$"
-        matches=re.findall(pattern,text or "",re.I|re.M)
-        values=[v82_amount(x) for x in matches]
-        if len(values)==1 and values[0] is not None:
-            fields[key]=values[0]
-    return fields
-
-async def v8_read_screen(page):
-    try:
-        text=await page.locator("body").inner_text(timeout=3000)
-        return v82_fields(text)
+        rows=await page.evaluate("""() => Array.from(document.querySelectorAll('body *'))
+          .filter(e => e.children.length === 0 && e.getClientRects().length && !['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(e.tagName))
+          .map(e => (e.innerText || '').trim())
+          .filter(t => /[0-9]/.test(t) && t.length <= 100)
+          .map(t => t.replace(/\b[0-9]{6,}\b/g,'[uzun sayi gizlendi]'))
+          .slice(0,40)""")
+        return rows
     except Exception:
-        return {}
+        return []
 
-async def v8_verify_claim(before,after):
-    notes=["Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi."]
-    if "balance" in before and "balance" in after:
-        b,a=before["balance"],after["balance"]
-        notes.append(f"Ekran bakiyesi: {b} -> {a}; fark: {a-b}.")
-    if "vault" in before and "vault" in after:
-        notes.append(f"Ekran kasasi: {before['vault']} -> {after['vault']}.")
-    complete=all(k in before and k in after for k in ("balance","vault"))
-    if complete and before["vault"]>0 and after["vault"]==0 and after["balance"]>before["balance"]:
-        notes.append("Ekran kontrolu: kasa sifirlandi ve bakiye artti; toplama dogrulandi.")
-    else:
-        notes.append("Toplama otomatik dogrulanamadi: etiketler/sayi bicimi okunamadi veya beklenen iki degisim birlikte gorulmedi. Basarili kabul edilmedi; tekrar tiklanmadi.")
-    return notes
+async def v83_compare(before,after):
+    # Sayi veya etiket tahminiyle basari karari verilmez.
+    if before == after:
+        return ["Gorunur sayisal alanlarda degisim saptanmadi; odul dogrulanmadi."]
+    changed=[]
+    for i in range(max(len(before),len(after))):
+        b=before[i] if i<len(before) else '(yok)'
+        a=after[i] if i<len(after) else '(yok)'
+        if b!=a:
+            changed.append(f"Alan {i+1}: {b} -> {a}")
+    return ["Ekrandaki sayisal metin degisimleri (kasa/bakiye oldugu varsayilmadi):"]+changed[:12]+["Alanlar henuz kesin eslestirilmedi; otomatik odul dogrulamasi yapilmadi. Tekrar tiklanmadi."]
 
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
@@ -3362,15 +3340,16 @@ async def v8_browser(name,url,state):
                 return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
             if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
                 return notes+["Claim baglami degisti; tiklanmadi."]
+            before=await v83_snapshot(page)
             state["stage"]="claim_tiklama"
-            before=await v8_read_screen(page)
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
             except PWTimeout:
                 return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
             await page.wait_for_timeout(3000)
-            after=await v8_read_screen(page)
-            notes.extend(await v8_verify_claim(before,after))
+            notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
+            after=await v83_snapshot(page)
+            notes.extend(await v83_compare(before,after))
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
