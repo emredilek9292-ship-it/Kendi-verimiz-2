@@ -3184,7 +3184,7 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 # ============================================================
-# V21 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v8
+# V22 - UNIVERSAL MINIAPP ENGINE + BROWSER AUTOMATION v9
 # MyAgeApp gibi DOM tabanli mini uygulamalar icin saglam otomasyon.
 # "miniapp botadi" (slash'siz) ve "/miniapp botadi" ikisi de calisir.
 # ============================================================
@@ -3410,7 +3410,7 @@ def parse_balance_from_text(text: str):
 async def browser_auto(bot: str, url: str) -> list:
     """Mini uygulamayı gerçek tarayıcıda açar; JS ile güvenli butonları tıklar.
 
-    Network isteklerini de yakalar; claim/daily API çağrılarını raporlar.
+    /api/tasks cevabi otomatik yakalanir; EARN AGE sonrasi butun buton metinleri raporlanir.
     """
     lines = []
     browser = await get_browser()
@@ -3427,6 +3427,26 @@ async def browser_auto(bot: str, url: str) -> list:
     page = await context.new_page()
 
     api_calls = []
+    captured = {}
+
+    def on_response(resp):
+        u = resp.url
+        if any(k in u for k in ("/api/tasks", "/api/session")):
+            try:
+                captured[u] = {"status": resp.status, "text": ""}
+            except Exception:
+                pass
+
+    async def read_captured():
+        # response body'yi async olarak okuyabilmek icin ayri fonksiyon
+        for u in list(captured.keys()):
+            try:
+                r = await page.request.get(u)
+                captured[u]["text"] = (await r.text())[:4000]
+            except Exception:
+                pass
+
+    page.on("response", on_response)
 
     def on_request(req):
         u = req.url
@@ -3474,18 +3494,24 @@ async def browser_auto(bot: str, url: str) -> list:
             await page.wait_for_timeout(max_wait)
         return label
 
-    async def page_fetch(path: str):
+    async def dump_buttons():
         try:
             return await page.evaluate(
-                """async (p) => {
-                    const r = await fetch(p, {credentials: 'include'});
-                    const t = await r.text();
-                    return {status: r.status, text: t.slice(0, 4000)};
-                }""",
-                path,
+                """() => {
+                    const els = Array.from(document.querySelectorAll('button, a, [role=button], div, span'));
+                    const out = [];
+                    for (const el of els) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (!t || t.length > 40) continue;
+                        if (out.includes(t)) continue;
+                        out.push(t);
+                        if (out.length >= 40) break;
+                    }
+                    return out;
+                }"""
             )
-        except Exception as e:
-            return {"status": 0, "text": f"{type(e).__name__} {e}"}
+        except Exception:
+            return []
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -3527,22 +3553,26 @@ async def browser_auto(bot: str, url: str) -> list:
                 lines.append(f"Sekme butonu: {res}")
                 break
 
-        # 3) /api/tasks icerigini sayfa icinden oku
-        tasks = await page_fetch("/api/tasks")
-        lines.append(f"/api/tasks durumu: {tasks.get('status')}")
-        ttxt = tasks.get("text") or ""
-        lines.append("Tasks JSON özeti: " + re.sub(r"\s+", " ", ttxt)[:600])
+        # 3) /api/tasks cevabini yakala
+        await read_captured()
+        for u, info in captured.items():
+            if "/api/tasks" in u:
+                lines.append(f"/api/tasks durumu: {info['status']}")
+                lines.append("Tasks JSON özeti: " + re.sub(r"\s+", " ", info["text"])[:800])
 
-        # 4) Claim/Collect/Reward butonu (Balance hariç)
-        claim_btn = await js_click(
-            r"\b(claim|collect|daily|check[- ]?in|reward|bonus|harvest|\u00f6d\u00fcl|g\u00fcnl\u00fck)\b"
-        )
-        if claim_btn:
-            lines.append(f"Claim butonu: {claim_btn}")
-        else:
-            lines.append("Claim/Daily/Collect butonu bulunamadı.")
+        # 4) EARN AGE sonrasi butun tiklanabilir metinler
+        labels = await dump_buttons()
+        if labels:
+            lines.append("Görünür buton metinleri: " + " | ".join(labels[:25]))
 
-        await page.wait_for_timeout(3000)
+        # 5) Gorev butonlari (Start/Check/Go/Open)
+        for pat in [r"\b(start|check|go|open)\b", r"\b(claim|collect|reward|bonus|daily|check[- ]?in)\b"]:
+            res = await js_click(pat)
+            if res:
+                lines.append(f"Tıklanan buton: {res}")
+                await page.wait_for_timeout(3000)
+
+        await page.wait_for_timeout(2000)
         await shot(f"{bot} - işlem sonrası ekran")
 
         body_after = ""
