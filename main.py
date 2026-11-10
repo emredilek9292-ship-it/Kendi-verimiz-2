@@ -3217,6 +3217,52 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
+from decimal import Decimal, InvalidOperation
+
+def v82_amount(raw):
+    raw=raw.strip().replace(" ","").replace("\u00a0","")
+    if not re.fullmatch(r"\d+(?:[.,]\d+)?",raw):
+        return None
+    if re.search(r"[.,]\d{3}$",raw):
+        return None  # Binlik/ondalik ayraci belirsiz: tahmin etme.
+    try:
+        return Decimal(raw.replace(",","."))
+    except InvalidOperation:
+        return None
+
+def v82_fields(text):
+    labels={"balance":r"(?:balance|total balance|bakiye|toplam bakiye)",
+            "vault":r"(?:vault|kasa|claimable|available to claim)"}
+    fields={}
+    for key,label in labels.items():
+        pattern=r"^\s*"+label+r"\s*[:=]?\s*(?:\n\s*)?([0-9][0-9., \u00a0]*)(?:\s*(?:AGE|\$AGE))?\s*$"
+        matches=re.findall(pattern,text or "",re.I|re.M)
+        values=[v82_amount(x) for x in matches]
+        if len(values)==1 and values[0] is not None:
+            fields[key]=values[0]
+    return fields
+
+async def v8_read_screen(page):
+    try:
+        text=await page.locator("body").inner_text(timeout=3000)
+        return v82_fields(text)
+    except Exception:
+        return {}
+
+async def v8_verify_claim(before,after):
+    notes=["Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi."]
+    if "balance" in before and "balance" in after:
+        b,a=before["balance"],after["balance"]
+        notes.append(f"Ekran bakiyesi: {b} -> {a}; fark: {a-b}.")
+    if "vault" in before and "vault" in after:
+        notes.append(f"Ekran kasasi: {before['vault']} -> {after['vault']}.")
+    complete=all(k in before and k in after for k in ("balance","vault"))
+    if complete and before["vault"]>0 and after["vault"]==0 and after["balance"]>before["balance"]:
+        notes.append("Ekran kontrolu: kasa sifirlandi ve bakiye artti; toplama dogrulandi.")
+    else:
+        notes.append("Toplama otomatik dogrulanamadi: etiketler/sayi bicimi okunamadi veya beklenen iki degisim birlikte gorulmedi. Basarili kabul edilmedi; tekrar tiklanmadi.")
+    return notes
+
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
     if not await v8_public(url):
@@ -3317,12 +3363,14 @@ async def v8_browser(name,url,state):
             if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
                 return notes+["Claim baglami degisti; tiklanmadi."]
             state["stage"]="claim_tiklama"
+            before=await v8_read_screen(page)
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
             except PWTimeout:
                 return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
             await page.wait_for_timeout(3000)
-            notes.append("Claim tiklamasi tamamlandi. Odul miktari veya bakiye artisi dogrulanmadi; toplandi kabul edilmedi.")
+            after=await v8_read_screen(page)
+            notes.extend(await v8_verify_claim(before,after))
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
@@ -3429,29 +3477,6 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
         "Bot sahibinin ozel sohbetinden @MyAgeApp gonder. Otomatik tekrar/rutin/otopilot kapali. dur ile iptal et.")
 
 
-
-# V8.1: V8 tarayici ve claim akisi degistirilmeden miniapp komutu eklenir.
-async def cmd_miniapp_v81(update, context):
-    if (not update.effective_user or update.effective_user.id != ADMIN_USER_ID
-            or not update.effective_chat or update.effective_chat.type != "private"):
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Kullanim: /miniapp MyAgeApp veya miniapp MyAgeApp")
-        return
-    targets = parse_link_targets(" ".join(context.args))
-    if len(targets) != 1:
-        await update.effective_message.reply_text("Tek bir mini uygulama adi veya Telegram linki gonder.")
-        return
-    name, short, start = targets[0]
-    if name.lower() != "myageapp":
-        await update.effective_message.reply_text("Bu surum yalniz MyAgeApp'in V8 claim akisini destekler; baska uygulamada islem yapilmadi.")
-        return
-    await autolink(name, short, start)
-
-async def miniapp_text_v81(update, context):
-    context.args = (update.effective_message.text or "").strip().split()[1:]
-    await cmd_miniapp_v81(update, context)
-
 async def main():
     global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK, APP_LOCK
 
@@ -3517,8 +3542,6 @@ async def main():
     tg_client.add_event_handler(on_group_message, events.NewMessage(incoming=True))
 
     bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("miniapp", cmd_miniapp_v81))
-    bot_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"(?i)^\s*miniapp\b"), miniapp_text_v81))
     bot_app.add_handler(CommandHandler("start", cmd_start))
     bot_app.add_handler(CommandHandler("help", cmd_help))
     bot_app.add_handler(CommandHandler("yardim", cmd_help))
