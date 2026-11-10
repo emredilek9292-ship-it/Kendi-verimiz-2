@@ -3217,29 +3217,42 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-async def v83_snapshot(page):
+async def v84_snapshot(page):
+    # Görünür, kısa ve sayı içeren metinleri sırayla toplar.
+    # Zamanlayıcılar hariç tutulur; kasa ve bakiye alanları karışmasın.
     try:
         rows=await page.evaluate("""() => Array.from(document.querySelectorAll('body *'))
           .filter(e => e.children.length === 0 && e.getClientRects().length && !['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(e.tagName))
           .map(e => (e.innerText || '').trim())
-          .filter(t => /[0-9]/.test(t) && t.length <= 100)
+          .filter(t => /[0-9]/.test(t) && t.length <= 100 && !/\b\d+[d]\s+\d{1,2}:\d{2}:\d{2}\b/.test(t) && !/^\d{1,2}:\d{2}:\d{2}$/.test(t))
           .map(t => t.replace(/\b[0-9]{6,}\b/g,'[uzun sayi gizlendi]'))
           .slice(0,40)""")
         return rows
     except Exception:
         return []
 
-async def v83_compare(before,after):
-    # Sayi veya etiket tahminiyle basari karari verilmez.
-    if before == after:
-        return ["Gorunur sayisal alanlarda degisim saptanmadi; odul dogrulanmadi."]
-    changed=[]
-    for i in range(max(len(before),len(after))):
-        b=before[i] if i<len(before) else '(yok)'
-        a=after[i] if i<len(after) else '(yok)'
-        if b!=a:
-            changed.append(f"Alan {i+1}: {b} -> {a}")
-    return ["Ekrandaki sayisal metin degisimleri (kasa/bakiye oldugu varsayilmadi):"]+changed[:12]+["Alanlar henuz kesin eslestirilmedi; otomatik odul dogrulamasi yapilmadi. Tekrar tiklanmadi."]
+async def v84_verify(before,after):
+    # MyAgeApp'te gözlemlenen eşleşme: kasa Alan 14, bakiye Alan 1.
+    # Başarı ancak kasa 0'a iner ve bakiye artarsa kabul edilir.
+    def get(rows,i):
+        return rows[i-1] if 0 <= i-1 < len(rows) else None
+    def num(s):
+        try:
+            return float((s or '').replace(',','').strip())
+        except Exception:
+            return None
+    kasa_b=num(get(before,14)); kasa_a=num(get(after,14))
+    bak_b=num(get(before,1)); bak_a=num(get(after,1))
+    notes=[]
+    if kasa_b is None or kasa_a is None or bak_b is None or bak_a is None:
+        notes.append("Kasa/bakiye alanlari okunamadi; otomatik toplama dogrulanamadi.")
+        return notes
+    notes.append(f"Kasa: {kasa_b:g} -> {kasa_a:g}; bakiye: {bak_b:g} -> {bak_a:g}.")
+    if kasa_b>0 and kasa_a==0 and bak_a>bak_b:
+        notes.append("Kasa sifirlandi ve bakiye artti; toplama dogrulandi.")
+    else:
+        notes.append("Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.")
+    return notes
 
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
@@ -3340,7 +3353,7 @@ async def v8_browser(name,url,state):
                 return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
             if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
                 return notes+["Claim baglami degisti; tiklanmadi."]
-            before=await v83_snapshot(page)
+            before=await v84_snapshot(page)
             state["stage"]="claim_tiklama"
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
@@ -3348,8 +3361,8 @@ async def v8_browser(name,url,state):
                 return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
-            after=await v83_snapshot(page)
-            notes.extend(await v83_compare(before,after))
+            after=await v84_snapshot(page)
+            notes.extend(await v84_verify(before,after))
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
