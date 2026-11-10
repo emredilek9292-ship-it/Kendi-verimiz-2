@@ -3239,14 +3239,40 @@ def v88_diff_report(before,after):
     if not b and not a:
         notes.append("Sayisal ekran satiri okunamadi.")
         return notes
-    # Ayni sirada karsilastirilabilir en fazla 12 satir.
     for i in range(min(len(b),len(a),12)):
         if b[i]!=a[i]:
             notes.append(f"Satir {i+1}: {b[i]} -> {a[i]}")
     if len(b)!=len(a):
         notes.append(f"Satir sayisi degisti: {len(b)} -> {len(a)}.")
-    if not any(f"Satir" in n for n in notes):
+    if not any("Satir" in n for n in notes):
         notes.append("Gorunur sayisal satirlarda degisim saptanmadi.")
+    return notes
+
+def v89_balance_check(before,after):
+    # MyAgeApp'te gozlemlenen bakiye satiri: Satir 7.
+    # Bu surum yalnizca bakiye artisini raporlar; kasa satiri yoksa ayri not verir.
+    def line(text,i):
+        try:
+            return (text or "").splitlines()[i-1].strip()
+        except Exception:
+            return ""
+    def amount(s):
+        try:
+            return float(s.replace(',',''))
+        except Exception:
+            return None
+    b=amount(line(before,7))
+    a=amount(line(after,7))
+    notes=[]
+    if b is None or a is None:
+        notes.append("Bakiye satiri (Satir 7) okunamadi; bakiye kontrolu yapilmadi.")
+        return notes
+    if a>b:
+        notes.append(f"Bakiye artti: {b:g} -> {a:g}; toplama muhtemel.")
+    elif a==b:
+        notes.append(f"Bakiye degismedi: {b:g} -> {a:g}.")
+    else:
+        notes.append(f"Bakiye azaldi: {b:g} -> {a:g}.")
     return notes
 
 async def v8_browser(name,url,state):
@@ -3358,6 +3384,7 @@ async def v8_browser(name,url,state):
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v88_screen_text(page)
             notes.extend(v88_diff_report(before_text,after_text))
+            notes.extend(v89_balance_check(before_text,after_text))
             notes.append("Otomatik odul dogrulamasi yapilmadi; ekran metni yalnizca teshis icin raporlanir.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
