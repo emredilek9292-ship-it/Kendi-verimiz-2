@@ -3276,8 +3276,8 @@ def v814_verify(before,after):
         notes.append('Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.')
     return notes
 
-async def v815_find_claim(page):
-    # Claim butonunu metin bazli arar; rastgele secmez. Birden fazla aday varsa durur.
+async def v816_find_claim(page):
+    # Claim, Vault kutusunun sagindaki ayri ogge. Metin bazli arar; rastgele secmez.
     labels=["claim","claim now","collect","get","start","open"]
     candidates=[]
     for label in labels:
@@ -3378,7 +3378,7 @@ async def v8_browser(name,url,state):
                 if await dialogs.nth(i).is_visible():
                     return notes+["Baska bir pencere hala acik; claim denenmedi."]
             state["stage"]="claim_bulma"
-            found=await v815_find_claim(page)
+            found=await v816_find_claim(page)
             if not found:
                 return notes+["Tek bir claim adayi bulunamadi; rastgele secim yapilmadi."]
             label,el=found
