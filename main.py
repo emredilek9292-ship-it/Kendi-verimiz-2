@@ -1,5 +1,5 @@
 """
-Airdrop / oyun bot radari (v3 + Groq + V8.29 evrensel mini app motoru — döngü korumalı)
+Airdrop / oyun bot radari (v3 + Groq + V8.30 evrensel mini app motoru — tüm görevler)
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -4655,17 +4655,17 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
 #  - "otopilot tara": hesabındaki mini uygulamalı tüm botları bulup listeye ekler.
 # =====================================================================
 
-UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "30") or 30)      # bir turda en fazla tıklama
-UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "170") or 170)          # bir bot için tarayıcı süresi (sn)
-UNI_TABS = int(os.getenv("UNI_TABS", "6") or 6)                      # gezilecek en fazla sekme
+UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "80") or 80)      # bir turda en fazla tıklama
+UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "300") or 300)          # bir bot için tarayıcı süresi (sn)
+UNI_TABS = int(os.getenv("UNI_TABS", "8") or 8)                      # gezilecek en fazla sekme
 UNI_TAPS = int(os.getenv("UNI_TAPS", "30") or 30)                    # tapper oyunlarında dokunma (0 = kapalı)
 UNI_JOIN = os.getenv("UNI_JOIN", "1").strip() != "0"                 # görev kanallarına katıl
-UNI_JOIN_MAX = int(os.getenv("UNI_JOIN_MAX", "6") or 6)              # bir turda en fazla katılım
+UNI_JOIN_MAX = int(os.getenv("UNI_JOIN_MAX", "12") or 12)              # bir turda en fazla katılım
 UNI_ADS = os.getenv("UNI_ADS", "0").strip() == "1"                   # "reklam izle" görevleri
 UNI_BOT_START = os.getenv("UNI_BOT_START", "0").strip() == "1"       # görevdeki başka botlara /start
 UNI_FAIL_PAUSE = int(os.getenv("UNI_FAIL_PAUSE", "5") or 5)          # üst üste bu kadar hata → bot beklemeye
 UNI_STATE_DIR = os.getenv("UNI_STATE_DIR", "/tmp/uni_state")
-V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "420") or 420)
+V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "600") or 600)
 
 V8_AP.setdefault("auto_add", False)   # radar yeni mini app bulunca listeye eklesin mi
 V8_AP.setdefault("per", {})           # bot başına istatistik {bot: {ok,skip,err,fail,last}}
@@ -4713,10 +4713,20 @@ UNI_DISMISS_RE = re.compile(
 )
 UNI_SAFE_DISMISS_RE = re.compile(r"^(?:close|skip|later|not now|maybe later|×|✕|✖|x|kapat|ge[çc]|atla|закрыть|пропустить)$", re.I)
 UNI_NAV_RE = re.compile(
-    r"^(?:earn|tasks?|quests?|missions?|bonus(?:es)?|rewards?|daily|airdrop|challenges?|"
+    r"^(?:earn|earnings?|tasks?|quests?|missions?|bonus(?:es)?|rewards?|daily|daily tasks|airdrop|challenges?|"
+    r"free|events?|activit(?:y|ies)|social|partners?|special|offers?|achievements?|"
     r"g[öo]rev(?:ler)?|kazan|[öo]d[üu]l(?:ler)?|bonus|задания|заработ\w*|награды|квесты)$",
     re.I,
 )
+UNI_TASK_VERB_RE = re.compile(
+    r"\b(?:join|subscribe|follow|visit|watch|play|open|start|launch|check out|explore|try|read|"
+    r"telegram|channel|chat|group|community|twitter|\bx\b|youtube|tiktok|instagram|discord|website|partner|"
+    r"kat[ıi]l|abone|takip|ziyaret|izle|oyna|kanal|sohbet|grup|"
+    r"подпиш|вступ|перейд|канал|чат|смотр)\w*",
+    re.I,
+)
+UNI_AMOUNT_RE = re.compile(r"^\+?\s*[\d.,]+\s*[kKmMbB]?\s*[A-Za-z$]{0,8}\s*[→>›»]?$")
+UNI_DONE_RE = re.compile(r"\b(?:done|completed?|claimed|finished|received|tamamland[ıi]|al[ıi]nd[ıi]|выполнено|получено)\b|✓|✔|✅", re.I)
 UNI_JOIN_SKIP = {"share", "proxy", "socks", "addstickers", "addemoji", "addlist", "boost", "iv", "login",
                  "setlanguage", "addtheme", "confirmphone", "c", "s", "joinchat"}
 UNI_BOT_NAME_RISK = re.compile(
@@ -4866,8 +4876,9 @@ UNI_SHIM_JS = r"""
       if (!text) {
         const cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className || '');
         if (/close|dismiss/i.test(cls)) text = 'close';
+        else if (r.width <= 90 && r.height <= 90) text = '[ikon]';   // ok / chevron / play simgesi
       }
-      if (!text || text.length > 60) continue;
+      if (!text || text.length > 140) continue;
       // üstte başka öğe mi var?
       const inView = r.top >= 0 && r.bottom <= vh && r.left >= 0 && r.right <= vw;
       let covered = false;
@@ -4890,14 +4901,17 @@ UNI_SHIM_JS = r"""
         if (t.length > text.length + 2) { ctx = t.slice(0, 300); if (t.length >= 10) break; }
       }
       // anahtar: sayılar normalize (sürekli artan sayaç aynı butonu 'yeni' göstermesin)
-      const norm = (v) => v.replace(/[\d][\d.,:\s]*/g, '#');
+      const norm = (v) => v.replace(/\d+(?:[.,:]\d+)+|\d{3,}/g, '#');
       const key = norm(text) + '|' + norm(ctx).slice(0, 120);
+      let rowEl = el, q = el.parentElement;
+      for (let i = 0; q && i < 4; i++, q = q.parentElement) { if (getComputedStyle(q).cursor === 'pointer' && (q.innerText || '').length < 200) rowEl = q; else break; }
+      const row = norm((rowEl.innerText || '').replace(/\s+/g, ' ').trim()).slice(0, 90);
       if (seen.has(key + Math.round(r.top))) continue;
       seen.add(key + Math.round(r.top));
       const id = 'u' + (++U.seq);
       el.setAttribute('data-uni', id);
-      out.push({ id, text, ctx, key, tag, x: r.left, y: r.top, w: r.width, h: r.height,
-        bottom: r.top > vh * 0.78, overlay: isOverlay(el), tab: (el.getAttribute('role') || '') === 'tab' });
+      out.push({ id, text, ctx, key, row, tag, x: r.left, y: r.top, w: r.width, h: r.height,
+        bottom: r.top > vh * 0.78, overlay: isOverlay(el), tab: (el.getAttribute('role') || '') === 'tab' || /\btab\b|chip|segment/i.test(String(el.className || '')) });
     }
     return out;
   };
@@ -5025,9 +5039,19 @@ async def uni_screen(page) -> str:
 
 async def uni_scan(page) -> list:
     try:
-        return await page.evaluate("() => window.__uni ? window.__uni.scan() : []") or []
+        cands = await page.evaluate("() => window.__uni ? window.__uni.scan() : []") or []
     except Exception:
         return []
+    # alt menü çubuğu: ekranın altında aynı hizada 3+ öğe → sadece sekme olarak kullanılır
+    rows = {}
+    for c in cands:
+        if c.get("bottom") and not c.get("overlay"):
+            rows.setdefault(round(c["y"] / 12), []).append(c)
+    for grp in rows.values():
+        if len(grp) >= 3 and all(c["h"] < 110 for c in grp):
+            for c in grp:
+                c["navbar"] = True
+    return cands
 
 
 async def uni_drain(page) -> dict:
@@ -5043,7 +5067,12 @@ def uni_classify(c: dict) -> str:
     both = text + " " + ctx
     if UNI_RISK_RE.search(text):
         return "risk"
-    if (c.get("bottom") or c.get("tab")) and UNI_NAV_RE.match(text):
+    navtext = re.sub(r"[\d+]+", "", text).strip()
+    if c.get("navbar"):
+        if UNI_SKIP_RE.search(text):
+            return "skip"
+        return "nav" if UNI_NAV_RE.match(navtext) else "tabx"
+    if (c.get("bottom") or c.get("tab")) and UNI_NAV_RE.match(navtext):
         return "nav"
     if UNI_RISK_RE.search(ctx) and len(ctx) < 200:
         return "risk"
@@ -5062,10 +5091,20 @@ def uni_classify(c: dict) -> str:
         return "check"
     if UNI_GO_RE.match(text):
         return "go"
-    if (c.get("bottom") or c.get("tab")) and UNI_NAV_RE.match(text):
+    if UNI_NAV_RE.match(navtext) and len(navtext) <= 14:
         return "nav"
-    if UNI_NAV_RE.match(text) and len(text) <= 12:
-        return "nav"
+    if c.get("tab"):
+        return "tabx"   # bilinmeyen sekme: ana menüde görev sekmesi bulunamazsa gezilir
+    # görev satırı: satırın kendisi, '+500' gibi ödül butonu ya da ok simgesi
+    rowtxt = text if text != "[ikon]" else ""
+    if UNI_DONE_RE.search(text) or (UNI_DONE_RE.search(ctx[:80]) and len(ctx) < 120):
+        return ""
+    if text == "[ikon]" and UNI_TASK_VERB_RE.search(ctx[:160]):
+        return "task"
+    if UNI_AMOUNT_RE.match(text) and UNI_TASK_VERB_RE.search(ctx[:160]):
+        return "task"
+    if 8 <= len(rowtxt) <= 140 and UNI_TASK_VERB_RE.search(rowtxt):
+        return "task"
     return ""
 
 
@@ -5099,7 +5138,7 @@ async def uni_handle_links(page, name: str, run: dict, notes: list):
     urls += list(run["navq"])
     run["navq"].clear()
     if not urls:
-        return
+        return 0
     tg = [u for u in urls if uni_tme_from_nav(u) or u.startswith("tg:")]
     other = [u for u in urls if u not in tg]
     for u in other[:5]:
@@ -5131,6 +5170,7 @@ async def uni_handle_links(page, name: str, run: dict, notes: list):
                 notes.append(f"@{b} başlatılamadı: {type(e).__name__}")
         else:
             notes.append(f"Görev başka bot istiyor: @{b} (UNI_BOT_START=1 ile otomatik başlatılır).")
+    return len(urls)
 
 
 async def uni_tap(page, notes: list):
@@ -5159,12 +5199,13 @@ async def uni_tap(page, notes: list):
     return n
 
 
-UNI_TEXT_CAP = {"reward": 2, "check": 3, "go": 8, "dismiss": 4}
-UNI_SCREEN_MAX = int(os.getenv("UNI_SCREEN_MAX", "12") or 12)   # tek ekranda en fazla işlem
+UNI_TEXT_CAP = {"reward": 2, "check": 25, "go": 25, "task": 2, "dismiss": 30}
+UNI_SCREEN_MAX = int(os.getenv("UNI_SCREEN_MAX", "12") or 12)   # ana ekranda en fazla işlem
+UNI_TAB_MAX = int(os.getenv("UNI_TAB_MAX", "40") or 40)         # görev sekmesinde en fazla işlem
 
 
 def uni_norm(t: str) -> str:
-    return re.sub(r"\d[\d.,:\s]*", "#", (t or "").strip().lower())
+    return re.sub(r"\s+", " ", re.sub(r"\d+(?:[.,:]\d+)+|\d{3,}", "#", (t or "").strip().lower()))
 
 
 def uni_gain(before: str, after: str) -> bool:
@@ -5185,12 +5226,12 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
     screen_actions = 0
     tcount = run.setdefault("tcount", {})
     recent = []
-    while time.time() < deadline and run["actions"] < UNI_MAX_ACTIONS and screen_actions < UNI_SCREEN_MAX:
+    while time.time() < deadline and run["actions"] < UNI_MAX_ACTIONS and screen_actions < (UNI_SCREEN_MAX if label == "ana" else UNI_TAB_MAX):
         if AUTO_STOP:
             notes.append("Durdurma isteği alındı.")
             return
         cands = await uni_scan(page)
-        groups = {"reward": [], "check": [], "go": [], "dismiss": [], "nav": [], "risk": [], "skip": []}
+        groups = {"reward": [], "check": [], "go": [], "task": [], "dismiss": [], "nav": [], "tabx": [], "risk": [], "skip": []}
         for c in cands:
             k = uni_classify(c)
             if k:
@@ -5210,22 +5251,42 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
                     out.append((k, c))
             return out
 
-        # Öncelik: açık penceredeki ödül/görev > ekrandaki ödül > kontrol > görev > pencere kapat
+        tsig = run.setdefault("task_sig", {})
+
+        def sig_ok(c):
+            sg = c.get("row") or uni_norm(c["text"])
+            st = tsig.get(sg)
+            return st is None or (st["n"] < 2 and not st["eff"])
+
+        ov = lambda lst: [c for c in lst if c.get("overlay")]
+        pg = lambda lst: [c for c in lst if not c.get("overlay")]
         order = []
-        ov_rew = [c for c in groups["reward"] if c.get("overlay")]
-        order += [("reward", x) for x in fresh(ov_rew, "reward")]
-        order += [("reward", x) for x in fresh(groups["reward"], "reward")]
-        if pending_check or run["join_ok"]:
-            order += [("check", x) for x in fresh(groups["check"], "check", limit=2)]
-        order += [("go", x) for x in fresh(groups["go"], "go")]
-        order += [("check", x) for x in fresh(groups["check"], "check", limit=1)]
-        order += [("dismiss", x) for x in fresh(groups["dismiss"], "dismiss", limit=2)]
+        # 1) açık pencere/alt sayfa: ödül > görev(Join/Go) > kontrol > kapat
+        order += [("reward", x) for x in fresh(ov(groups["reward"]), "reward")]
+        order += [("go", x) for x in fresh(ov(groups["go"]), "go")]
+        order += [("check", x) for x in fresh(ov(groups["check"]), "check", limit=2)]
+        ov_dismiss = [("dismiss", x) for x in fresh(ov(groups["dismiss"]), "dismiss", limit=2)]
+        if order or ov_dismiss:
+            order += ov_dismiss
+        else:
+            # 2) sayfa: ödül > (bekleyen) kontrol > görev butonu > görev satırı > kontrol
+            order += [("reward", x) for x in fresh(pg(groups["reward"]), "reward")]
+            if pending_check or run["join_ok"]:
+                order += [("check", x) for x in fresh(pg(groups["check"]), "check", limit=2)]
+            order += [("go", x) for x in fresh(pg(groups["go"]), "go")]
+            if label != "ana" or not groups["reward"]:
+                order += [("task", x) for x in fresh(groups["task"], "task") if sig_ok(x[1])]
+            order += [("check", x) for x in fresh(pg(groups["check"]), "check", limit=1)]
+            order += [("dismiss", x) for x in fresh(groups["dismiss"], "dismiss", limit=2)]
 
         if not order:
             idle += 1
-            if idle >= 2:
+            if idle >= (4 if pending_check else 2):
                 return
-            await page.wait_for_timeout(1500)
+            # bazı görevler 10-30 sn sonra Check/Claim açar
+            await page.wait_for_timeout(7000 if pending_check else 1500)
+            if pending_check:
+                run["clicked"] = {k: v for k, v in run["clicked"].items() if not k.startswith("check:")}
             continue
         idle = 0
         kind, (key, c) = order[0]
@@ -5240,11 +5301,20 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
         screen_actions += 1
         run["log"].append(f"{label}/{kind}: {c['text'][:30]}")
         recent.append(tk)
-        if kind == "go":
+        if kind in ("go", "task"):
             pending_check = True
         await page.wait_for_timeout(2200 if kind != "check" else 3500)
-        await uni_handle_links(page, name, run, notes)
+        nlinks = await uni_handle_links(page, name, run, notes)
         after = await uni_screen(page)
+        if kind == "task":
+            sg = c.get("row") or uni_norm(c["text"])
+            st = tsig.setdefault(sg, {"n": 0, "eff": False})
+            st["n"] += 1
+            try:
+                ov_open = await page.evaluate("() => !!document.querySelector('[role=dialog],[aria-modal=true],dialog[open],[class*=sheet i],[class*=modal i]')")
+            except Exception:
+                ov_open = False
+            st["eff"] = st["eff"] or bool(nlinks) or ov_open
         diff = uni_diff(before, after)
         gained = uni_gain(before, after)
         if diff and gained and kind in ("reward", "check"):
@@ -5256,7 +5326,7 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
         if len(recent) >= 4 and recent[-1] == recent[-3] and recent[-2] == recent[-4]:
             notes.append(f"{label}: tekrar eden döngü ({c['text'][:20]}) algılandı, ekran bırakıldı.")
             return
-        if kind == "go" and run["join_ok"]:
+        if kind in ("go", "task") and run["join_ok"]:
             await page.wait_for_timeout(2500)
 
 
@@ -5280,31 +5350,72 @@ async def uni_flow(page, name, notes, state):
     # sekmeleri gez
     state["stage"] = "uni_sekmeler"
     visited_tabs = set()
+
+    async def scroll_and_work(lab: str):
+        """Uzun görev listelerinde sona kadar kaydırıp her bölümü işle."""
+        try:
+            await page.mouse.move(195, 430)
+        except Exception:
+            pass
+        last = await uni_screen(page)
+        for _s in range(8):
+            if time.time() >= deadline or run["actions"] >= UNI_MAX_ACTIONS or AUTO_STOP:
+                return
+            try:
+                await page.mouse.wheel(0, 700)
+                await page.evaluate("() => { const el = [...document.querySelectorAll('*')].filter(e => e.scrollHeight > e.clientHeight + 40 && /auto|scroll/.test(getComputedStyle(e).overflowY)).sort((a, b) => b.clientHeight - a.clientHeight)[0]; if (el) el.scrollBy(0, 700); else window.scrollBy(0, 700); }")
+            except Exception:
+                pass
+            await page.wait_for_timeout(1200)
+            await uni_work_screen(page, name, run, notes, deadline, lab)
+            cur = await uni_screen(page)
+            if cur == last:
+                return
+            last = cur
+
+    async def work_tab(c, lab: str):
+        if not await uni_click(page, c):
+            return False
+        await page.wait_for_timeout(2500)
+        await uni_handle_links(page, name, run, notes)
+        await uni_work_screen(page, name, run, notes, deadline, lab)
+        await scroll_and_work(lab)
+        return True
+
     for _ in range(UNI_TABS):
         if time.time() >= deadline or run["actions"] >= UNI_MAX_ACTIONS or AUTO_STOP:
             break
         cands = await uni_scan(page)
-        navs = [c for c in cands if uni_classify(c) == "nav" and c["text"].lower() not in visited_tabs]
+        kinds = [(uni_classify(c), c) for c in cands]
+        navs = [c for k, c in kinds if k == "nav" and uni_norm(c["text"]) not in visited_tabs]
+        if not navs:
+            # görev sekmesi adı tanınmadı → alt menüdeki diğer (riskli/davet olmayan) sekmeleri dene
+            navs = [c for k, c in kinds if k == "tabx" and c.get("navbar") and uni_norm(c["text"]) not in visited_tabs]
         if not navs:
             break
-        navs.sort(key=lambda c: (not c.get("bottom"), c["y"]))
+        navs.sort(key=lambda c: (not c.get("bottom"), c["x"], c["y"]))
         tab = navs[0]
-        visited_tabs.add(tab["text"].lower())
-        if not await uni_click(page, tab):
+        lab = tab["text"][:14]
+        visited_tabs.add(uni_norm(tab["text"]))
+        if not await work_tab(tab, lab):
             continue
-        await page.wait_for_timeout(2500)
-        await uni_handle_links(page, name, run, notes)
-        await uni_work_screen(page, name, run, notes, deadline, tab["text"][:12])
-        # sayfayı aşağı kaydırıp tekrar bak (uzun görev listeleri)
-        for _s in range(2):
-            if time.time() >= deadline:
+        # sekme içindeki alt sekmeler (Daily / Social / Partners / In-game ...)
+        for _sub in range(6):
+            if time.time() >= deadline or run["actions"] >= UNI_MAX_ACTIONS or AUTO_STOP:
                 break
-            try:
-                await page.mouse.wheel(0, 900)
-            except Exception:
-                pass
-            await page.wait_for_timeout(1200)
-            await uni_work_screen(page, name, run, notes, deadline, tab["text"][:12])
+            subs = []
+            for c in await uni_scan(page):
+                k = uni_classify(c)
+                if c.get("navbar") or k in ("risk", "skip"):
+                    continue
+                if (c.get("tab") or k == "nav") and uni_norm(c["text"]) not in visited_tabs and c["text"] != "[ikon]":
+                    subs.append(c)
+            if not subs:
+                break
+            subs.sort(key=lambda c: (c["y"], c["x"]))
+            st = subs[0]
+            visited_tabs.add(uni_norm(st["text"]))
+            await work_tab(st, f"{lab}>{st['text'][:10]}")
 
     await uni_handle_links(page, name, run, notes)
     end_text = await uni_screen(page)
@@ -5313,7 +5424,7 @@ async def uni_flow(page, name, notes, state):
     if visited_tabs:
         notes.append("Gezilen sekmeler: " + ", ".join(sorted(visited_tabs))[:200])
     if run["log"]:
-        notes.append(f"Yapılan {run['actions']} işlem: " + " · ".join(run["log"][:20])[:900])
+        notes.append(f"Yapılan {run['actions']} işlem: " + " · ".join(run["log"][:45])[:2500])
     if run["joined"]:
         notes.append(f"Görev kanalları: {run['join_ok']}/{len(run['joined'])} katılım.")
     if run["visited"]:
