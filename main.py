@@ -3464,6 +3464,249 @@ async def v8_find_safe_claim(page):
     return None
 
 
+
+def v8_pxe_parse_holding(text: str):
+    """Üst bardaki HOLDING / coin miktarı (örn. 189)."""
+    if not text:
+        return None
+    # "HOLDING 189" veya satırda tek başına büyük sayı + yakında PXE
+    m = re.search(r"HOLDING\s*(\d+(?:[.,]\d+)?)", text, re.I)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if re.fullmatch(r"\d{2,6}", ln.replace(",", "")):
+            # üst bar: avatar adı sonrası coin
+            window = " ".join(lines[max(0, i - 2): i + 3]).lower()
+            if "holding" in window or "pxe" in window or "jimin" in window:
+                try:
+                    return float(ln.replace(",", ""))
+                except ValueError:
+                    pass
+    return None
+
+
+def v8_pxe_parse_mined(text: str):
+    """Mine edilen miktar (0.0141 gibi). CLAIM'E HAZIR yakını."""
+    if not text:
+        return None
+    m = re.search(r"(?:MINE ED[Iİ]LD[Iİ]|CLAIM['’]?E HAZIR)[^\d]{0,40}(\d+(?:[.,]\d+)?)", text, re.I)
+    if m:
+        try:
+            return float(m.group(1).replace(",", "."))
+        except ValueError:
+            pass
+    m = re.search(r"\b0\.\d{3,6}\b", text)
+    if m:
+        try:
+            return float(m.group(0))
+        except ValueError:
+            pass
+    return None
+
+
+def v8_pxe_risk_label(s: str) -> bool:
+    return bool(re.search(
+        r"wallet|connect|deposit|withdraw|buy\b|purchase|payment|subscribe\s*\$|on-chain|"
+        r"keepeye|cuzdan|cüzdan|odeme|ödeme|sat[iı]n|ucret|ücret|\$pxe\s*on",
+        s or "", re.I,
+    ))
+
+
+async def v8_pxe_click_nav(page, label: str) -> bool:
+    """Alt menü: Upgrade / Earn / Arkadaşlar / Profile / kazma."""
+    for role in ("button", "tab", "link"):
+        loc = page.get_by_role(role, name=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I))
+        try:
+            if await loc.count() >= 1 and await loc.first.is_visible():
+                await loc.first.click(timeout=8000, no_wait_after=True)
+                await page.wait_for_timeout(2000)
+                return True
+        except Exception:
+            pass
+    # metin ile dene
+    loc = page.get_by_text(re.compile(rf"^\s*{re.escape(label)}\s*$", re.I))
+    try:
+        if await loc.count() >= 1 and await loc.first.is_visible():
+            await loc.first.click(timeout=8000, no_wait_after=True)
+            await page.wait_for_timeout(2000)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def v8_pxe_click_claim_mine(page, notes, state) -> bool:
+    """Ana maden ekranındaki büyük Claim butonu."""
+    state["stage"] = "pxe_mine_claim"
+    claim = page.get_by_role("button", name=re.compile(r"^\s*Claim\s*$", re.I))
+    try:
+        n = await claim.count()
+    except Exception:
+        n = 0
+    if n != 1:
+        # bazen sadece text
+        claim = page.get_by_text(re.compile(r"^\s*Claim\s*$", re.I))
+        try:
+            n = await claim.count()
+        except Exception:
+            n = 0
+        if n != 1:
+            notes.append("Maden Claim butonu tek net aday olarak bulunamadı.")
+            return False
+    el = claim.first if hasattr(claim, "first") else claim
+    try:
+        if not await el.is_visible() or not await el.is_enabled():
+            notes.append("Maden Claim görünür/etkin değil.")
+            return False
+        nearby = await el.evaluate(
+            "e => (e.parentElement?.innerText || e.innerText).slice(0,800)", timeout=3000)
+        if v8_pxe_risk_label(nearby):
+            notes.append("Claim çevresinde riskli ifade; basılmadı.")
+            return False
+        before = await v810_screen(page)
+        mined = v8_pxe_parse_mined(before)
+        hold_b = v8_pxe_parse_holding(before)
+        if mined is not None and mined <= 0:
+            notes.append(f"Mine edilen miktar {mined:g}; claim atlandı.")
+            return False
+        await el.scroll_into_view_if_needed(timeout=5000)
+        await el.click(trial=True, timeout=10000)
+        await el.click(timeout=10000, no_wait_after=True)
+        await page.wait_for_timeout(3000)
+        after = await v810_screen(page)
+        hold_a = v8_pxe_parse_holding(after)
+        notes.append("Maden Claim bir kez tıklandı.")
+        if hold_b is not None and hold_a is not None:
+            notes.append(f"HOLDING: {hold_b:g} → {hold_a:g}")
+            if hold_a > hold_b:
+                notes.append("HOLDING arttı → maden toplama doğrulandı.")
+            else:
+                notes.append("HOLDING artışı görülmedi; yine de tıklama yapıldı.")
+        elif mined is not None:
+            notes.append(f"Claim öncesi mine: {mined:g}")
+        return True
+    except Exception as e:
+        notes.append(f"Maden Claim tıklanamadı: {type(e).__name__}")
+        return False
+
+
+async def v8_pxe_click_daily_topla(page, notes, state) -> bool:
+    """Earn > Günlük Ödül > Topla +N"""
+    state["stage"] = "pxe_daily_topla"
+    # Önce Earn sekmesine geç
+    if not await v8_pxe_click_nav(page, "Earn"):
+        notes.append("Earn sekmesine geçilemedi; günlük ödül atlandı.")
+        return False
+    await page.wait_for_timeout(1500)
+    # Topla +11 / Topla +N
+    loc = page.get_by_role("button", name=re.compile(r"^\s*Topla\s*\+?\s*\d*\s*$", re.I))
+    try:
+        n = await loc.count()
+    except Exception:
+        n = 0
+    if n == 0:
+        loc = page.get_by_text(re.compile(r"^\s*Topla\s*\+\s*\d+\s*$", re.I))
+        try:
+            n = await loc.count()
+        except Exception:
+            n = 0
+    if n != 1:
+        notes.append("Günlük 'Topla +N' tek aday olarak yok (zaten alınmış veya kapalı).")
+        return False
+    el = loc.first
+    try:
+        if not await el.is_visible() or not await el.is_enabled():
+            notes.append("Topla butonu görünür/etkin değil.")
+            return False
+        nearby = await el.evaluate(
+            "e => (e.parentElement?.parentElement?.innerText || e.innerText).slice(0,1000)", timeout=3000)
+        if v8_pxe_risk_label(nearby):
+            notes.append("Topla çevresinde riskli ifade; basılmadı.")
+            return False
+        before = await v810_screen(page)
+        hold_b = v8_pxe_parse_holding(before)
+        await el.click(trial=True, timeout=10000)
+        await el.click(timeout=10000, no_wait_after=True)
+        await page.wait_for_timeout(3000)
+        after = await v810_screen(page)
+        hold_a = v8_pxe_parse_holding(after)
+        notes.append("Günlük ödül Topla bir kez tıklandı.")
+        if hold_b is not None and hold_a is not None:
+            notes.append(f"HOLDING (günlük): {hold_b:g} → {hold_a:g}")
+            if hold_a > hold_b:
+                notes.append("Günlük ödül doğrulandı (HOLDING arttı).")
+        return True
+    except Exception as e:
+        notes.append(f"Topla tıklanamadı: {type(e).__name__}")
+        return False
+
+
+async def v8_pxe_scan_tasks(page, notes, state):
+    """Earn ekranındaki görevleri oku; tehlikelilere basma, güvenli olanları listele."""
+    state["stage"] = "pxe_task_scan"
+    text = await v810_screen(page)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    safe, risky, share = [], [], []
+    blob = "\n".join(lines)
+    # kaba sınıflandırma
+    for ln in lines:
+        low = ln.lower()
+        if v8_pxe_risk_label(ln):
+            risky.append(ln)
+        elif any(k in low for k in ("paylaş", "story", "share", "verify")):
+            share.append(ln)
+        elif any(k in low for k in ("katıl", "katil", "duyuru", "sohbet", "kanal", "vote", "react", "reklam", "izle")):
+            safe.append(ln)
+    if safe:
+        notes.append("Güvenli/topluluk görevleri (otomatik basılmadı): " + " · ".join(safe[:8])[:400])
+    if share:
+        notes.append("Paylaşım/Verify görevleri (story manuel): " + " · ".join(share[:6])[:300])
+    if risky:
+        uniq = list(dict.fromkeys(risky))[:6]
+        notes.append("Atlandı (cüzdan/ödeme/satın): " + " · ".join(uniq)[:300])
+    notes.append(
+        "Not: Kanal katıl / story paylaş / reklam izle mini app içinde tam otomatik değil. "
+        "İstersen kanal linklerini radar /join ile ayrıca ekleriz."
+    )
+
+
+async def v8_pickaxe_flow(page, name, notes, state):
+    """
+    Pickaxe Empire profili:
+      1) Maden Claim (CLAIM'E HAZIR)
+      2) Earn > Günlük Topla +N
+      3) Görev listesini raporla (BUY/PAYMENT/ON-CHAIN'e basma)
+    """
+    notes.append("Pickaxe Empire profili devrede.")
+    # Bilinmeyen modal varsa dokunma
+    state["stage"] = "pxe_dialog"
+    dialogs = page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
+    for i in range(min(await dialogs.count(), 8)):
+        if await dialogs.nth(i).is_visible():
+            notes.append("Açık diyalog var; Pickaxe profili bilinmeyene basmaz. Claim denenmedi.")
+            return notes
+
+    # Ana ekranda claim dene (genelde maden ana sayfa)
+    await v8_pxe_click_claim_mine(page, notes, state)
+
+    # Günlük ödül
+    await v8_pxe_click_daily_topla(page, notes, state)
+
+    # Görev taraması (Earn'de kalmış olmalı)
+    try:
+        await v8_pxe_scan_tasks(page, notes, state)
+    except Exception as e:
+        notes.append(f"Görev taraması: {type(e).__name__}")
+
+    notes.append("Pickaxe: cüzdan, BUY $PXE, payment channel, on-chain holder işlerine basılmaz.")
+    notes.append("Story paylaş / Verify manuel. İkinci tıklama yok.")
+    return notes
+
+
 async def v8_generic_miniap_flow(page, name, notes, state):
     """MyAgeApp dışı mini uygulamalar: bilinmeyen duyuruya basma, tek güvenli claim dene, raporla."""
     state["stage"] = "genel_dialog_kontrol"
@@ -3566,6 +3809,9 @@ async def v8_browser(name,url,state):
             await page.locator("body").wait_for(state="attached",timeout=15000)
             await page.wait_for_timeout(5000)
             notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
+            if name.lower() in ("pickaxeempirebot", "pickaxe_empire_bot"):
+                notes.append("Pickaxe Empire özel profili seçildi.")
+                return await v8_pickaxe_flow(page, name, notes, state)
             if name.lower() != "myageapp":
                 notes.append(f"Genel mini app modu: @{name} (MyAgeApp dışı — bilinmeyen duyuruya basılmaz).")
                 return await v8_generic_miniap_flow(page, name, notes, state)
@@ -3677,6 +3923,9 @@ async def v8_browser(name,url,state):
             await page.locator("body").wait_for(state="attached",timeout=15000)
             await page.wait_for_timeout(5000)
             notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
+            if name.lower() in ("pickaxeempirebot", "pickaxe_empire_bot"):
+                notes.append("Pickaxe Empire özel profili seçildi.")
+                return await v8_pickaxe_flow(page, name, notes, state)
             if name.lower() != "myageapp":
                 notes.append(f"Genel mini app modu: @{name} (MyAgeApp dışı — bilinmeyen duyuruya basılmaz).")
                 return await v8_generic_miniap_flow(page, name, notes, state)
