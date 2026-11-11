@@ -3223,25 +3223,22 @@ async def v810_screen(page):
     except Exception:
         return ''
 
-def v820_find_balance(text):
+def v821_find_balance(text):
     if not text:
         return None
-    for line in text.splitlines():
-        s=line.strip()
-        if not s:
-            continue
-        if s.lower()=='balance':
-            continue
-        if 'balance' in s.lower():
-            m=re.search(r'(\d+(?:[.,]\d+)*)',s)
-            if m:
-                try:
-                    return float(m.group(1).replace(',',''))
-                except Exception:
-                    pass
+    lines=[x.strip() for x in text.splitlines() if x.strip()]
+    for i,line in enumerate(lines):
+        if line.lower()=='balance':
+            # Bakiye degeri Balance'in hemen altindaki sayidir.
+            for j in range(i+1,min(i+4,len(lines))):
+                if re.fullmatch(r'\d+(?:[.,]\d+)*',lines[j]):
+                    try:
+                        return float(lines[j].replace(',',''))
+                    except Exception:
+                        pass
     return None
 
-def v820_find_vault(text):
+def v821_find_vault(text):
     if not text:
         return None
     lines=[x.strip() for x in text.splitlines() if x.strip()]
@@ -3256,12 +3253,12 @@ def v820_find_vault(text):
                         pass
     return None
 
-def v820_verify(before,after):
-    notes=['V8.20: gercek ekran metnine gore bakiye ve kasa okuma.']
-    b=v820_find_balance(before)
-    a=v820_find_balance(after)
-    vb=v820_find_vault(before)
-    va=v820_find_vault(after)
+def v821_verify(before,after):
+    notes=['V8.21: Balance satirinin hemen altindaki sayi bakiye olarak okundu.']
+    b=v821_find_balance(before)
+    a=v821_find_balance(after)
+    vb=v821_find_vault(before)
+    va=v821_find_vault(after)
     if b is None or a is None:
         notes.append('Bakiye etiketi okunamadi; bakiye kontrolu yapilmadi.')
     elif a>b:
@@ -3406,8 +3403,8 @@ async def v8_browser(name,url,state):
             notes.append(f"Claim adayi bulundu ve tiklandi: {label}.")
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
-            notes.extend(v820_verify(before_text,after_text))
-            notes.append("V8.20: bakiye ve kasa etiketleri gercek ekran metnine gore ayarlandi; satir numarasina baglanmadi.")
+            notes.extend(v821_verify(before_text,after_text))
+            notes.append("V8.21: bakiye etiketi Balance satirinin hemen altindaki sayi olarak okundu; satir numarasina baglanmadi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
@@ -3524,8 +3521,8 @@ async def v8_browser(name,url,state):
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
-            notes.extend(v820_verify(before_text,after_text))
-            notes.append("V8.20: bakiye ve kasa etiketleri gercek ekran metnine gore ayarlandi; satir numarasina baglanmadi.")
+            notes.extend(v821_verify(before_text,after_text))
+            notes.append("V8.21: bakiye etiketi Balance satirinin hemen altindaki sayi olarak okundu; satir numarasina baglanmadi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
