@@ -3192,7 +3192,9 @@ V8_AP_FILE = os.getenv("V8_AP_FILE", "/tmp/radar_v8_ap.json")
 # on: otopilot açık mı | min_m/max_m: tur aralığı (dk) | istatistikler
 V8_AP = {
     "on": False,
-    "bot": "myageapp",
+    # Tüm botlar tek otopilot listesinde; turda sırayla gezilir
+    "bots": ["myageapp", "pickaxeempirebot"],
+    "bot": "myageapp",  # geriye uyum: son çalışılan
     "min_m": 45,
     "max_m": 75,
     "last": 0.0,
@@ -3202,6 +3204,7 @@ V8_AP = {
     "last_vault": None,
     "last_bal": None,
     "last_note": "",
+    "cursor": 0,  # listedeki sıradaki bot
 }
 
 
@@ -3242,6 +3245,14 @@ async def load_v8_ap():
           f"ok={V8_AP.get('n_ok')} skip={V8_AP.get('n_skip')} err={V8_AP.get('n_err')}")
 
 
+def v8_ap_bots() -> list:
+    bots = V8_AP.get("bots")
+    if isinstance(bots, list) and bots:
+        return [str(b).lower().lstrip("@") for b in bots if str(b).strip()]
+    b = (V8_AP.get("bot") or "myageapp").lower().lstrip("@")
+    return [b] if b else ["myageapp"]
+
+
 def v8_ap_status_text() -> str:
     on = "AÇIK" if V8_AP.get("on") else "KAPALI"
     last = V8_AP.get("last") or 0
@@ -3249,16 +3260,20 @@ def v8_ap_status_text() -> str:
     if last:
         m = int((time.time() - last) / 60)
         ago = f" | son tur: {m} dk önce"
+    bl = v8_ap_bots()
+    bots_s = ", ".join("@" + x for x in bl) if bl else "(liste boş)"
     return (
         f"V8 Otopilot: {on}\n"
-        f"Bot: @{V8_AP.get('bot', 'myageapp')}\n"
+        f"Botlar: {bots_s}\n"
+        f"Son bot: @{V8_AP.get('bot', '-')}\n"
         f"Aralık: {V8_AP.get('min_m')}-{V8_AP.get('max_m')} dk (rastgele)\n"
         f"Başarılı: {V8_AP.get('n_ok', 0)} | Atlanan: {V8_AP.get('n_skip', 0)} | Hata: {V8_AP.get('n_err', 0)}"
         f"{ago}\n"
         f"Son kasa: {V8_AP.get('last_vault')} | Son bakiye: {V8_AP.get('last_bal')}\n"
         f"Son not: {V8_AP.get('last_note', '')[:120]}\n\n"
-        f"Aç: otopilot aç   |  Kapat: otopilot kapat / dur\n"
-        f"Tek sefer: @botadi veya t.me linki\nOtopilot şu an MyAgeApp odaklı (diğerleri tek sefer)."
+        f"otopilot aç / kapat\n"
+        f"otopilot ekle botadi  |  otopilot sil botadi\n"
+        f"Tek sefer: @botadi"
     )
 
 
@@ -3622,10 +3637,13 @@ async def v8_pxe_click_daily_topla(page, notes, state) -> bool:
         if not await el.is_visible() or not await el.is_enabled():
             notes.append("Topla butonu görünür/etkin değil.")
             return False
-        nearby = await el.evaluate(
-            "e => (e.parentElement?.parentElement?.innerText || e.innerText).slice(0,1000)", timeout=3000)
-        if v8_pxe_risk_label(nearby):
-            notes.append("Topla çevresinde riskli ifade; basılmadı.")
+        # Buton metni Topla ise güvenli say; üst kart metnine bakma (yanlış pozitif oluyordu)
+        try:
+            btn_txt = (await el.inner_text(timeout=2000) or "").strip()
+        except Exception:
+            btn_txt = ""
+        if not re.search(r"topla", btn_txt, re.I):
+            notes.append(f"Topla beklenirken farklı metin: {btn_txt[:40]!r}; basılmadı.")
             return False
         before = await v810_screen(page)
         hold_b = v8_pxe_parse_holding(before)
@@ -3842,9 +3860,12 @@ async def v8_pxe_run_community_tasks(page, notes, state, max_tasks: int = 8):
         notes.append(f"Katılım özeti: {n}/{len(all_targets)} başarılı/zaten üye.")
     elif clicked_labels:
         notes.append(
-            "Satırlara tıklandı ama açık t.me linki yok. "
-            "Bazı görevler uygulamayı Telegram’a yönlendirir; bir sonraki turda ödül düşmüş olabilir."
+            "Satırlara tıklandı ama açık t.me linki yok; bilinen Pickaxe kanallarına yedek katılım deneniyor."
         )
+        # Mini app çoğu zaman Telegram'a yönlendirir; yaygın duyuru/sohbet adları
+        fallbacks = ["PickaxeEmpire", "pickaxeempire", "PickaxeEmpireChat", "pickaxeempirechat"]
+        n = await v8_pxe_do_joins(fallbacks, notes)
+        notes.append(f"Yedek katılım: {n}/{len(fallbacks)} (yanlış kullanıcı adı olursa zararsız hata).")
     else:
         notes.append("Tıklanacak güvenli katılım satırı bulunamadı (hepsi tamamlanmış veya farklı metin).")
 
@@ -3883,6 +3904,202 @@ async def v8_pickaxe_flow(page, name, notes, state):
 
     notes.append("Pickaxe: cüzdan, BUY $PXE, payment channel, on-chain, story/Verify, reklam izle basılmaz.")
     notes.append("Birden fazla güvenli katılım görevi sırayla denendi. İkinci claim tıklaması yok.")
+    return notes
+
+
+
+async def v8_myage_nav(page, label: str) -> bool:
+    for role in ("button", "tab", "link"):
+        loc = page.get_by_role(role, name=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I))
+        try:
+            if await loc.count() >= 1 and await loc.first.is_visible():
+                await loc.first.click(timeout=8000, no_wait_after=True)
+                await page.wait_for_timeout(1500)
+                return True
+        except Exception:
+            pass
+    loc = page.get_by_text(re.compile(rf"^\s*{re.escape(label)}\s*$", re.I))
+    try:
+        if await loc.count() >= 1 and await loc.first.is_visible():
+            await loc.first.click(timeout=8000, no_wait_after=True)
+            await page.wait_for_timeout(1500)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def v8_myage_click_spin(page, notes, state) -> bool:
+    """Home'daki mavi Spin (2h30m). Watch/Locked'a basmaz."""
+    state["stage"] = "myage_spin"
+    # Home'a dön
+    await v8_myage_nav(page, "Home")
+    await page.wait_for_timeout(800)
+    spin = page.get_by_role("button", name=re.compile(r"^\s*Spin\s*$", re.I))
+    try:
+        n = await spin.count()
+    except Exception:
+        n = 0
+    if n == 0:
+        spin = page.get_by_text(re.compile(r"^\s*Spin\s*$", re.I))
+        try:
+            n = await spin.count()
+        except Exception:
+            n = 0
+    if n != 1:
+        notes.append("Spin: tek net buton yok (cooldown veya farklı ekran).")
+        return False
+    el = spin.first
+    try:
+        if not await el.is_visible() or not await el.is_enabled():
+            notes.append("Spin görünür/etkin değil.")
+            return False
+        nearby = await el.evaluate(
+            "e => (e.parentElement?.innerText || e.innerText).slice(0,600)", timeout=3000)
+        if re.search(r"watch|locked|wallet|deposit|premium", nearby or "", re.I):
+            notes.append("Spin çevresi riskli/kilitli; basılmadı.")
+            return False
+        before = await v810_screen(page)
+        bal_b = v821_find_balance(before)
+        await el.click(trial=True, timeout=8000)
+        await el.click(timeout=8000, no_wait_after=True)
+        await page.wait_for_timeout(3500)
+        after = await v810_screen(page)
+        bal_a = v821_find_balance(after)
+        notes.append("Spin bir kez tıklandı.")
+        if bal_b is not None and bal_a is not None:
+            notes.append(f"Spin sonrası bakiye: {bal_b:g} → {bal_a:g}")
+        return True
+    except Exception as e:
+        notes.append(f"Spin tıklanamadı: {type(e).__name__}")
+        return False
+
+
+async def v8_myage_claim_achievements(page, notes, state, max_n: int = 5) -> int:
+    """
+    Achievements ekranındaki mavi Claim butonları (Hoarder vb.).
+    Watch / Register gambling / Locked basılmaz.
+    """
+    state["stage"] = "myage_achievements"
+    # Achievements satırına veya TOP üzerinden dene
+    opened = False
+    for label in ("Achievements", "Achievement"):
+        loc = page.get_by_text(re.compile(rf"^\s*{label}\s*$", re.I))
+        try:
+            if await loc.count() >= 1 and await loc.first.is_visible():
+                await loc.first.click(timeout=8000, no_wait_after=True)
+                await page.wait_for_timeout(2000)
+                opened = True
+                break
+        except Exception:
+            pass
+    if not opened:
+        # COMPETE bölümünde olabilir; kaydır + tekrar
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(800)
+            loc = page.get_by_text(re.compile(r"Achievements", re.I))
+            if await loc.count() >= 1:
+                await loc.first.click(timeout=8000, no_wait_after=True)
+                await page.wait_for_timeout(2000)
+                opened = True
+        except Exception:
+            pass
+    if not opened:
+        notes.append("Achievements ekranı açılamadı; başarı claim atlandı.")
+        return 0
+
+    done = 0
+    # Sayfadaki Claim butonları (vault claim değil, başarı claim)
+    claim_btns = page.get_by_role("button", name=re.compile(r"^\s*Claim\s*$", re.I))
+    try:
+        n = await claim_btns.count()
+    except Exception:
+        n = 0
+    notes.append(f"Achievements Claim adayı: {n}")
+    for i in range(min(n, max_n)):
+        el = claim_btns.nth(i)
+        try:
+            if not await el.is_visible() or not await el.is_enabled():
+                continue
+            nearby = await el.evaluate(
+                "e => (e.parentElement?.parentElement?.innerText || e.parentElement?.innerText || e.innerText).slice(0,900)",
+                timeout=3000,
+            )
+            low = (nearby or "").lower()
+            if re.search(r"wallet|deposit|withdraw|premium|watch|register\s+jetton|register\s+tonplay|locked", low):
+                notes.append("Başarı Claim atlandı (riskli/partner bağlamı).")
+                continue
+            # Hoarder / Keeper / vault times gibi metinler güvenli
+            await el.scroll_into_view_if_needed(timeout=4000)
+            await el.click(trial=True, timeout=8000)
+            await el.click(timeout=8000, no_wait_after=True)
+            await page.wait_for_timeout(2500)
+            done += 1
+            notes.append(f"Başarı Claim tıklandı ({done}): {(nearby or '')[:60].replace(chr(10), ' ')}")
+        except Exception as e:
+            notes.append(f"Başarı Claim hata: {type(e).__name__}")
+    if done == 0:
+        notes.append("Tıklanabilir başarı Claim yok (hepsi alınmış veya kilitli).")
+    return done
+
+
+async def v8_myage_click_checks(page, notes, state, max_n: int = 3) -> int:
+    """Home'daki Check butonları (tag / link in bio). Bas, sonucu not et."""
+    state["stage"] = "myage_check"
+    await v8_myage_nav(page, "Home")
+    await page.wait_for_timeout(600)
+    checks = page.get_by_role("button", name=re.compile(r"^\s*Check\s*$", re.I))
+    try:
+        n = await checks.count()
+    except Exception:
+        n = 0
+    done = 0
+    for i in range(min(n, max_n)):
+        el = checks.nth(i)
+        try:
+            if not await el.is_visible() or not await el.is_enabled():
+                continue
+            nearby = await el.evaluate(
+                "e => (e.parentElement?.innerText || e.innerText).slice(0,500)", timeout=3000)
+            if re.search(r"wallet|deposit|watch|premium", nearby or "", re.I):
+                continue
+            await el.click(timeout=8000, no_wait_after=True)
+            await page.wait_for_timeout(2000)
+            done += 1
+            notes.append(f"Check tıklandı: {(nearby or '')[:50].replace(chr(10), ' ')}")
+        except Exception:
+            pass
+    if done == 0 and n == 0:
+        notes.append("Check butonu yok.")
+    return done
+
+
+async def v8_myage_extra_tasks(page, notes, state):
+    """
+    MyAgeApp ek görevler (vault claim sonrası):
+      - Spin (varsa, 1 kez)
+      - Check butonları
+      - Achievements Claim (Hoarder vb., birden fazla)
+    Watch / Locked / gambling Register basılmaz.
+    """
+    notes.append("MyAgeApp ek görevler başlıyor (Spin / Check / Achievements Claim).")
+    try:
+        await v8_myage_click_spin(page, notes, state)
+    except Exception as e:
+        notes.append(f"Spin aşaması: {type(e).__name__}")
+    try:
+        await v8_myage_click_checks(page, notes, state)
+    except Exception as e:
+        notes.append(f"Check aşaması: {type(e).__name__}")
+    try:
+        await v8_myage_claim_achievements(page, notes, state, max_n=6)
+    except Exception as e:
+        notes.append(f"Achievements aşaması: {type(e).__name__}")
+    notes.append(
+        "Atlandı: Epic Watch (reklam), Locked Mystery, Register Jetton/Tonplay, "
+        "Like&share manuel, cüzdan/ödeme."
+    )
     return notes
 
 
@@ -4150,9 +4367,11 @@ async def v8_browser(name,url,state):
             state["stage"]="claim_bulma"
             claim=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
             if await claim.count()!=1:
-                return notes+["Tek bir claim dugmesi bulunamadi; rastgele secim yapilmadi."]
+                notes.append("Tek bir claim dugmesi bulunamadi; rastgele secim yapilmadi.")
+                return await v8_myage_extra_tasks(page, notes, state)
             if not await claim.is_visible() or not await claim.is_enabled():
-                return notes+["Claim gorunur/etkin degil; tiklanmadi."]
+                notes.append("Claim gorunur/etkin degil; tiklanmadi.")
+                return await v8_myage_extra_tasks(page, notes, state)
             nearby=await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)
             risk=re.compile(r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satın|satin|ucret|ücret|[$€₺]",re.I)
             if risk.search(nearby):
@@ -4173,7 +4392,7 @@ async def v8_browser(name,url,state):
                 if pre_bal is not None:
                     notes.append(f"Bakiye: {pre_bal:g}")
                 notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
-                return notes
+                return await v8_myage_extra_tasks(page, notes, state)
             state["stage"]="claim_tiklama"
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
@@ -4185,7 +4404,7 @@ async def v8_browser(name,url,state):
             notes.extend(v821_verify(before_text, after_text))
             notes.append("V8.21-safe: Balance/Vault çoklu aday veya belirsizse reddedilir; başarı yalnız net kasa=0 + bakiye artışı ile ilan edilir.")
             notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
-            return notes
+            return await v8_myage_extra_tasks(page, notes, state)
         finally:
             try:
                 await asyncio.wait_for(browser.close(),15)
@@ -4362,31 +4581,41 @@ async def v8_autopilot_loop():
             if busy:
                 await asyncio.sleep(30)
                 continue
-            bot = (V8_AP.get("bot") or "myageapp").lower()
+            bots = v8_ap_bots()
+            if not bots:
+                V8_AP["bots"] = ["myageapp", "pickaxeempirebot"]
+                bots = v8_ap_bots()
+            # Listedeki tüm botları bu turda sırayla çalıştır
             await bot_app.bot.send_message(
                 ADMIN_USER_ID,
-                f"🔁 V8 otopilot turu başlıyor: @{bot}\n"
-                f"Kasa > 0 ise Claim bir kez denenecek. Durdurmak: dur / otopilot kapat",
+                f"🔁 V8 otopilot turu: {', '.join('@'+b for b in bots)}\n"
+                f"Durdurmak: dur / otopilot kapat",
                 disable_web_page_preview=True,
             )
-            # Tek seferlik işlerle çakışmasın diye ayrı anahtar; döngü task'ını iptal etme
-            key = f"ap:{bot}"
-            task = asyncio.create_task(v8_run_and_track(bot))
-            V8_TASKS[key] = task
-            try:
-                outcome, notes = await task
-            except asyncio.CancelledError:
-                notes = ["Tur iptal edildi."]
-                outcome = "err"
-                raise
-            finally:
-                V8_TASKS.pop(key, None)
-            # bir sonraki tur için taze rastgele bekleme
+            for bot in bots:
+                if not V8_AP.get("on"):
+                    break
+                busy = any(not t.done() for t in V8_TASKS.values())
+                if busy:
+                    await asyncio.sleep(20)
+                V8_AP["bot"] = bot
+                key = f"ap:{bot}"
+                task = asyncio.create_task(v8_run_and_track(bot))
+                V8_TASKS[key] = task
+                try:
+                    outcome, notes = await task
+                except asyncio.CancelledError:
+                    notes = ["Tur iptal edildi."]
+                    outcome = "err"
+                    raise
+                finally:
+                    V8_TASKS.pop(key, None)
+                await asyncio.sleep(random.uniform(8, 20))
             wait_s = random.randint(min_m * 60, max_m * 60)
             await bot_app.bot.send_message(
                 ADMIN_USER_ID,
-                f"💤 V8 otopilot: sonraki kontrol ~{wait_s // 60} dk sonra.\n"
-                f"Durum: {v8_ap_status_text()}",
+                f"💤 V8 otopilot: sonraki tur ~{wait_s // 60} dk sonra.\n"
+                f"{v8_ap_status_text()}",
                 disable_web_page_preview=True,
             )
             # bekleme sırasında kapatılırsa çıksın
@@ -4454,10 +4683,35 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(v8_ap_status_text())
         return
     if low in {"otopilot aç", "otopilot ac", "otopilot on", "otopilot baslat", "otopilot başlat"}:
+        # Varsayılan listeyi garantile
+        if not v8_ap_bots():
+            V8_AP["bots"] = ["myageapp", "pickaxeempirebot"]
         await v8_ap_set(True)
         return
     if low in {"otopilot kapat", "otopilot off", "otopilot durdur"}:
         await v8_ap_set(False)
+        return
+    if low.startswith("otopilot ekle") or low.startswith("otopilot add"):
+        parts = text.split()
+        name = parts[-1].lstrip("@").lower() if len(parts) >= 3 else ""
+        name = parse_bot_arg(name) or (name if re.fullmatch(r"[a-z0-9_]{4,32}", name) else "")
+        if not name:
+            await msg.reply_text("Kullanım: otopilot ekle botadi")
+            return
+        bots = v8_ap_bots()
+        if name not in bots:
+            bots.append(name)
+            V8_AP["bots"] = bots
+            await persist_v8_ap()
+        await msg.reply_text(v8_ap_status_text())
+        return
+    if low.startswith("otopilot sil") or low.startswith("otopilot del"):
+        parts = text.split()
+        name = parts[-1].lstrip("@").lower() if len(parts) >= 3 else ""
+        bots = [b for b in v8_ap_bots() if b != name]
+        V8_AP["bots"] = bots or ["myageapp"]
+        await persist_v8_ap()
+        await msg.reply_text(v8_ap_status_text())
         return
     for e in list(msg.entities or [])+list(msg.caption_entities or []):
         if getattr(e,"url",None):
@@ -4484,7 +4738,8 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
         "• Tek sefer: @MyAgeApp veya başka bot adı / t.me linki gönder\n"
         "• MyAgeApp: duyuru OK + Claim + bakiye/kasa doğrulama\n"
         "• Diğer mini app: güvenli tek Claim/Collect + önce/sonra rapor\n"
-        "• Otopilot (MyAgeApp): otopilot aç / otopilot kapat / otopilot\n"
+        "• Otopilot (tüm liste): otopilot aç / kapat / otopilot\n"
+        "• Liste: otopilot ekle botadi  |  otopilot sil botadi\n"
         "• Durdur: dur\n\n"
         "Cüzdan, ödeme, deposit butonlarına basılmaz. "
         "Bilinmeyen pop-up otomatik onaylanmaz."
