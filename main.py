@@ -3223,15 +3223,16 @@ async def v810_screen(page):
     except Exception:
         return ''
 
-def v819_find_amount(text,keywords):
+def v820_find_balance(text):
     if not text:
         return None
     for line in text.splitlines():
         s=line.strip()
         if not s:
             continue
-        low=s.lower()
-        if any(k in low for k in keywords):
+        if s.lower()=='balance':
+            continue
+        if 'balance' in s.lower():
             m=re.search(r'(\d+(?:[.,]\d+)*)',s)
             if m:
                 try:
@@ -3240,20 +3241,27 @@ def v819_find_amount(text,keywords):
                     pass
     return None
 
-def v819_find_flag(text,keywords):
+def v820_find_vault(text):
     if not text:
-        return False
-    low=text.lower()
-    return any(k in low for k in keywords)
+        return None
+    lines=[x.strip() for x in text.splitlines() if x.strip()]
+    for i,line in enumerate(lines):
+        if line.lower()=='vault':
+            # Kasa degeri Vault'un hemen altindaki 0 satiridir.
+            for j in range(i+1,min(i+4,len(lines))):
+                if re.fullmatch(r'\d+(?:[.,]\d+)*',lines[j]):
+                    try:
+                        return float(lines[j].replace(',',''))
+                    except Exception:
+                        pass
+    return None
 
-def v819_verify(before,after):
-    notes=['V8.19: V14 mantigina gore daraltilmis etiket bazli bakiye ve kasa okuma.']
-    b=v819_find_amount(before,['bakiye','balance'])
-    a=v819_find_amount(after,['bakiye','balance'])
-    vb=v819_find_amount(before,['kasa','vault'])
-    va=v819_find_amount(after,['kasa','vault'])
-    done_before=v819_find_flag(before,['done'])
-    done_after=v819_find_flag(after,['done'])
+def v820_verify(before,after):
+    notes=['V8.20: gercek ekran metnine gore bakiye ve kasa okuma.']
+    b=v820_find_balance(before)
+    a=v820_find_balance(after)
+    vb=v820_find_vault(before)
+    va=v820_find_vault(after)
     if b is None or a is None:
         notes.append('Bakiye etiketi okunamadi; bakiye kontrolu yapilmadi.')
     elif a>b:
@@ -3398,8 +3406,8 @@ async def v8_browser(name,url,state):
             notes.append(f"Claim adayi bulundu ve tiklandi: {label}.")
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
-            notes.extend(v819_verify(before_text,after_text))
-            notes.append("V8.19: bakiye ve kasa etiketleri V14 mantigina gore daraltildi; satir numarasina baglanmadi.")
+            notes.extend(v820_verify(before_text,after_text))
+            notes.append("V8.20: bakiye ve kasa etiketleri gercek ekran metnine gore ayarlandi; satir numarasina baglanmadi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
@@ -3516,8 +3524,8 @@ async def v8_browser(name,url,state):
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
-            notes.extend(v819_verify(before_text,after_text))
-            notes.append("V8.19: bakiye ve kasa etiketleri V14 mantigina gore daraltildi; satir numarasina baglanmadi.")
+            notes.extend(v820_verify(before_text,after_text))
+            notes.append("V8.20: bakiye ve kasa etiketleri gercek ekran metnine gore ayarlandi; satir numarasina baglanmadi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
