@@ -3217,78 +3217,60 @@ async def v8_report(name,text):
     await bot_app.bot.send_message(ADMIN_USER_ID,f"@{name} — V8 SONUC\n{text}",disable_web_page_preview=True)
 
 
-from decimal import Decimal
-
-def v810_lines(text):
-    return [s.strip() for s in (text or '').splitlines() if s.strip() and re.search(r'\d',s) and len(s.strip())<=120]
-
-def v810_integer(text):
-    text=(text or '').strip()
-    if re.fullmatch(r'[0-9]+',text):
-        return Decimal(text)
-    if re.fullmatch(r'[0-9]{1,3}(?:,[0-9]{3})+',text):
-        return Decimal(text.replace(',',''))
-    return None
-
-def v810_report(before,after):
-    b,a=v810_lines(before),v810_lines(after)
-    notes=['V8.10: ortak sayisal satir listesi kullanildi.']
-    if len(b)<7 or len(a)<7:
-        return notes+['7. sayisal satir okunamadi; bakiye yorumu yapilmadi.']
-    stable=b[3:6]==a[3:6] and b[7:9]==a[7:9]
-    x,y=v810_integer(b[6]),v810_integer(a[6])
-    if x is None or y is None or not stable:
-        notes.append('7. sayisal satirin bicimi veya komsu satirlari degisti; bakiye yorumu yapilmadi.')
-    else:
-        notes.append(f'7. sayisal satir (bakiye adayi): {b[6]} -> {a[6]}; fark: {y-x}.')
-        if y>x:
-            notes.append('Bu alanda artis goruldu. Alan kimligi ve kasa sifirlanmasi dogrulanmadigi icin odul basarisi ilan edilmedi.')
-        else:
-            notes.append('Bu alanda artis yok; odul dogrulanmadi.')
-    notes.append('Kasa icin guvenilir alan eslesmesi yok; sifirlandi varsayilmadi.')
-    return notes
-
 async def v810_screen(page):
     try:
         return await page.locator('body').inner_text(timeout=3000)
     except Exception:
         return ''
 
-def v813_verify(before,after):
-    # Kullanici gozlemi: kasa 2 ve Done; bakiye Satir 7.
-    # Basari yalnizca kasa 2 -> 0 ve bakiye artarsa kabul edilir.
-    def line(text,i):
-        try:
-            return (text or '').splitlines()[i-1].strip()
-        except Exception:
-            return ''
-    def amount(s):
-        try:
-            return float(s.replace(',',''))
-        except Exception:
-            return None
-    b=amount(line(before,7))
-    a=amount(line(after,7))
-    notes=[]
+def v814_find_amount(text,keywords):
+    if not text:
+        return None
+    for line in text.splitlines():
+        s=line.strip()
+        if not s:
+            continue
+        low=s.lower()
+        if any(k in low for k in keywords):
+            m=re.search(r'(\d+(?:[.,]\d+)*)',s)
+            if m:
+                try:
+                    return float(m.group(1).replace(',',''))
+                except Exception:
+                    pass
+    return None
+
+def v814_find_flag(text,keywords):
+    if not text:
+        return False
+    low=text.lower()
+    return any(k in low for k in keywords)
+
+def v814_verify(before,after):
+    notes=['V8.14: etiket bazli bakiye ve kasa okuma.']
+    b=v814_find_amount(before,['bakiye','balance'])
+    a=v814_find_amount(after,['bakiye','balance'])
+    vb=v814_find_amount(before,['kasa','vault'])
+    va=v814_find_amount(after,['kasa','vault'])
+    done_before=v814_find_flag(before,['done'])
+    done_after=v814_find_flag(after,['done'])
     if b is None or a is None:
-        notes.append('Bakiye satiri (Satir 7) okunamadi; bakiye kontrolu yapilmadi.')
-        return notes
-    if a>b:
+        notes.append('Bakiye etiketi okunamadi; bakiye kontrolu yapilmadi.')
+    elif a>b:
         notes.append(f'Bakiye artti: {b:g} -> {a:g}.')
     elif a==b:
         notes.append(f'Bakiye degismedi: {b:g} -> {a:g}.')
     else:
         notes.append(f'Bakiye azaldi: {b:g} -> {a:g}.')
-    # Kasa kontrolu: kullanici gozlemine gore kasa 2 ve Done.
-    if '2' in before and 'Done' in before:
-        notes.append('Kasa oncesi 2 ve Done goruldu.')
+    if vb is None or va is None:
+        notes.append('Kasa etiketi okunamadi; kasa kontrolu yapilmadi.')
     else:
-        notes.append('Kasa oncesi 2 ve Done bulunamadi; kasa eslesmesi dogrulanmadi.')
-    if '0' in after and 'Done' not in after:
-        notes.append('Kasa sonrasi 0 goruldu; kasa sifirlandi.')
+        notes.append(f'Kasa: {vb:g} -> {va:g}.')
+    if vb is not None and va is not None and vb==2 and va==0:
+        notes.append('Kasa 2 -> 0; kasa sifirlandi.')
     else:
-        notes.append('Kasa sonrasi 0 bulunamadi; kasa sifirlanmadi.')
-    if b is not None and a is not None and a>b and '2' in before and 'Done' in before and '0' in after and 'Done' not in after:
+        notes.append('Kasa 2 -> 0 bulunamadi; kasa sifirlanmadi.')
+    if b is not None and a is not None and a>b and vb==2 and va==0:
         notes.append('Kasa 2 -> 0 ve bakiye artti; toplama dogrulandi.')
     else:
         notes.append('Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.')
@@ -3402,9 +3384,8 @@ async def v8_browser(name,url,state):
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
-            notes.extend(v810_report(before_text,after_text))
-            notes.extend(v813_verify(before_text,after_text))
-            notes.append("Kasa eslesmesi kullanici gozlemine dayali: kasa 2 ve Done; bakiye Satir 7.")
+            notes.extend(v814_verify(before_text,after_text))
+            notes.append("V8.14: bakiye ve kasa etiket bazli okundu; satir numarasina baglanmadi.")
             notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
             return notes
         finally:
