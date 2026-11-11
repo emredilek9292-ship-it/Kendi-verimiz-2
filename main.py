@@ -3276,6 +3276,138 @@ def v814_verify(before,after):
         notes.append('Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.')
     return notes
 
+async def v815_find_claim(page):
+    # Claim butonunu metin bazli arar; rastgele secmez. Birden fazla aday varsa durur.
+    labels=["claim","claim now","collect","get","start","open"]
+    candidates=[]
+    for label in labels:
+        loc=page.get_by_text(label,exact=True)
+        try:
+            n=await loc.count()
+        except Exception:
+            continue
+        for i in range(n):
+            el=loc.nth(i)
+            try:
+                if await el.is_visible() and await el.is_enabled():
+                    candidates.append((label,el))
+            except Exception:
+                pass
+    # Tek aday varsa onu dondurur; yoksa None.
+    if len(candidates)==1:
+        return candidates[0]
+    return None
+
+async def v8_browser(name,url,state):
+    from playwright.async_api import async_playwright,TimeoutError as PWTimeout
+    if not await v8_public(url):
+        return ["Adres guvenlik kontrolunden gecmedi."]
+    notes=[]
+    async with async_playwright() as p:
+        state["stage"]="chromium_baslatma"
+        browser=await p.chromium.launch(headless=True,timeout=60000,args=["--disable-dev-shm-usage"])
+        try:
+            context=await browser.new_context(viewport={"width":390,"height":844},is_mobile=True,
+                has_touch=True,user_agent=DESKTOP_UA,accept_downloads=False)
+            cache={}
+            async def guard(route):
+                u=route.request.url
+                host=urlparse(u).netloc
+                try:
+                    if host not in cache:
+                        cache[host]=await v8_public(u)
+                    if cache[host] and urlparse(u).scheme=="https":
+                        await route.continue_()
+                    else:
+                        await route.abort()
+                except Exception:
+                    try:
+                        await route.abort()
+                    except Exception:
+                        pass
+            await context.route("**/*",guard)
+            page=await context.new_page()
+            page.set_default_timeout(10000)
+            state["stage"]="sayfa_acilisi"
+            try:
+                response=await page.goto(url,wait_until="domcontentloaded",timeout=60000)
+                if response and response.status>=400:
+                    return [f"HTTP {response.status}; islem yapilmadi."]
+            except PWTimeout:
+                notes.append("Acilis suresi asildi; yuklenen ekran kontrol ediliyor.")
+            await page.locator("body").wait_for(state="attached",timeout=15000)
+            await page.wait_for_timeout(5000)
+            notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
+            if name.lower()!="myageapp":
+                return notes+["Bu V8 duzeltmesi yalniz MyAgeApp duyurusu icindir. Baska uygulamada dugmeye basilmadi."]
+            state["stage"]="duyuru_tanima"
+            dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
+            closed=False
+            for i in range(min(await dialogs.count(),10)):
+                dialog=dialogs.nth(i)
+                if not await dialog.is_visible():
+                    continue
+                text=await dialog.inner_text(timeout=5000)
+                if not v8_known_announcement(text):
+                    continue
+                ok=dialog.get_by_role("button",name=re.compile(r"^\s*OK\s*$",re.I))
+                if await ok.count()!=1:
+                    return notes+["Taninmis duyuruda tek bir erisilebilir OK dugmesi bulunamadi; basilmadi."]
+                state["stage"]="duyuru_ok"
+                await ok.click(trial=True,timeout=10000)
+                if not v8_known_announcement(await dialog.inner_text(timeout=3000)):
+                    return notes+["Duyuru metni degisti; OK basilmadi."]
+                await ok.click(timeout=10000,no_wait_after=True)
+                try:
+                    await dialog.wait_for(state="hidden",timeout=10000)
+                except PWTimeout:
+                    return notes+["OK tiklamasi tamamlandi ancak pencerenin kapandigi dogrulanamadi; claim denenmedi."]
+                closed=True
+                notes.append("Yazdigin $AGE duyurusu tanindi. Kendi OK dugmesi tiklandi ve pencere kapandi.")
+                break
+            if not closed:
+                visible=False
+                for i in range(min(await dialogs.count(),10)):
+                    if await dialogs.nth(i).is_visible():
+                        visible=True
+                        break
+                if visible:
+                    return notes+["Farkli veya metni birebir eslesmeyen pencere var; onaylanmadi, claim denenmedi."]
+                notes.append("Gorunur duyuru penceresi yok; claim kontrolune geciliyor.")
+            for i in range(min(await dialogs.count(),10)):
+                if await dialogs.nth(i).is_visible():
+                    return notes+["Baska bir pencere hala acik; claim denenmedi."]
+            state["stage"]="claim_bulma"
+            found=await v815_find_claim(page)
+            if not found:
+                return notes+["Tek bir claim adayi bulunamadi; rastgele secim yapilmadi."]
+            label,el=found
+            state["stage"]="claim_hazirlik"
+            try:
+                await el.scroll_into_view_if_needed(timeout=5000)
+                await el.click(trial=True,timeout=12000)
+            except PWTimeout:
+                return notes+["Claim adayi tiklanabilir degil; zorlanmadi."]
+            before_text=await v810_screen(page)
+            state["stage"]="claim_tiklama"
+            try:
+                await el.click(timeout=10000,no_wait_after=True)
+            except PWTimeout:
+                return notes+["Claim adayi tiklanamadi; tekrar denenmedi."]
+            await page.wait_for_timeout(3000)
+            notes.append(f"Claim adayi bulundu ve tiklandi: {label}.")
+            notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
+            after_text=await v810_screen(page)
+            notes.extend(v814_verify(before_text,after_text))
+            notes.append("V8.14: bakiye ve kasa etiket bazli okundu; satir numarasina baglanmadi.")
+            notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
+            return notes
+        finally:
+            try:
+                await asyncio.wait_for(browser.close(),15)
+            except Exception:
+                pass
+
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
     if not await v8_public(url):
