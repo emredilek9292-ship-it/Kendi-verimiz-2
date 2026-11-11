@@ -3258,7 +3258,7 @@ def v8_ap_status_text() -> str:
         f"Son kasa: {V8_AP.get('last_vault')} | Son bakiye: {V8_AP.get('last_bal')}\n"
         f"Son not: {V8_AP.get('last_note', '')[:120]}\n\n"
         f"Aç: otopilot aç   |  Kapat: otopilot kapat / dur\n"
-        f"Tek sefer: @MyAgeApp yaz"
+        f"Tek sefer: @botadi veya t.me linki\nOtopilot şu an MyAgeApp odaklı (diğerleri tek sefer)."
     )
 
 
@@ -3419,6 +3419,113 @@ async def v816_find_claim(page):
         return candidates[0]
     return None
 
+
+async def v8_find_safe_claim(page):
+    """Tek, görünür, tehlikesiz Claim/Collect benzeri buton ara. Birden fazlaysa None."""
+    labels = [
+        r"^\s*claim\s*$",
+        r"^\s*claim now\s*$",
+        r"^\s*collect\s*$",
+        r"^\s*harvest\s*$",
+        r"^\s*get reward\s*$",
+        r"^\s*claim reward\s*$",
+        r"^\s*topla\s*$",
+        r"^\s*ödül al\s*$",
+        r"^\s*odul al\s*$",
+    ]
+    risk = re.compile(
+        r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|"
+        r"premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satın|satin|ucret|ücret|[$€₺]",
+        re.I,
+    )
+    candidates = []
+    for pat in labels:
+        loc = page.get_by_role("button", name=re.compile(pat, re.I))
+        try:
+            n = await loc.count()
+        except Exception:
+            continue
+        for i in range(n):
+            el = loc.nth(i)
+            try:
+                if not await el.is_visible() or not await el.is_enabled():
+                    continue
+                nearby = await el.evaluate(
+                    "e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",
+                    timeout=3000,
+                )
+                if risk.search(nearby or ""):
+                    continue
+                candidates.append(el)
+            except Exception:
+                pass
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+async def v8_generic_miniap_flow(page, name, notes, state):
+    """MyAgeApp dışı mini uygulamalar: bilinmeyen duyuruya basma, tek güvenli claim dene, raporla."""
+    state["stage"] = "genel_dialog_kontrol"
+    dialogs = page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
+    for i in range(min(await dialogs.count(), 10)):
+        if await dialogs.nth(i).is_visible():
+            notes.append("Bilinmeyen pencere açık; genel modda otomatik kapatılmadı, claim denenmedi.")
+            return notes
+
+    state["stage"] = "genel_claim_bulma"
+    claim = await v8_find_safe_claim(page)
+    if claim is None:
+        notes.append("Tek bir güvenli Claim/Collect butonu bulunamadı; rastgele seçim yapılmadı.")
+        # teşhis için kısa ekran özeti
+        try:
+            t = await v810_screen(page)
+            snippet = " | ".join([ln.strip() for ln in t.splitlines() if ln.strip()][:12])
+            if snippet:
+                notes.append("Ekran özeti: " + snippet[:500])
+        except Exception:
+            pass
+        return notes
+
+    state["stage"] = "genel_claim_hazirlik"
+    try:
+        await claim.scroll_into_view_if_needed(timeout=5000)
+        await claim.click(trial=True, timeout=12000)
+    except Exception:
+        notes.append("Claim adayı tıklanabilir değil; zorlanmadı.")
+        return notes
+
+    before_text = await v810_screen(page)
+    # MyAgeApp etiketleri varsa bonus olarak oku (zorunlu değil)
+    pre_bal = v821_find_balance(before_text)
+    pre_vault = v821_find_vault(before_text)
+    if pre_vault is not None and pre_vault <= 0:
+        notes.append(f"Kasa/Vault zaten {pre_vault:g}; claim atlandı.")
+        return notes
+
+    state["stage"] = "genel_claim_tiklama"
+    try:
+        await claim.click(timeout=10000, no_wait_after=True)
+    except Exception:
+        notes.append("Claim tıklaması tamamlanamadı; tekrar denenmedi.")
+        return notes
+    await page.wait_for_timeout(3000)
+    notes.append("Genel mod: güvenli Claim/Collect bir kez tıklandı; ikinci tıklama yok.")
+    after_text = await v810_screen(page)
+
+    # Bilinen etiketler varsa doğrula; yoksa sadece metin farkı raporla
+    if v821_find_balance(before_text) is not None or v821_find_vault(before_text) is not None:
+        notes.extend(v821_verify(before_text, after_text))
+    else:
+        notes.append("Bu uygulamada Balance/Vault etiketi yok; otomatik başarı ilan edilmedi.")
+        b_lines = [ln.strip() for ln in before_text.splitlines() if ln.strip()][:8]
+        a_lines = [ln.strip() for ln in after_text.splitlines() if ln.strip()][:8]
+        notes.append("ÖNCE: " + " | ".join(b_lines)[:400])
+        notes.append("SONRA: " + " | ".join(a_lines)[:400])
+    notes.append("Cüzdan/ödeme pencerelerine basılmaz. Genel mini app modu.")
+    return notes
+
+
 async def v8_browser(name,url,state):
     from playwright.async_api import async_playwright,TimeoutError as PWTimeout
     if not await v8_public(url):
@@ -3459,8 +3566,9 @@ async def v8_browser(name,url,state):
             await page.locator("body").wait_for(state="attached",timeout=15000)
             await page.wait_for_timeout(5000)
             notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
-            if name.lower()!="myageapp":
-                return notes+["Bu V8 duzeltmesi yalniz MyAgeApp duyurusu icindir. Baska uygulamada dugmeye basilmadi."]
+            if name.lower() != "myageapp":
+                notes.append(f"Genel mini app modu: @{name} (MyAgeApp dışı — bilinmeyen duyuruya basılmaz).")
+                return await v8_generic_miniap_flow(page, name, notes, state)
             state["stage"]="duyuru_tanima"
             dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
             closed=False
@@ -3569,8 +3677,9 @@ async def v8_browser(name,url,state):
             await page.locator("body").wait_for(state="attached",timeout=15000)
             await page.wait_for_timeout(5000)
             notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
-            if name.lower()!="myageapp":
-                return notes+["Bu V8 duzeltmesi yalniz MyAgeApp duyurusu icindir. Baska uygulamada dugmeye basilmadi."]
+            if name.lower() != "myageapp":
+                notes.append(f"Genel mini app modu: @{name} (MyAgeApp dışı — bilinmeyen duyuruya basılmaz).")
+                return await v8_generic_miniap_flow(page, name, notes, state)
             state["stage"]="duyuru_tanima"
             dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
             closed=False
@@ -3703,7 +3812,7 @@ async def auto_link(name: str,short: str="",start: str=""):
     if name in V8_TASKS and not V8_TASKS[name].done():
         await v8_report(name,"Zaten sirada veya calisiyor.")
         return
-    await v8_report(name,"V8 iş sıraya alındı. Tanınmış duyuru kapatılır; kasa > 0 ise Claim bir kez denenir. dur ile iptal.")
+    await v8_report(name,"V8 iş sıraya alındı. MyAgeApp: duyuru+claim+doğrulama. Diğer mini app: güvenli tek Claim/Collect + rapor. dur ile iptal.")
     V8_TASKS[name]=spawn(v8_run(name,short,start))
 
 
@@ -3943,14 +4052,14 @@ async def cmd_dur(update: Update,context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "V8 MyAgeApp\n\n"
-        "• Tek sefer: özel sohbetten @MyAgeApp gönder\n"
-        "• Otopilot aç: otopilot aç\n"
-        "• Otopilot kapat: otopilot kapat  veya  dur\n"
-        "• Durum: otopilot\n\n"
-        "Otopilot yalnızca kasa > 0 iken Claim dener; "
-        "bakiye artışı + kasa=0 doğrulanmadan başarı saymaz. "
-        "Cüzdan/ödeme işlerine dokunmaz."
+        "V8 Mini App\n\n"
+        "• Tek sefer: @MyAgeApp veya başka bot adı / t.me linki gönder\n"
+        "• MyAgeApp: duyuru OK + Claim + bakiye/kasa doğrulama\n"
+        "• Diğer mini app: güvenli tek Claim/Collect + önce/sonra rapor\n"
+        "• Otopilot (MyAgeApp): otopilot aç / otopilot kapat / otopilot\n"
+        "• Durdur: dur\n\n"
+        "Cüzdan, ödeme, deposit butonlarına basılmaz. "
+        "Bilinmeyen pop-up otomatik onaylanmaz."
     )
 
 
