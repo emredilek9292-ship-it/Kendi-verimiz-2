@@ -3651,8 +3651,6 @@ async def v8_pxe_scan_tasks(page, notes, state):
     text = await v810_screen(page)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     safe, risky, share = [], [], []
-    blob = "\n".join(lines)
-    # kaba sınıflandırma
     for ln in lines:
         low = ln.lower()
         if v8_pxe_risk_label(ln):
@@ -3662,16 +3660,196 @@ async def v8_pxe_scan_tasks(page, notes, state):
         elif any(k in low for k in ("katıl", "katil", "duyuru", "sohbet", "kanal", "vote", "react", "reklam", "izle")):
             safe.append(ln)
     if safe:
-        notes.append("Güvenli/topluluk görevleri (otomatik basılmadı): " + " · ".join(safe[:8])[:400])
+        notes.append("Güvenli/topluluk görev adayları: " + " · ".join(safe[:10])[:400])
     if share:
-        notes.append("Paylaşım/Verify görevleri (story manuel): " + " · ".join(share[:6])[:300])
+        notes.append("Paylaşım/Verify (manuel, basılmaz): " + " · ".join(share[:6])[:300])
     if risky:
         uniq = list(dict.fromkeys(risky))[:6]
         notes.append("Atlandı (cüzdan/ödeme/satın): " + " · ".join(uniq)[:300])
-    notes.append(
-        "Not: Kanal katıl / story paylaş / reklam izle mini app içinde tam otomatik değil. "
-        "İstersen kanal linklerini radar /join ile ayrıca ekleriz."
-    )
+
+
+async def v8_pxe_extract_join_targets(text: str) -> list:
+    """Ekran/metinden t.me kanal-grup hedeflerini çıkar (bot hariç)."""
+    found = []
+    for m in CH_RE.finditer(text or ""):
+        tgt = m.group(1)
+        low = tgt.lower()
+        if low.endswith("bot") or low in ("share", "proxy", "socks", "addstickers"):
+            continue
+        found.append(tgt)
+    # düz @kanal
+    for m in re.finditer(r"@([A-Za-z][A-Za-z0-9_]{3,})", text or ""):
+        n = m.group(1)
+        if not n.lower().endswith("bot"):
+            found.append(n)
+    # tekilleştir, sırayı koru
+    out = []
+    seen = set()
+    for x in found:
+        k = x.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    return out[:8]
+
+
+async def v8_pxe_do_joins(targets: list, notes) -> int:
+    """Telethon ile güvenli kanallara katıl. Birden fazla hedef destekler."""
+    if not targets:
+        return 0
+    if not tg_client:
+        notes.append("Telethon yok; kanallara katılınamadı.")
+        return 0
+    ok_n = 0
+    # tarayıcı kilidi dışında; kısa TG kilidi al
+    got = await try_lock(TG_LOCK, 25)
+    if not got:
+        notes.append("Telegram sırası dolu; katılım sonraya bırakıldı.")
+        return 0
+    try:
+        for tgt in targets:
+            if v8_pxe_risk_label(tgt):
+                notes.append(f"Atlandı (riskli hedef): {tgt}")
+                continue
+            try:
+                msg = await do_join(tgt)
+                notes.append(f"Katılım @{tgt if not tgt.startswith('+') else tgt}: {msg}")
+                if "Katıldım" in msg or "zaten" in msg.lower():
+                    ok_n += 1
+            except Exception as e:
+                notes.append(f"Katılım hata {tgt}: {type(e).__name__}")
+            await asyncio.sleep(random.uniform(2, 5))
+    finally:
+        TG_LOCK.release()
+    return ok_n
+
+
+async def v8_pxe_run_community_tasks(page, notes, state, max_tasks: int = 8):
+    """
+    Earn'deki mavi/topluluk görevleri:
+      - Duyuru kanalı / miner sohbeti gibi KATIL satırlarına bas
+      - Çıkan t.me hedeflerine Telethon ile katıl
+      - Story/Verify/Buy/Payment/cüzdan'a basma
+      - Birden fazla görev sırayla (max_tasks)
+    """
+    state["stage"] = "pxe_community"
+    # Earn'de olduğumuzdan emin ol
+    await v8_pxe_click_nav(page, "Earn")
+    await page.wait_for_timeout(1200)
+
+    # Güvenli görev metin kalıpları (birden fazla dil/varyasyon)
+    SAFE_PATTERNS = [
+        r"DUYURU\s*KANAL",
+        r"M[İI]NER\s*SOHBET",
+        r"KANALINA\s*KATIL",
+        r"SOHBET[İI]NE\s*KATIL",
+        r"JOIN\s*(ANNOUNCE|CHANNEL|CHAT|GROUP)",
+        r"ANNOUNCEMENT",
+        r"COMMUNITY\s*CHAT",
+    ]
+    # Asla basılmayacak
+    BLOCK_PATTERNS = [
+        r"STORY", r"PAYLA[ŞS]", r"VERIFY", r"BUY\s*\$", r"PAYMENT",
+        r"ON[- ]?CHAIN", r"KEEPEYE", r"SUBSCRIBE\s*\$", r"WALLET",
+        r"REKLAM", r"İZLE", r"IZLE", r"VOTE", r"REACT",
+    ]
+
+    clicked_labels = []
+    all_targets = []
+
+    # Sayfadaki tüm tıklanabilir metin adaylarını tara
+    candidates = []
+    for pat in SAFE_PATTERNS:
+        loc = page.get_by_text(re.compile(pat, re.I))
+        try:
+            n = await loc.count()
+        except Exception:
+            continue
+        for i in range(min(n, 6)):
+            el = loc.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+                label = (await el.inner_text(timeout=2000) or "").strip()
+                if not label:
+                    continue
+                low = label.lower()
+                if any(re.search(b, label, re.I) for b in BLOCK_PATTERNS):
+                    continue
+                if v8_pxe_risk_label(label):
+                    continue
+                candidates.append((label[:80], el))
+            except Exception:
+                pass
+
+    # Aynı etiketi tekilleştir
+    uniq = []
+    seen_l = set()
+    for label, el in candidates:
+        k = re.sub(r"\s+", " ", label.lower())
+        if k in seen_l:
+            continue
+        seen_l.add(k)
+        uniq.append((label, el))
+
+    notes.append(f"Topluluk katılım adayı: {len(uniq)} (en fazla {max_tasks} denenecek).")
+
+    for label, el in uniq[:max_tasks]:
+        state["stage"] = "pxe_community_click"
+        try:
+            # satırın kendisi veya parent tıklanabilir olabilir
+            await el.scroll_into_view_if_needed(timeout=4000)
+            await el.click(timeout=8000, no_wait_after=True)
+            clicked_labels.append(label)
+            notes.append(f"Görev satırına tıklandı: {label[:60]}")
+            await page.wait_for_timeout(2500)
+            # Açılan metinden / sayfadan link topla
+            txt = await v810_screen(page)
+            targets = await v8_pxe_extract_join_targets(txt)
+            # link butonları
+            for a in await page.locator("a[href*='t.me']").all():
+                try:
+                    href = await a.get_attribute("href")
+                    if href:
+                        targets.extend(await v8_pxe_extract_join_targets(href))
+                except Exception:
+                    pass
+            # tekilleştir
+            t2 = []
+            s2 = set()
+            for t in targets:
+                if t.lower() not in s2:
+                    s2.add(t.lower())
+                    t2.append(t)
+            if t2:
+                notes.append("Bulunan katılım hedefleri: " + ", ".join(t2)[:200])
+                all_targets.extend(t2)
+            else:
+                notes.append("Bu satırdan t.me hedefi çıkmadı (mini app içi yönlendirme olabilir).")
+            # geri dönmeyi dene
+            for back in ("Geri", "Back", "Kapat", "Close", "Earn"):
+                if await v8_pxe_click_nav(page, back):
+                    break
+            await page.wait_for_timeout(800)
+            await v8_pxe_click_nav(page, "Earn")
+        except Exception as e:
+            notes.append(f"Görev tık hatası ({label[:30]}): {type(e).__name__}")
+
+    # Toplanan kanallara katıl
+    all_targets = list(dict.fromkeys(all_targets))
+    if all_targets:
+        n = await v8_pxe_do_joins(all_targets, notes)
+        notes.append(f"Katılım özeti: {n}/{len(all_targets)} başarılı/zaten üye.")
+    elif clicked_labels:
+        notes.append(
+            "Satırlara tıklandı ama açık t.me linki yok. "
+            "Bazı görevler uygulamayı Telegram’a yönlendirir; bir sonraki turda ödül düşmüş olabilir."
+        )
+    else:
+        notes.append("Tıklanacak güvenli katılım satırı bulunamadı (hepsi tamamlanmış veya farklı metin).")
+
+    if clicked_labels:
+        notes.append("Tıklanan görevler: " + " · ".join(clicked_labels)[:300])
 
 
 async def v8_pickaxe_flow(page, name, notes, state):
@@ -3679,10 +3857,10 @@ async def v8_pickaxe_flow(page, name, notes, state):
     Pickaxe Empire profili:
       1) Maden Claim (CLAIM'E HAZIR)
       2) Earn > Günlük Topla +N
-      3) Görev listesini raporla (BUY/PAYMENT/ON-CHAIN'e basma)
+      3) Topluluk katılım görevleri (birden fazla; duyuru/sohbet)
+      4) Görev taraması / rapor (BUY/PAYMENT/ON-CHAIN/Story basılmaz)
     """
     notes.append("Pickaxe Empire profili devrede.")
-    # Bilinmeyen modal varsa dokunma
     state["stage"] = "pxe_dialog"
     dialogs = page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
     for i in range(min(await dialogs.count(), 8)):
@@ -3690,20 +3868,21 @@ async def v8_pickaxe_flow(page, name, notes, state):
             notes.append("Açık diyalog var; Pickaxe profili bilinmeyene basmaz. Claim denenmedi.")
             return notes
 
-    # Ana ekranda claim dene (genelde maden ana sayfa)
     await v8_pxe_click_claim_mine(page, notes, state)
-
-    # Günlük ödül
     await v8_pxe_click_daily_topla(page, notes, state)
 
-    # Görev taraması (Earn'de kalmış olmalı)
+    try:
+        await v8_pxe_run_community_tasks(page, notes, state, max_tasks=8)
+    except Exception as e:
+        notes.append(f"Topluluk görevleri: {type(e).__name__}")
+
     try:
         await v8_pxe_scan_tasks(page, notes, state)
     except Exception as e:
         notes.append(f"Görev taraması: {type(e).__name__}")
 
-    notes.append("Pickaxe: cüzdan, BUY $PXE, payment channel, on-chain holder işlerine basılmaz.")
-    notes.append("Story paylaş / Verify manuel. İkinci tıklama yok.")
+    notes.append("Pickaxe: cüzdan, BUY $PXE, payment channel, on-chain, story/Verify, reklam izle basılmaz.")
+    notes.append("Birden fazla güvenli katılım görevi sırayla denendi. İkinci claim tıklaması yok.")
     return notes
 
 
