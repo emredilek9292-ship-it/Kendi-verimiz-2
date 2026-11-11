@@ -1,5 +1,5 @@
 """
-Airdrop / oyun bot radari (v3 + Groq + V8.28 evrensel mini app motoru)
+Airdrop / oyun bot radari (v3 + Groq + V8.29 evrensel mini app motoru — döngü korumalı)
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -4679,7 +4679,7 @@ UNI_RISK_RE = re.compile(
     re.I,
 )
 UNI_SKIP_RE = re.compile(
-    r"invite|refer|friend|story|stories|share|repost|retweet|boost|emoji|nickname|"
+    r"invite|refer|friend|story|stories|share|repost|retweet|boost (?:the |our |a )?channel|channel boost|boost us|t\.me/boost|emoji|nickname|"
     r"to (your )?name|rename|username|premium|davet|arkada[şs]|payla[şs]|hikaye|"
     r"пригласи|друз|сторис|поделит",
     re.I,
@@ -4889,7 +4889,9 @@ UNI_SHIM_JS = r"""
         t = t.replace(/\s+/g, ' ').trim();
         if (t.length > text.length + 2) { ctx = t.slice(0, 300); if (t.length >= 10) break; }
       }
-      const key = text + '|' + ctx.slice(0, 120);
+      // anahtar: sayılar normalize (sürekli artan sayaç aynı butonu 'yeni' göstermesin)
+      const norm = (v) => v.replace(/[\d][\d.,:\s]*/g, '#');
+      const key = norm(text) + '|' + norm(ctx).slice(0, 120);
       if (seen.has(key + Math.round(r.top))) continue;
       seen.add(key + Math.round(r.top));
       const id = 'u' + (++U.seq);
@@ -5008,7 +5010,7 @@ def uni_diff(before: str, after: str) -> list:
         if lab in seen:
             continue
         seen.add(lab)
-        notes.append(f"{lab.split('#')[0]}: {x:g} → {y:g}")
+        notes.append(f"{(lab.split('#')[0].strip(' :') or 'Bakiye')}: {x:g} → {y:g}")
         if len(notes) >= 5:
             break
     return notes
@@ -5157,11 +5159,33 @@ async def uni_tap(page, notes: list):
     return n
 
 
+UNI_TEXT_CAP = {"reward": 2, "check": 3, "go": 8, "dismiss": 4}
+UNI_SCREEN_MAX = int(os.getenv("UNI_SCREEN_MAX", "12") or 12)   # tek ekranda en fazla işlem
+
+
+def uni_norm(t: str) -> str:
+    return re.sub(r"\d[\d.,:\s]*", "#", (t or "").strip().lower())
+
+
+def uni_gain(before: str, after: str) -> bool:
+    """Aynı etiketli bir sayı arttı mı?"""
+    b = dict(uni_numbers(before))
+    for k, v in uni_numbers(after):
+        if k in b and v > b[k]:
+            return True
+    return False
+
+
 async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: float, label: str):
-    """Mevcut ekranda: pencere kapat → ödül → görev → kontrol, ta ki yapılacak kalmayana dek."""
+    """Mevcut ekranda: pencere kapat → ödül → görev → kontrol, ta ki yapılacak kalmayana dek.
+    Döngü koruması: aynı yazılı butona sınırlı basılır; kazanç getirmeyen ödül butonu bu turda bir daha denenmez;
+    tekrar eden Claim→Close gibi desen görülürse ekran bırakılır."""
     idle = 0
     pending_check = False
-    while time.time() < deadline and run["actions"] < UNI_MAX_ACTIONS:
+    screen_actions = 0
+    tcount = run.setdefault("tcount", {})
+    recent = []
+    while time.time() < deadline and run["actions"] < UNI_MAX_ACTIONS and screen_actions < UNI_SCREEN_MAX:
         if AUTO_STOP:
             notes.append("Durdurma isteği alındı.")
             return
@@ -5181,7 +5205,8 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
             out = []
             for c in lst:
                 k = kind + ":" + c["key"]
-                if run["clicked"].get(k, 0) < limit:
+                tk = f"{label}:{kind}:{uni_norm(c['text'])}"
+                if run["clicked"].get(k, 0) < limit and tcount.get(tk, 0) < UNI_TEXT_CAP.get(kind, 3):
                     out.append((k, c))
             return out
 
@@ -5205,20 +5230,32 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
         idle = 0
         kind, (key, c) = order[0]
         run["clicked"][key] = run["clicked"].get(key, 0) + 1
+        tk = f"{label}:{kind}:{uni_norm(c['text'])}"
+        tcount[tk] = tcount.get(tk, 0) + 1
         before = await uni_screen(page)
         ok = await uni_click(page, c)
         if not ok:
             continue
         run["actions"] += 1
+        screen_actions += 1
         run["log"].append(f"{label}/{kind}: {c['text'][:30]}")
+        recent.append(tk)
         if kind == "go":
             pending_check = True
         await page.wait_for_timeout(2200 if kind != "check" else 3500)
         await uni_handle_links(page, name, run, notes)
         after = await uni_screen(page)
         diff = uni_diff(before, after)
-        if diff and kind in ("reward", "check"):
+        gained = uni_gain(before, after)
+        if diff and gained and kind in ("reward", "check"):
             run["gains"].extend(diff[:2])
+        if kind == "reward" and not gained:
+            # kazanç yok (zaten toplanmış / süre dolmamış) → bu buton bu turda bitti
+            tcount[tk] = UNI_TEXT_CAP["reward"]
+        # Claim→Close→Claim→Close gibi tekrar eden desen → bu ekranı bırak
+        if len(recent) >= 4 and recent[-1] == recent[-3] and recent[-2] == recent[-4]:
+            notes.append(f"{label}: tekrar eden döngü ({c['text'][:20]}) algılandı, ekran bırakıldı.")
+            return
         if kind == "go" and run["join_ok"]:
             await page.wait_for_timeout(2500)
 
