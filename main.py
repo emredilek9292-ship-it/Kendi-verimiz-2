@@ -1,5 +1,5 @@
 """
-Airdrop / oyun bot radari (v3 + Groq)
+Airdrop / oyun bot radari (v3 + Groq + V8.28 evrensel mini app motoru)
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -2728,6 +2728,11 @@ async def on_group_message(event):
         if INSPECT and bots and not warn:
             for b in bots:
                 spawn(inspect_bot(b))
+        # Oto-ekle açıksa: yeni bulunan botu evrensel motorla dene, açılırsa otopilot listesine ekle
+        if bots and not warn and V8_AP.get("auto_add"):
+            for b in bots:
+                if not UNI_BOT_NAME_RISK.search(b):
+                    spawn(auto_link(b))
     except Exception as e:
         print("[LISTENER]", repr(e))
 
@@ -4165,251 +4170,89 @@ async def v8_generic_miniap_flow(page, name, notes, state):
     return notes
 
 
-async def v8_browser(name,url,state):
-    from playwright.async_api import async_playwright,TimeoutError as PWTimeout
-    if not await v8_public(url):
-        return ["Adres guvenlik kontrolunden gecmedi."]
-    notes=[]
-    async with async_playwright() as p:
-        state["stage"]="chromium_baslatma"
-        browser=await p.chromium.launch(headless=True,timeout=60000,args=["--disable-dev-shm-usage"])
+async def v8_myage_page_flow(page, name, notes, state):
+    """MyAgeApp: bilinen duyuru OK + Claim + Balance/Vault dogrulama + ek gorevler."""
+    from playwright.async_api import TimeoutError as PWTimeout
+    state["stage"]="duyuru_tanima"
+    dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
+    closed=False
+    for i in range(min(await dialogs.count(),10)):
+        dialog=dialogs.nth(i)
+        if not await dialog.is_visible():
+            continue
+        text=await dialog.inner_text(timeout=5000)
+        if not v8_known_announcement(text):
+            continue
+        ok=dialog.get_by_role("button",name=re.compile(r"^\s*OK\s*$",re.I))
+        if await ok.count()!=1:
+            return notes+["Taninmis duyuruda tek bir erisilebilir OK dugmesi bulunamadi; basilmadi."]
+        state["stage"]="duyuru_ok"
+        await ok.click(trial=True,timeout=10000)
+        # Recheck exact notice immediately before dismissal.
+        if not v8_known_announcement(await dialog.inner_text(timeout=3000)):
+            return notes+["Duyuru metni degisti; OK basilmadi."]
+        await ok.click(timeout=10000,no_wait_after=True)
         try:
-            context=await browser.new_context(viewport={"width":390,"height":844},is_mobile=True,
-                has_touch=True,user_agent=DESKTOP_UA,accept_downloads=False)
-            cache={}
-            async def guard(route):
-                u=route.request.url
-                host=urlparse(u).netloc
-                try:
-                    if host not in cache:
-                        cache[host]=await v8_public(u)
-                    if cache[host] and urlparse(u).scheme=="https":
-                        await route.continue_()
-                    else:
-                        await route.abort()
-                except Exception:
-                    try:
-                        await route.abort()
-                    except Exception:
-                        pass
-            await context.route("**/*",guard)
-            page=await context.new_page()
-            page.set_default_timeout(10000)
-            state["stage"]="sayfa_acilisi"
-            try:
-                response=await page.goto(url,wait_until="domcontentloaded",timeout=60000)
-                if response and response.status>=400:
-                    return [f"HTTP {response.status}; islem yapilmadi."]
-            except PWTimeout:
-                notes.append("Acilis suresi asildi; yuklenen ekran kontrol ediliyor.")
-            await page.locator("body").wait_for(state="attached",timeout=15000)
-            await page.wait_for_timeout(5000)
-            notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
-            if name.lower() in ("pickaxeempirebot", "pickaxe_empire_bot"):
-                notes.append("Pickaxe Empire özel profili seçildi.")
-                return await v8_pickaxe_flow(page, name, notes, state)
-            if name.lower() != "myageapp":
-                notes.append(f"Genel mini app modu: @{name} (MyAgeApp dışı — bilinmeyen duyuruya basılmaz).")
-                return await v8_generic_miniap_flow(page, name, notes, state)
-            state["stage"]="duyuru_tanima"
-            dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
-            closed=False
-            for i in range(min(await dialogs.count(),10)):
-                dialog=dialogs.nth(i)
-                if not await dialog.is_visible():
-                    continue
-                text=await dialog.inner_text(timeout=5000)
-                if not v8_known_announcement(text):
-                    continue
-                ok=dialog.get_by_role("button",name=re.compile(r"^\s*OK\s*$",re.I))
-                if await ok.count()!=1:
-                    return notes+["Taninmis duyuruda tek bir erisilebilir OK dugmesi bulunamadi; basilmadi."]
-                state["stage"]="duyuru_ok"
-                await ok.click(trial=True,timeout=10000)
-                if not v8_known_announcement(await dialog.inner_text(timeout=3000)):
-                    return notes+["Duyuru metni degisti; OK basilmadi."]
-                await ok.click(timeout=10000,no_wait_after=True)
-                try:
-                    await dialog.wait_for(state="hidden",timeout=10000)
-                except PWTimeout:
-                    return notes+["OK tiklamasi tamamlandi ancak pencerenin kapandigi dogrulanamadi; claim denenmedi."]
-                closed=True
-                notes.append("Yazdigin $AGE duyurusu tanindi. Kendi OK dugmesi tiklandi ve pencere kapandi.")
+            await dialog.wait_for(state="hidden",timeout=10000)
+        except PWTimeout:
+            return notes+["OK tiklamasi tamamlandi ancak pencerenin kapandigi dogrulanamadi; claim denenmedi."]
+        closed=True
+        notes.append("Yazdigin $AGE duyurusu tanindi. Kendi OK dugmesi tiklandi ve pencere kapandi.")
+        break
+    if not closed:
+        visible=False
+        for i in range(min(await dialogs.count(),10)):
+            if await dialogs.nth(i).is_visible():
+                visible=True
                 break
-            if not closed:
-                visible=False
-                for i in range(min(await dialogs.count(),10)):
-                    if await dialogs.nth(i).is_visible():
-                        visible=True
-                        break
-                if visible:
-                    return notes+["Farkli veya metni birebir eslesmeyen pencere var; onaylanmadi, claim denenmedi."]
-                notes.append("Gorunur duyuru penceresi yok; claim kontrolune geciliyor.")
-            for i in range(min(await dialogs.count(),10)):
-                if await dialogs.nth(i).is_visible():
-                    return notes+["Baska bir pencere hala acik; claim denenmedi."]
-            state["stage"]="claim_bulma"
-            found=await v816_find_claim(page)
-            if not found:
-                return notes+["Tek bir claim adayi bulunamadi; rastgele secim yapilmadi."]
-            label,el=found
-            state["stage"]="claim_hazirlik"
-            try:
-                await el.scroll_into_view_if_needed(timeout=5000)
-                await el.click(trial=True,timeout=12000)
-            except PWTimeout:
-                return notes+["Claim adayi tiklanabilir degil; zorlanmadi."]
-            before_text=await v810_screen(page)
-            state["stage"]="claim_tiklama"
-            try:
-                await el.click(timeout=10000,no_wait_after=True)
-            except PWTimeout:
-                return notes+["Claim adayi tiklanamadi; tekrar denenmedi."]
-            await page.wait_for_timeout(3000)
-            notes.append(f"Claim adayi bulundu ve tiklandi: {label}.")
-            notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
-            after_text=await v810_screen(page)
-            notes.extend(v821_verify(before_text, after_text))
-            notes.append("V8.21-safe: Balance/Vault çoklu aday veya belirsizse reddedilir; başarı yalnız net kasa=0 + bakiye artışı ile ilan edilir.")
-            notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz. Bu sürüm otomatik tekrar kurmaz.")
-            return notes
-        finally:
-            try:
-                await asyncio.wait_for(browser.close(),15)
-            except Exception:
-                pass
-
-async def v8_browser(name,url,state):
-    from playwright.async_api import async_playwright,TimeoutError as PWTimeout
-    if not await v8_public(url):
-        return ["Adres guvenlik kontrolunden gecmedi."]
-    notes=[]
-    async with async_playwright() as p:
-        state["stage"]="chromium_baslatma"
-        browser=await p.chromium.launch(headless=True,timeout=60000,args=["--disable-dev-shm-usage"])
-        try:
-            context=await browser.new_context(viewport={"width":390,"height":844},is_mobile=True,
-                has_touch=True,user_agent=DESKTOP_UA,accept_downloads=False)
-            cache={}
-            async def guard(route):
-                u=route.request.url
-                host=urlparse(u).netloc
-                try:
-                    if host not in cache:
-                        cache[host]=await v8_public(u)
-                    if cache[host] and urlparse(u).scheme=="https":
-                        await route.continue_()
-                    else:
-                        await route.abort()
-                except Exception:
-                    try:
-                        await route.abort()
-                    except Exception:
-                        pass
-            await context.route("**/*",guard)
-            page=await context.new_page()
-            page.set_default_timeout(10000)
-            state["stage"]="sayfa_acilisi"
-            try:
-                response=await page.goto(url,wait_until="domcontentloaded",timeout=60000)
-                if response and response.status>=400:
-                    return [f"HTTP {response.status}; islem yapilmadi."]
-            except PWTimeout:
-                notes.append("Acilis suresi asildi; yuklenen ekran kontrol ediliyor.")
-            await page.locator("body").wait_for(state="attached",timeout=15000)
-            await page.wait_for_timeout(5000)
-            notes.append("Sayfa acildi; uygulama oturumu ve bakiye dogrulanmadi.")
-            if name.lower() in ("pickaxeempirebot", "pickaxe_empire_bot"):
-                notes.append("Pickaxe Empire özel profili seçildi.")
-                return await v8_pickaxe_flow(page, name, notes, state)
-            if name.lower() != "myageapp":
-                notes.append(f"Genel mini app modu: @{name} (MyAgeApp dışı — bilinmeyen duyuruya basılmaz).")
-                return await v8_generic_miniap_flow(page, name, notes, state)
-            state["stage"]="duyuru_tanima"
-            dialogs=page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
-            closed=False
-            for i in range(min(await dialogs.count(),10)):
-                dialog=dialogs.nth(i)
-                if not await dialog.is_visible():
-                    continue
-                text=await dialog.inner_text(timeout=5000)
-                if not v8_known_announcement(text):
-                    continue
-                ok=dialog.get_by_role("button",name=re.compile(r"^\s*OK\s*$",re.I))
-                if await ok.count()!=1:
-                    return notes+["Taninmis duyuruda tek bir erisilebilir OK dugmesi bulunamadi; basilmadi."]
-                state["stage"]="duyuru_ok"
-                await ok.click(trial=True,timeout=10000)
-                # Recheck exact notice immediately before dismissal.
-                if not v8_known_announcement(await dialog.inner_text(timeout=3000)):
-                    return notes+["Duyuru metni degisti; OK basilmadi."]
-                await ok.click(timeout=10000,no_wait_after=True)
-                try:
-                    await dialog.wait_for(state="hidden",timeout=10000)
-                except PWTimeout:
-                    return notes+["OK tiklamasi tamamlandi ancak pencerenin kapandigi dogrulanamadi; claim denenmedi."]
-                closed=True
-                notes.append("Yazdigin $AGE duyurusu tanindi. Kendi OK dugmesi tiklandi ve pencere kapandi.")
-                break
-            if not closed:
-                visible=False
-                for i in range(min(await dialogs.count(),10)):
-                    if await dialogs.nth(i).is_visible():
-                        visible=True
-                        break
-                if visible:
-                    return notes+["Farkli veya metni birebir eslesmeyen pencere var; onaylanmadi, claim denenmedi."]
-                notes.append("Gorunur duyuru penceresi yok; claim kontrolune geciliyor.")
-            # Never act while another modal remains visible.
-            for i in range(min(await dialogs.count(),10)):
-                if await dialogs.nth(i).is_visible():
-                    return notes+["Baska bir pencere hala acik; claim denenmedi."]
-            state["stage"]="claim_bulma"
-            claim=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
-            if await claim.count()!=1:
-                notes.append("Tek bir claim dugmesi bulunamadi; rastgele secim yapilmadi.")
-                return await v8_myage_extra_tasks(page, notes, state)
-            if not await claim.is_visible() or not await claim.is_enabled():
-                notes.append("Claim gorunur/etkin degil; tiklanmadi.")
-                return await v8_myage_extra_tasks(page, notes, state)
-            nearby=await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)
-            risk=re.compile(r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satın|satin|ucret|ücret|[$€₺]",re.I)
-            if risk.search(nearby):
-                return notes+["Claim cevresinde ucret/cuzdan benzeri ifade var; tiklanmadi."]
-            state["stage"]="claim_hazirlik"
-            try:
-                await claim.scroll_into_view_if_needed(timeout=5000)
-                await claim.click(trial=True,timeout=12000)
-            except PWTimeout:
-                return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
-            if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
-                return notes+["Claim baglami degisti; tiklanmadi."]
-            before_text=await v810_screen(page)
-            pre_vault = v821_find_vault(before_text)
-            pre_bal = v821_find_balance(before_text)
-            if pre_vault is not None and pre_vault <= 0:
-                notes.append(f"Kasa zaten {pre_vault:g}; claim atlandı (gereksiz tıklama yok).")
-                if pre_bal is not None:
-                    notes.append(f"Bakiye: {pre_bal:g}")
-                notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
-                return await v8_myage_extra_tasks(page, notes, state)
-            state["stage"]="claim_tiklama"
-            try:
-                await claim.click(timeout=10000,no_wait_after=True)
-            except PWTimeout:
-                return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
-            await page.wait_for_timeout(3000)
-            notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
-            after_text=await v810_screen(page)
-            notes.extend(v821_verify(before_text, after_text))
-            notes.append("V8.21-safe: Balance/Vault çoklu aday veya belirsizse reddedilir; başarı yalnız net kasa=0 + bakiye artışı ile ilan edilir.")
-            notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
-            return await v8_myage_extra_tasks(page, notes, state)
-        finally:
-            try:
-                await asyncio.wait_for(browser.close(),15)
-            except Exception:
-                pass
+        if visible:
+            return notes+["Farkli veya metni birebir eslesmeyen pencere var; onaylanmadi, claim denenmedi."]
+        notes.append("Gorunur duyuru penceresi yok; claim kontrolune geciliyor.")
+    # Never act while another modal remains visible.
+    for i in range(min(await dialogs.count(),10)):
+        if await dialogs.nth(i).is_visible():
+            return notes+["Baska bir pencere hala acik; claim denenmedi."]
+    state["stage"]="claim_bulma"
+    claim=page.get_by_role("button",name=re.compile(r"^\s*claim\s*$",re.I))
+    if await claim.count()!=1:
+        notes.append("Tek bir claim dugmesi bulunamadi; rastgele secim yapilmadi.")
+        return await v8_myage_extra_tasks(page, notes, state)
+    if not await claim.is_visible() or not await claim.is_enabled():
+        notes.append("Claim gorunur/etkin degil; tiklanmadi.")
+        return await v8_myage_extra_tasks(page, notes, state)
+    nearby=await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)
+    risk=re.compile(r"wallet|connect|deposit|withdraw|buy|purchase|payment|fee|cost|price|stake|swap|premium|stars|usdt|\bton\b|cuzdan|cüzdan|odeme|ödeme|satın|satin|ucret|ücret|[$€₺]",re.I)
+    if risk.search(nearby):
+        return notes+["Claim cevresinde ucret/cuzdan benzeri ifade var; tiklanmadi."]
+    state["stage"]="claim_hazirlik"
+    try:
+        await claim.scroll_into_view_if_needed(timeout=5000)
+        await claim.click(trial=True,timeout=12000)
+    except PWTimeout:
+        return notes+["Claim hala tiklanabilir degil; zorlanmadi."]
+    if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
+        return notes+["Claim baglami degisti; tiklanmadi."]
+    before_text=await v810_screen(page)
+    pre_vault = v821_find_vault(before_text)
+    pre_bal = v821_find_balance(before_text)
+    if pre_vault is not None and pre_vault <= 0:
+        notes.append(f"Kasa zaten {pre_vault:g}; claim atlandı (gereksiz tıklama yok).")
+        if pre_bal is not None:
+            notes.append(f"Bakiye: {pre_bal:g}")
+        notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
+        return await v8_myage_extra_tasks(page, notes, state)
+    state["stage"]="claim_tiklama"
+    try:
+        await claim.click(timeout=10000,no_wait_after=True)
+    except PWTimeout:
+        return notes+["Claim tiklamasi tamamlanamadi; tekrar denenmedi."]
+    await page.wait_for_timeout(3000)
+    notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
+    after_text=await v810_screen(page)
+    notes.extend(v821_verify(before_text, after_text))
+    notes.append("V8.21-safe: Balance/Vault çoklu aday veya belirsizse reddedilir; başarı yalnız net kasa=0 + bakiye artışı ile ilan edilir.")
+    notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
+    return await v8_myage_extra_tasks(page, notes, state)
 
 
 async def v8_run(name,short="",start=""):
@@ -4444,7 +4287,7 @@ async def v8_run(name,short="",start=""):
         return await v8_browser(name,url,state)
     async with V8_LOCK:
         try:
-            notes=await asyncio.wait_for(work(),240)
+            notes=await asyncio.wait_for(work(),V8_JOB_TIMEOUT)
             await v8_report(name,"\n".join(notes))
         except asyncio.CancelledError:
             raise
@@ -4459,7 +4302,7 @@ async def auto_link(name: str,short: str="",start: str=""):
     if name in V8_TASKS and not V8_TASKS[name].done():
         await v8_report(name,"Zaten sirada veya calisiyor.")
         return
-    await v8_report(name,"V8 iş sıraya alındı. MyAgeApp: duyuru+claim+doğrulama. Diğer mini app: güvenli tek Claim/Collect + rapor. dur ile iptal.")
+    await v8_report(name,"V8 iş sıraya alındı. MyAgeApp: duyuru+claim+doğrulama. Evrensel mini app motoru. dur ile iptal.")
     V8_TASKS[name]=spawn(v8_run(name,short,start))
 
 
@@ -4509,7 +4352,7 @@ async def v8_run_and_track(name="myageapp", short="", start=""):
 
     try:
         async with V8_LOCK:
-            notes = await asyncio.wait_for(work(), 240)
+            notes = await asyncio.wait_for(work(), V8_JOB_TIMEOUT)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -4595,6 +4438,8 @@ async def v8_autopilot_loop():
             for bot in bots:
                 if not V8_AP.get("on"):
                     break
+                if uni_paused(bot):
+                    continue
                 busy = any(not t.done() for t in V8_TASKS.values())
                 if busy:
                     await asyncio.sleep(20)
@@ -4610,6 +4455,8 @@ async def v8_autopilot_loop():
                     raise
                 finally:
                     V8_TASKS.pop(key, None)
+                uni_track(bot, outcome)
+                await persist_v8_ap()
                 await asyncio.sleep(random.uniform(8, 20))
             wait_s = random.randint(min_m * 60, max_m * 60)
             await bot_app.bot.send_message(
@@ -4660,6 +4507,9 @@ async def v8_stop():
 
 
 async def v8_ap_set(on: bool):
+    global AUTO_STOP
+    if on:
+        AUTO_STOP = False
     V8_AP["on"] = bool(on)
     if on and not V8_AP.get("last"):
         V8_AP["last"] = 0.0  # hemen ilk turu tetikleyebilsin
@@ -4690,6 +4540,40 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
         return
     if low in {"otopilot kapat", "otopilot off", "otopilot durdur"}:
         await v8_ap_set(False)
+        return
+    if low in {"otopilot tara", "otopilot hepsi", "otopilot tümü", "otopilot tumu", "otopilot all"}:
+        await msg.reply_text("Hesabındaki botlar taranıyor (mini uygulaması olanlar listeye eklenecek)…")
+        try:
+            found = await uni_discover_bots()
+        except Exception as e:
+            await msg.reply_text(f"Tarama hatası: {type(e).__name__}")
+            return
+        bots = v8_ap_bots()
+        new = [b for b in found if b not in bots]
+        V8_AP["bots"] = bots + new
+        await persist_v8_ap()
+        await msg.reply_text(
+            f"Bulunan mini app botu: {len(found)} | yeni eklenen: {len(new)}\n"
+            + (", ".join("@" + b for b in new)[:3500] if new else "(yeni yok)")
+        )
+        if low != "otopilot tara":
+            await v8_ap_set(True)
+        return
+    if low in {"otopilot otoekle aç", "otopilot otoekle ac", "otopilot otoekle on"}:
+        V8_AP["auto_add"] = True
+        await persist_v8_ap()
+        await msg.reply_text("Oto-ekle AÇIK: radarın bulduğu ve açılabilen her yeni mini app otomatik çalıştırılıp listeye eklenecek.")
+        return
+    if low in {"otopilot otoekle kapat", "otopilot otoekle off"}:
+        V8_AP["auto_add"] = False
+        await persist_v8_ap()
+        await msg.reply_text("Oto-ekle KAPALI.")
+        return
+    if low in {"otopilot temizle", "otopilot sifirla", "otopilot sıfırla"}:
+        V8_AP["bots"] = ["myageapp"]
+        V8_AP["per"] = {}
+        await persist_v8_ap()
+        await msg.reply_text(v8_ap_status_text())
         return
     if low.startswith("otopilot ekle") or low.startswith("otopilot add"):
         parts = text.split()
@@ -4737,13 +4621,900 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
         "V8 Mini App\n\n"
         "• Tek sefer: @MyAgeApp veya başka bot adı / t.me linki gönder\n"
         "• MyAgeApp: duyuru OK + Claim + bakiye/kasa doğrulama\n"
-        "• Diğer mini app: güvenli tek Claim/Collect + önce/sonra rapor\n"
+        "• Diğer TÜM mini app'ler: evrensel motor (claim/daily/farm/spin, görev sekmeleri, kanal katılımı + Check, tapper)\n"
+        "• otopilot tara → hesabındaki tüm mini app botlarını bul / otopilot hepsi → bul + başlat\n"
+        "• otopilot otoekle aç → radarın bulduğu yeni mini app'leri otomatik ekle\n"
         "• Otopilot (tüm liste): otopilot aç / kapat / otopilot\n"
         "• Liste: otopilot ekle botadi  |  otopilot sil botadi\n"
         "• Durdur: dur\n\n"
         "Cüzdan, ödeme, deposit butonlarına basılmaz. "
         "Bilinmeyen pop-up otomatik onaylanmaz."
     )
+
+
+
+
+# =====================================================================
+# V8.28 — EVRENSEL MINI APP MOTORU (tüm Telegram mini uygulamaları)
+# ---------------------------------------------------------------------
+#  - Telegram WebApp köprüsü taklidi (TelegramWebviewProxy): mini app'in
+#    gönderdiği olayları yakalar; t.me linkleri, popup, CloudStorage,
+#    DeviceStorage, tema/viewport isteklerine Telegram gibi cevap verir.
+#    Ödeme (invoice), telefon, emoji, hikaye paylaşımı → her zaman iptal.
+#  - Ekrandaki tüm tıklanabilir öğeleri tarar, sınıflandırır:
+#       ödül  : Claim / Collect / Daily / Check-in / Farm / Spin / Topla ...
+#       görev : Start / Go / Join / Subscribe / Katıl ...
+#       kontrol: Check / Verify / Kontrol et ...
+#       kapat : Close / Skip / Got it / Tamam / × (sadece açık pencerede)
+#    Risk (cüzdan/ödeme/satın alma/stars/TON...) içerenlere asla basmaz.
+#  - Alt menüde Earn / Tasks / Görevler / Bonus gibi sekmeleri gezer.
+#  - Görevlerin açtığı t.me kanal/gruplarına Telethon ile katılır,
+#    ardından Check/Verify'a basar.
+#  - Tapper oyunlarında ana coin'e sınırlı sayıda dokunur (UNI_TAPS).
+#  - Her bot için tarayıcı depolaması saklanır (onboarding tekrar etmez).
+#  - "otopilot tara": hesabındaki mini uygulamalı tüm botları bulup listeye ekler.
+# =====================================================================
+
+UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "30") or 30)      # bir turda en fazla tıklama
+UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "170") or 170)          # bir bot için tarayıcı süresi (sn)
+UNI_TABS = int(os.getenv("UNI_TABS", "6") or 6)                      # gezilecek en fazla sekme
+UNI_TAPS = int(os.getenv("UNI_TAPS", "30") or 30)                    # tapper oyunlarında dokunma (0 = kapalı)
+UNI_JOIN = os.getenv("UNI_JOIN", "1").strip() != "0"                 # görev kanallarına katıl
+UNI_JOIN_MAX = int(os.getenv("UNI_JOIN_MAX", "6") or 6)              # bir turda en fazla katılım
+UNI_ADS = os.getenv("UNI_ADS", "0").strip() == "1"                   # "reklam izle" görevleri
+UNI_BOT_START = os.getenv("UNI_BOT_START", "0").strip() == "1"       # görevdeki başka botlara /start
+UNI_FAIL_PAUSE = int(os.getenv("UNI_FAIL_PAUSE", "5") or 5)          # üst üste bu kadar hata → bot beklemeye
+UNI_STATE_DIR = os.getenv("UNI_STATE_DIR", "/tmp/uni_state")
+V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "420") or 420)
+
+V8_AP.setdefault("auto_add", False)   # radar yeni mini app bulunca listeye eklesin mi
+V8_AP.setdefault("per", {})           # bot başına istatistik {bot: {ok,skip,err,fail,last}}
+
+UNI_RISK_RE = re.compile(
+    r"wallet|connect|deposit|withdraw|\bbuy\b|purchase|payment|\bpay\b|\bfee\b|price|\bstake|swap|"
+    r"premium|\bstars?\b|⭐|usdt|\bton\b|tonconnect|transaction|invoice|sign transaction|mint nft|"
+    r"\bbid\b|auction|subscribe for \$|"
+    r"cuzdan|cüzdan|odeme|ödeme|sat[ıi]n al|ucret|ücret|yat[ıi]r|çek(im)?\b|"
+    r"кошел|оплат|купить|вывод|депозит|[$€₺]",
+    re.I,
+)
+UNI_SKIP_RE = re.compile(
+    r"invite|refer|friend|story|stories|share|repost|retweet|boost|emoji|nickname|"
+    r"to (your )?name|rename|username|premium|davet|arkada[şs]|payla[şs]|hikaye|"
+    r"пригласи|друз|сторис|поделит",
+    re.I,
+)
+UNI_ADS_RE = re.compile(r"\bads?\b|advert|watch (an )?ad|reklam|реклам", re.I)
+UNI_REWARD_RE = re.compile(
+    r"^(?:claim(?: now| reward| all| daily| bonus| free)?|collect(?: all| reward)?|harvest|"
+    r"get(?: reward| bonus| it| free)?|receive|take|redeem reward|"
+    r"daily(?: reward| bonus| check[- ]?in| claim)?|check[- ]?in|sign[- ]?in today|"
+    r"start farming|farm(?:ing)?|start mining|mine|open(?: box| chest| case)?|free spin|spin|roll|"
+    r"topla|al|[öo]d[üu]l[üu]? al|g[üu]nl[üu]k [öo]d[üu]l|madencili[ğg]e ba[şs]la|"
+    r"получить|забрать|собрать|клейм|фарм)"
+    r"(?:\s*[+x×]?\s*[\d.,]+\s*[kKmMbB]?\b.*)?$",
+    re.I,
+)
+UNI_GO_RE = re.compile(
+    r"^(?:start|go|open|join|subscribe|follow|visit|do it|do|perform|complete|launch|play|read|"
+    r"check out|ba[şs]la|git|a[çc]|kat[ıi]l|abone ol|takip et|ziyaret et|yap|tamamla|"
+    r"перейти|подписаться|вступить|выполнить|начать|открыть)\s*[→>›»]?$",
+    re.I,
+)
+UNI_CHECK_RE = re.compile(
+    r"^(?:check|verify|validate|confirm|kontrol(?: et)?|do[ğg]rula|onayla|проверить|подтвердить)$",
+    re.I,
+)
+UNI_DISMISS_RE = re.compile(
+    r"^(?:close|skip|later|not now|maybe later|got it|ok|okay|continue|next|start|let'?s go|"
+    r"understood|cool|nice|great|thanks|done|×|✕|✖|x|kapat|tamam|devam|ileri|ge[çc]|atla|anlad[ıi]m|"
+    r"понятно|закрыть|далее|пропустить|ок)$",
+    re.I,
+)
+UNI_SAFE_DISMISS_RE = re.compile(r"^(?:close|skip|later|not now|maybe later|×|✕|✖|x|kapat|ge[çc]|atla|закрыть|пропустить)$", re.I)
+UNI_NAV_RE = re.compile(
+    r"^(?:earn|tasks?|quests?|missions?|bonus(?:es)?|rewards?|daily|airdrop|challenges?|"
+    r"g[öo]rev(?:ler)?|kazan|[öo]d[üu]l(?:ler)?|bonus|задания|заработ\w*|награды|квесты)$",
+    re.I,
+)
+UNI_JOIN_SKIP = {"share", "proxy", "socks", "addstickers", "addemoji", "addlist", "boost", "iv", "login",
+                 "setlanguage", "addtheme", "confirmphone", "c", "s", "joinchat"}
+UNI_BOT_NAME_RISK = re.compile(
+    r"wallet|^pay|pay$|send$|^cryptobot$|exchange|bank|tonkeeper|tonhub|tonspace|fragment|"
+    r"bybit|binance|okx|bitget|mexc|kucoin|gateio|htx|premium|stars|botfather|stickers|gif$|"
+    r"^vote$|^like$|^bing$|^wiki$|^imdb$|^bold$|^vid$|^pic$|^youtube$|^music$",
+    re.I,
+)
+
+UNI_SHIM_JS = r"""
+(() => {
+  if (window.__uni) return;
+  const U = window.__uni = { events: [], links: [], blocked: [], seq: 0 };
+  const RISK = /wallet|connect|deposit|withdraw|\bbuy\b|purchase|payment|\bpay\b|premium|stars?|usdt|\bton\b|transaction|cüzdan|ödeme|satın|оплат|купить|кошел/i;
+  const store = (k) => 'uni_cs_' + k;
+  function respond(t, d) {
+    setTimeout(() => {
+      try {
+        const W = window.Telegram && window.Telegram.WebView;
+        if (W && typeof W.receiveEvent === 'function') { W.receiveEvent(t, d); return; }
+        if (window.TelegramGameProxy && typeof window.TelegramGameProxy.receiveEvent === 'function') { window.TelegramGameProxy.receiveEvent(t, d); return; }
+        if (typeof window.TelegramGameProxy_receiveEvent === 'function') window.TelegramGameProxy_receiveEvent(t, d);
+      } catch (e) {}
+    }, 60);
+  }
+  function link(u, how) { try { U.links.push({ url: String(u), how: how, t: Date.now() }); } catch (e) {} }
+  function handle(type, data) {
+    let d = data;
+    try { if (typeof d === 'string') d = JSON.parse(d || '{}'); } catch (e) { d = {}; }
+    d = d || {};
+    U.events.push({ type: type, t: Date.now() });
+    switch (type) {
+      case 'web_app_open_tg_link': link('https://t.me' + (d.path_full || ''), 'tg_link'); break;
+      case 'web_app_open_link': link(d.url || '', 'open_link'); break;
+      case 'web_app_open_invoice': U.blocked.push('invoice'); respond('invoice_closed', { slug: d.slug, status: 'cancelled' }); break;
+      case 'web_app_request_phone': U.blocked.push('phone'); respond('phone_requested', { status: 'cancelled' }); break;
+      case 'web_app_request_write_access': respond('write_access_requested', { status: 'allowed' }); break;
+      case 'web_app_share_to_story': U.blocked.push('story'); break;
+      case 'web_app_switch_inline_query': U.blocked.push('inline_share'); break;
+      case 'web_app_send_prepared_message': U.blocked.push('prepared_msg'); respond('prepared_message_failed', { error: 'USER_DECLINED' }); break;
+      case 'web_app_request_emoji_status_access': respond('emoji_status_access_requested', { status: 'cancelled' }); break;
+      case 'web_app_set_emoji_status': U.blocked.push('emoji'); respond('emoji_status_failed', { error: 'USER_DECLINED' }); break;
+      case 'web_app_open_scan_qr_popup': respond('scan_qr_popup_closed', {}); break;
+      case 'web_app_read_text_from_clipboard': respond('clipboard_text_received', { req_id: d.req_id }); break;
+      case 'web_app_request_viewport': respond('viewport_changed', { height: window.innerHeight, width: window.innerWidth, is_expanded: true, is_state_stable: true }); break;
+      case 'web_app_request_theme': respond('theme_changed', { theme_params: { bg_color: '#ffffff', text_color: '#000000', hint_color: '#999999', link_color: '#2481cc', button_color: '#2481cc', button_text_color: '#ffffff', secondary_bg_color: '#f0f0f0' } }); break;
+      case 'web_app_request_safe_area': respond('safe_area_changed', { top: 0, bottom: 0, left: 0, right: 0 }); break;
+      case 'web_app_request_content_safe_area': respond('content_safe_area_changed', { top: 0, bottom: 0, left: 0, right: 0 }); break;
+      case 'web_app_biometry_get_info': respond('biometry_info_received', { available: false }); break;
+      case 'web_app_check_home_screen': respond('home_screen_checked', { status: 'unsupported' }); break;
+      case 'web_app_check_location': respond('location_checked', { available: false }); break;
+      case 'web_app_request_location': respond('location_requested', { available: false }); break;
+      case 'web_app_request_fullscreen': respond('fullscreen_changed', { is_fullscreen: true }); break;
+      case 'web_app_open_popup': {
+        const btns = (d.buttons && d.buttons.length) ? d.buttons : [{ id: '', type: 'close' }];
+        const msg = (d.title || '') + ' ' + (d.message || '');
+        let pick = null;
+        if (!RISK.test(msg)) pick = btns.find(b => (b.type === 'ok' || b.type === 'default') && !RISK.test(b.text || ''));
+        if (!pick) pick = btns.find(b => b.type === 'cancel' || b.type === 'close');
+        U.events.push({ type: 'popup:' + msg.slice(0, 120) + ' -> ' + (pick ? (pick.text || pick.type) : 'none'), t: Date.now() });
+        respond('popup_closed', pick ? { button_id: pick.id } : {});
+        break;
+      }
+      case 'web_app_invoke_custom_method': {
+        const p = d.params || {}; let res = true;
+        try {
+          if (d.method === 'saveStorageValue') localStorage.setItem(store(p.key), p.value);
+          else if (d.method === 'getStorageValues') { res = {}; (p.keys || []).forEach(k => { const v = localStorage.getItem(store(k)); res[k] = v === null ? '' : v; }); }
+          else if (d.method === 'deleteStorageValues') (p.keys || []).forEach(k => localStorage.removeItem(store(k)));
+          else if (d.method === 'getStorageKeys') { res = []; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('uni_cs_')) res.push(k.slice(7)); } }
+          respond('custom_method_invoked', { req_id: d.req_id, result: res });
+        } catch (e) { respond('custom_method_invoked', { req_id: d.req_id, error: String(e) }); }
+        break;
+      }
+      case 'web_app_device_storage_save_key':
+        try { if (d.value === null || d.value === undefined) localStorage.removeItem('uni_ds_' + d.key); else localStorage.setItem('uni_ds_' + d.key, d.value); } catch (e) {}
+        respond('device_storage_key_saved', { req_id: d.req_id }); break;
+      case 'web_app_device_storage_get_key': {
+        let v = null; try { v = localStorage.getItem('uni_ds_' + d.key); } catch (e) {}
+        respond('device_storage_key_received', { req_id: d.req_id, value: v }); break;
+      }
+      case 'web_app_device_storage_clear': respond('device_storage_cleared', { req_id: d.req_id }); break;
+      case 'web_app_secure_storage_save_key':
+      case 'web_app_secure_storage_get_key':
+      case 'web_app_secure_storage_restore_key':
+      case 'web_app_secure_storage_clear':
+        respond('secure_storage_failed', { req_id: d.req_id, error: 'UNSUPPORTED' }); break;
+      default: break;
+    }
+  }
+  try {
+    Object.defineProperty(window, 'TelegramWebviewProxy', {
+      value: { postEvent: (t, d) => { try { handle(t, d); } catch (e) {} } },
+      writable: false, configurable: false,
+    });
+  } catch (e) {}
+  // yeni sekme / dış link açılmasını yakala, sayfadan çıkma
+  const fakeWin = { closed: false, close() {}, focus() {}, blur() {}, postMessage() {}, location: { href: '' }, document: { write() {}, close() {} } };
+  window.open = function (u) { link(u || '', 'window_open'); return fakeWin; };
+  document.addEventListener('click', (ev) => {
+    const a = ev.target && ev.target.closest && ev.target.closest('a[href]');
+    if (!a) return;
+    const href = a.href || '';
+    let ext = false;
+    try { ext = new URL(href, location.href).origin !== location.origin; } catch (e) {}
+    if (ext || a.target === '_blank') { link(href, 'anchor'); ev.preventDefault(); }
+  }, true);
+  U.drain = () => { const out = { events: U.events.splice(0), links: U.links.splice(0), blocked: U.blocked.splice(0) }; return out; };
+
+  // Ekrandaki tıklanabilir öğeleri bul
+  U.scan = () => {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const sel = 'button, a[href], [role=button], [role=tab], [role=menuitem], [onclick], input[type=button], input[type=submit], label, li, div, span, img, svg';
+    const all = Array.from(document.querySelectorAll(sel));
+    const out = [];
+    const seen = new Set();
+    const isOverlay = (el) => {
+      let n = el;
+      for (let i = 0; n && i < 12; i++, n = n.parentElement) {
+        if (n.matches && n.matches('[role=dialog],[aria-modal=true],dialog[open],[class*=modal i],[class*=popup i],[class*=sheet i],[class*=drawer i],[class*=overlay i]')) return true;
+        const st = getComputedStyle(n);
+        if (st.position === 'fixed') {
+          const r = n.getBoundingClientRect();
+          if (r.width * r.height > vw * vh * 0.35 && parseInt(st.zIndex || '0', 10) > 0) return true;
+        }
+      }
+      return false;
+    };
+    for (const el of all) {
+      if (out.length > 400) break;
+      const tag = el.tagName.toLowerCase();
+      const st = getComputedStyle(el);
+      const natural = /^(button|a|input)$/.test(tag) || /button|tab|menuitem/.test(el.getAttribute('role') || '') || el.hasAttribute('onclick');
+      if (!natural) {
+        if (st.cursor !== 'pointer') continue;
+        const p = el.parentElement;
+        if (p && getComputedStyle(p).cursor === 'pointer' && (p.innerText || '').trim() === (el.innerText || '').trim()) continue;
+      }
+      if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity || '1') < 0.1) continue;
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true' || st.pointerEvents === 'none') continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 6 || r.height < 6) continue;
+      if (r.bottom < -2000 || r.top > vh + 6000) continue;
+      let text = (el.innerText || el.value || '').replace(/\s+/g, ' ').trim();
+      const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') || '').trim();
+      if (!text) text = aria;
+      if (!text) {
+        const cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className || '');
+        if (/close|dismiss/i.test(cls)) text = 'close';
+      }
+      if (!text || text.length > 60) continue;
+      // üstte başka öğe mi var?
+      const inView = r.top >= 0 && r.bottom <= vh && r.left >= 0 && r.right <= vw;
+      let covered = false;
+      if (inView) {
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const top = document.elementFromPoint(cx, cy);
+        if (top && top !== el && !el.contains(top) && !top.contains(el)) covered = true;
+      }
+      if (covered) continue;
+      // bağlam: üst öğenin metni, içindeki DİĞER butonların metni çıkarılarak (komşu "Connect Wallet" Claim'i riskli yapmasın)
+      let ctx = '', n = el.parentElement;
+      for (let i = 0; n && i < 5; i++, n = n.parentElement) {
+        let t = (n.innerText || '');
+        for (const o of n.querySelectorAll('button,a[href],[role=button],[onclick],input[type=button],input[type=submit]')) {
+          if (o === el || o.contains(el) || el.contains(o)) continue;
+          const ot = (o.innerText || o.value || '').trim();
+          if (ot) t = t.split(ot).join(' ');
+        }
+        t = t.replace(/\s+/g, ' ').trim();
+        if (t.length > text.length + 2) { ctx = t.slice(0, 300); if (t.length >= 10) break; }
+      }
+      const key = text + '|' + ctx.slice(0, 120);
+      if (seen.has(key + Math.round(r.top))) continue;
+      seen.add(key + Math.round(r.top));
+      const id = 'u' + (++U.seq);
+      el.setAttribute('data-uni', id);
+      out.push({ id, text, ctx, key, tag, x: r.left, y: r.top, w: r.width, h: r.height,
+        bottom: r.top > vh * 0.78, overlay: isOverlay(el), tab: (el.getAttribute('role') || '') === 'tab' });
+    }
+    return out;
+  };
+
+  // Tapper coin adayı
+  U.tapTarget = () => {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let best = null, bestA = 0;
+    for (const el of document.querySelectorAll('img, div, button, canvas, svg')) {
+      const sig = (String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('alt') || '')).toLowerCase();
+      if (!/coin|tap|clicker|click-?area|hamster|egg|planet|main-?button|tapper/.test(sig)) continue;
+      const r = el.getBoundingClientRect();
+      const a = r.width * r.height;
+      if (a < 9000 || r.top < 0 || r.bottom > vh || r.width > vw * 1.05) continue;
+      if (a > bestA) { bestA = a; best = r; }
+    }
+    return best ? { x: best.left + best.width / 2, y: best.top + best.height / 2, w: best.width, h: best.height } : null;
+  };
+  U.hasCanvas = () => Array.from(document.querySelectorAll('canvas')).some(c => { const r = c.getBoundingClientRect(); return r.width * r.height > window.innerWidth * window.innerHeight * 0.5; });
+})();
+"""
+
+
+def uni_state_path(name: str) -> str:
+    safe = re.sub(r"[^a-z0-9_]", "", (name or "").lower()) or "x"
+    return os.path.join(UNI_STATE_DIR, f"{safe}.json")
+
+
+async def uni_new_context(browser, name: str):
+    kw = dict(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+              user_agent=DESKTOP_UA, accept_downloads=False, locale="en-US")
+    p = uni_state_path(name)
+    if os.path.exists(p):
+        try:
+            return await browser.new_context(storage_state=p, **kw)
+        except Exception:
+            pass
+    return await browser.new_context(**kw)
+
+
+async def uni_save_state(context, name: str):
+    try:
+        os.makedirs(UNI_STATE_DIR, exist_ok=True)
+        await asyncio.wait_for(context.storage_state(path=uni_state_path(name)), 10)
+    except Exception:
+        pass
+
+
+def uni_tme_from_nav(url: str) -> bool:
+    try:
+        return (urlparse(url).hostname or "").lower() in ("t.me", "telegram.me", "www.t.me")
+    except Exception:
+        return False
+
+
+def uni_join_targets(urls: list) -> tuple:
+    """t.me linklerinden (kanal/grup hedefleri, bot adları) çıkarır."""
+    chans, bots = [], []
+    for u in urls:
+        m = re.search(r"(?:t\.me|telegram\.me)/(\+[A-Za-z0-9_-]{6,}|joinchat/[A-Za-z0-9_-]{6,}|[A-Za-z][A-Za-z0-9_]{3,31})", u or "", re.I)
+        if not m:
+            continue
+        tgt = m.group(1)
+        low = tgt.lower()
+        if low in UNI_JOIN_SKIP:
+            continue
+        if low.endswith("bot") or re.search(r"[?&]start(app)?=", u or "", re.I) and "/" in (urlparse(u).path.strip("/")):
+            bots.append(tgt)
+        else:
+            chans.append(tgt)
+    return list(dict.fromkeys(chans)), list(dict.fromkeys(bots))
+
+
+def uni_numbers(text: str) -> list:
+    """Ekrandaki sayıları etiketleriyle çıkarır: 'Balance\n100' → ('Balance#0', 100)."""
+    num_re = re.compile(r"(?<![\w.])(\d{1,3}(?:[ ,]\d{3})+|\d+(?:\.\d+)?)\s*([kKmMbB])?(?![\w])")
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()][:80]
+    out, prev, cnt = [], "", {}
+    for ln in lines:
+        rest = num_re.sub("#", ln)
+        base = rest if re.search(r"[A-Za-zÀ-ɏЀ-ӿ]", rest) else (prev or "?")
+        for m in num_re.finditer(ln):
+            s = m.group(1).replace(",", "").replace(" ", "")
+            try:
+                v = float(s)
+            except ValueError:
+                continue
+            v *= {"k": 1e3, "m": 1e6, "b": 1e9}.get((m.group(2) or "").lower(), 1)
+            lab = base[:40]
+            k = f"{lab}#{cnt.get(lab, 0)}"
+            cnt[lab] = cnt.get(lab, 0) + 1
+            out.append((k, v))
+        if re.search(r"[A-Za-zÀ-ɏЀ-ӿ]", rest):
+            prev = ln[:40]
+    return out
+
+
+def uni_diff(before: str, after: str) -> list:
+    b, a = uni_numbers(before), uni_numbers(after)
+    notes = []
+    bl = {}
+    for lab, v in b:
+        bl.setdefault(lab, v)
+    ups = []
+    for lab, v in a:
+        if lab in bl and v != bl[lab]:
+            ups.append((lab, bl[lab], v))
+    seen = set()
+    for lab, x, y in ups:
+        if lab in seen:
+            continue
+        seen.add(lab)
+        notes.append(f"{lab.split('#')[0]}: {x:g} → {y:g}")
+        if len(notes) >= 5:
+            break
+    return notes
+
+
+async def uni_screen(page) -> str:
+    try:
+        return await page.locator("body").inner_text(timeout=4000)
+    except Exception:
+        return ""
+
+
+async def uni_scan(page) -> list:
+    try:
+        return await page.evaluate("() => window.__uni ? window.__uni.scan() : []") or []
+    except Exception:
+        return []
+
+
+async def uni_drain(page) -> dict:
+    try:
+        return await page.evaluate("() => window.__uni ? window.__uni.drain() : {events:[],links:[],blocked:[]}") or {}
+    except Exception:
+        return {}
+
+
+def uni_classify(c: dict) -> str:
+    text = (c.get("text") or "").strip()
+    ctx = c.get("ctx") or ""
+    both = text + " " + ctx
+    if UNI_RISK_RE.search(text):
+        return "risk"
+    if (c.get("bottom") or c.get("tab")) and UNI_NAV_RE.match(text):
+        return "nav"
+    if UNI_RISK_RE.search(ctx) and len(ctx) < 200:
+        return "risk"
+    if UNI_SKIP_RE.search(text) or UNI_SKIP_RE.search(ctx[:160]):
+        return "skip"
+    if not UNI_ADS and (UNI_ADS_RE.search(text) or UNI_ADS_RE.search(ctx[:120])):
+        return "skip"
+    if c.get("overlay") and UNI_DISMISS_RE.match(text):
+        # pencerede riskli içerik varsa sadece "kapat/geç" türü butonlar
+        if UNI_RISK_RE.search(ctx) and not UNI_SAFE_DISMISS_RE.match(text):
+            return "risk"
+        return "dismiss"
+    if UNI_REWARD_RE.match(text):
+        return "reward"
+    if UNI_CHECK_RE.match(text):
+        return "check"
+    if UNI_GO_RE.match(text):
+        return "go"
+    if (c.get("bottom") or c.get("tab")) and UNI_NAV_RE.match(text):
+        return "nav"
+    if UNI_NAV_RE.match(text) and len(text) <= 12:
+        return "nav"
+    return ""
+
+
+async def uni_click(page, c: dict) -> bool:
+    loc = page.locator(f'[data-uni="{c["id"]}"]')
+    try:
+        await loc.scroll_into_view_if_needed(timeout=4000)
+    except Exception:
+        pass
+    try:
+        await loc.click(timeout=6000, no_wait_after=True)
+        return True
+    except Exception:
+        pass
+    try:
+        await loc.dispatch_event("click", timeout=3000)
+        return True
+    except Exception:
+        return False
+
+
+async def uni_handle_links(page, name: str, run: dict, notes: list):
+    d = await uni_drain(page)
+    for b in d.get("blocked") or []:
+        run["blocked"].add(b)
+    for ev in d.get("events") or []:
+        t = ev.get("type", "")
+        if t.startswith("popup:"):
+            notes.append("Popup: " + t[6:160])
+    urls = [x.get("url", "") for x in (d.get("links") or [])]
+    urls += list(run["navq"])
+    run["navq"].clear()
+    if not urls:
+        return
+    tg = [u for u in urls if uni_tme_from_nav(u) or u.startswith("tg:")]
+    other = [u for u in urls if u not in tg]
+    for u in other[:5]:
+        host = urlparse(u).hostname or u[:40]
+        run["visited"].append(host)
+    chans, bots = uni_join_targets(tg)
+    me = (name or "").lower()
+    bots = [b for b in bots if b.lower() != me]
+    if chans and UNI_JOIN:
+        todo = [c for c in chans if c.lower() not in run["joined"]][: max(0, UNI_JOIN_MAX - len(run["joined"]))]
+        if todo:
+            n = await v8_pxe_do_joins(todo, notes)
+            for c in todo:
+                run["joined"].add(c.lower())
+            run["join_ok"] += n
+    for b in bots:
+        if b.lower() in run["bot_seen"]:
+            continue
+        run["bot_seen"].add(b.lower())
+        if UNI_BOT_START and not UNI_BOT_NAME_RISK.search(b):
+            try:
+                if await try_lock(TG_LOCK, 20):
+                    try:
+                        await tg_client.send_message(b, "/start")
+                        notes.append(f"Görev botu @{b} başlatıldı.")
+                    finally:
+                        TG_LOCK.release()
+            except Exception as e:
+                notes.append(f"@{b} başlatılamadı: {type(e).__name__}")
+        else:
+            notes.append(f"Görev başka bot istiyor: @{b} (UNI_BOT_START=1 ile otomatik başlatılır).")
+
+
+async def uni_tap(page, notes: list):
+    if UNI_TAPS <= 0:
+        return 0
+    try:
+        tgt = await page.evaluate("() => window.__uni ? window.__uni.tapTarget() : null")
+    except Exception:
+        tgt = None
+    if not tgt:
+        return 0
+    n = 0
+    for _ in range(UNI_TAPS):
+        x = tgt["x"] + random.uniform(-tgt["w"] * 0.18, tgt["w"] * 0.18)
+        y = tgt["y"] + random.uniform(-tgt["h"] * 0.18, tgt["h"] * 0.18)
+        try:
+            await page.touchscreen.tap(x, y)
+        except Exception:
+            try:
+                await page.mouse.click(x, y)
+            except Exception:
+                break
+        n += 1
+        await page.wait_for_timeout(random.randint(90, 260))
+    notes.append(f"Tapper: ana coin'e {n} dokunuş yapıldı.")
+    return n
+
+
+async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: float, label: str):
+    """Mevcut ekranda: pencere kapat → ödül → görev → kontrol, ta ki yapılacak kalmayana dek."""
+    idle = 0
+    pending_check = False
+    while time.time() < deadline and run["actions"] < UNI_MAX_ACTIONS:
+        if AUTO_STOP:
+            notes.append("Durdurma isteği alındı.")
+            return
+        cands = await uni_scan(page)
+        groups = {"reward": [], "check": [], "go": [], "dismiss": [], "nav": [], "risk": [], "skip": []}
+        for c in cands:
+            k = uni_classify(c)
+            if k:
+                groups[k].append(c)
+        for c in groups["risk"]:
+            if UNI_RISK_RE.search(c["text"]):
+                run["risky"].add(c["text"][:30])
+        for c in groups["nav"]:
+            run["navs"].setdefault(c["text"].lower(), c["text"])
+
+        def fresh(lst, kind, limit=1):
+            out = []
+            for c in lst:
+                k = kind + ":" + c["key"]
+                if run["clicked"].get(k, 0) < limit:
+                    out.append((k, c))
+            return out
+
+        # Öncelik: açık penceredeki ödül/görev > ekrandaki ödül > kontrol > görev > pencere kapat
+        order = []
+        ov_rew = [c for c in groups["reward"] if c.get("overlay")]
+        order += [("reward", x) for x in fresh(ov_rew, "reward")]
+        order += [("reward", x) for x in fresh(groups["reward"], "reward")]
+        if pending_check or run["join_ok"]:
+            order += [("check", x) for x in fresh(groups["check"], "check", limit=2)]
+        order += [("go", x) for x in fresh(groups["go"], "go")]
+        order += [("check", x) for x in fresh(groups["check"], "check", limit=1)]
+        order += [("dismiss", x) for x in fresh(groups["dismiss"], "dismiss", limit=2)]
+
+        if not order:
+            idle += 1
+            if idle >= 2:
+                return
+            await page.wait_for_timeout(1500)
+            continue
+        idle = 0
+        kind, (key, c) = order[0]
+        run["clicked"][key] = run["clicked"].get(key, 0) + 1
+        before = await uni_screen(page)
+        ok = await uni_click(page, c)
+        if not ok:
+            continue
+        run["actions"] += 1
+        run["log"].append(f"{label}/{kind}: {c['text'][:30]}")
+        if kind == "go":
+            pending_check = True
+        await page.wait_for_timeout(2200 if kind != "check" else 3500)
+        await uni_handle_links(page, name, run, notes)
+        after = await uni_screen(page)
+        diff = uni_diff(before, after)
+        if diff and kind in ("reward", "check"):
+            run["gains"].extend(diff[:2])
+        if kind == "go" and run["join_ok"]:
+            await page.wait_for_timeout(2500)
+
+
+async def uni_flow(page, name, notes, state):
+    """Evrensel mini app akışı — her mini uygulamada aynı mantık."""
+    deadline = time.time() + UNI_BUDGET_S
+    run = {"clicked": {}, "actions": 0, "log": [], "gains": [], "joined": set(), "join_ok": 0,
+           "bot_seen": set(), "visited": [], "risky": set(), "blocked": set(), "navs": {}, "navq": state.get("nav_links") if isinstance(state.get("nav_links"), list) else []}
+    state["uni_run"] = run
+    notes.append(f"Evrensel mod: @{name}")
+    await page.wait_for_timeout(2500)
+    start_text = await uni_screen(page)
+
+    state["stage"] = "uni_ana_ekran"
+    await uni_handle_links(page, name, run, notes)
+    await uni_work_screen(page, name, run, notes, deadline, "ana")
+
+    state["stage"] = "uni_tapper"
+    await uni_tap(page, notes)
+
+    # sekmeleri gez
+    state["stage"] = "uni_sekmeler"
+    visited_tabs = set()
+    for _ in range(UNI_TABS):
+        if time.time() >= deadline or run["actions"] >= UNI_MAX_ACTIONS or AUTO_STOP:
+            break
+        cands = await uni_scan(page)
+        navs = [c for c in cands if uni_classify(c) == "nav" and c["text"].lower() not in visited_tabs]
+        if not navs:
+            break
+        navs.sort(key=lambda c: (not c.get("bottom"), c["y"]))
+        tab = navs[0]
+        visited_tabs.add(tab["text"].lower())
+        if not await uni_click(page, tab):
+            continue
+        await page.wait_for_timeout(2500)
+        await uni_handle_links(page, name, run, notes)
+        await uni_work_screen(page, name, run, notes, deadline, tab["text"][:12])
+        # sayfayı aşağı kaydırıp tekrar bak (uzun görev listeleri)
+        for _s in range(2):
+            if time.time() >= deadline:
+                break
+            try:
+                await page.mouse.wheel(0, 900)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1200)
+            await uni_work_screen(page, name, run, notes, deadline, tab["text"][:12])
+
+    await uni_handle_links(page, name, run, notes)
+    end_text = await uni_screen(page)
+
+    # rapor
+    if visited_tabs:
+        notes.append("Gezilen sekmeler: " + ", ".join(sorted(visited_tabs))[:200])
+    if run["log"]:
+        notes.append(f"Yapılan {run['actions']} işlem: " + " · ".join(run["log"][:20])[:900])
+    if run["joined"]:
+        notes.append(f"Görev kanalları: {run['join_ok']}/{len(run['joined'])} katılım.")
+    if run["visited"]:
+        notes.append("Açılan dış linkler (ziyaret sayıldı): " + ", ".join(list(dict.fromkeys(run["visited"]))[:8]))
+    if run["risky"]:
+        notes.append("Basılmadı (cüzdan/ödeme/satın alma): " + " · ".join(list(run["risky"])[:8])[:300])
+    if run["blocked"]:
+        notes.append("Engellenen istekler: " + ", ".join(sorted(run["blocked"])))
+    total = uni_diff(start_text, end_text)
+    if total:
+        notes.append("Ekrandaki değişim: " + " | ".join(total))
+    if run["actions"] == 0:
+        try:
+            canvas = await page.evaluate("() => window.__uni ? window.__uni.hasCanvas() : false")
+        except Exception:
+            canvas = False
+        if canvas:
+            notes.append("Bu oyun canvas tabanlı (Unity/Phaser); DOM butonu yok, otomatik tıklanamadı.")
+        snippet = " | ".join([ln.strip() for ln in end_text.splitlines() if ln.strip()][:12])
+        if snippet:
+            notes.append("Ekran özeti: " + snippet[:400])
+        notes.append("Evrensel sonuç: ATLANDI (yapılacak güvenli işlem yok ya da hepsi zaten alınmış).")
+    elif run["gains"] or total or run["join_ok"]:
+        notes.append("Evrensel sonuç: OK")
+    else:
+        notes.append("Evrensel sonuç: BELIRSIZ (tıklandı ama ekranda değişim okunamadı).")
+    notes.append("Cüzdan, ödeme, Stars, TON, satın alma, hikaye/paylaşım ve davet adımlarına basılmaz.")
+    return notes
+
+
+# eski genel modu evrensel motora yönlendir
+async def v8_generic_miniap_flow(page, name, notes, state):
+    return await uni_flow(page, name, notes, state)
+
+
+async def v8_browser(name, url, state):
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    if not await v8_public(url):
+        return ["Adres guvenlik kontrolunden gecmedi."]
+    notes = []
+    async with async_playwright() as p:
+        state["stage"] = "chromium_baslatma"
+        browser = await p.chromium.launch(headless=True, timeout=60000, args=["--disable-dev-shm-usage"])
+        context = None
+        try:
+            context = await uni_new_context(browser, name)
+            await context.add_init_script(UNI_SHIM_JS)
+            cache = {}
+            nav_links = []
+
+            async def guard(route):
+                req = route.request
+                u = req.url
+                host = urlparse(u).netloc
+                try:
+                    # ana sayfadan t.me'ye yönlendirme → yakala, sayfayı terk etme
+                    if req.is_navigation_request() and uni_tme_from_nav(u):
+                        nav_links.append(u)
+                        await route.abort()
+                        return
+                    if host not in cache:
+                        cache[host] = await v8_public(u)
+                    if cache[host] and urlparse(u).scheme == "https":
+                        await route.continue_()
+                    else:
+                        await route.abort()
+                except Exception:
+                    try:
+                        await route.abort()
+                    except Exception:
+                        pass
+
+            await context.route("**/*", guard)
+            page = await context.new_page()
+            page.set_default_timeout(10000)
+            state["stage"] = "sayfa_acilisi"
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                if response and response.status >= 400:
+                    return [f"HTTP {response.status}; islem yapilmadi."]
+            except PWTimeout:
+                notes.append("Acilis suresi asildi; yuklenen ekran kontrol ediliyor.")
+            await page.locator("body").wait_for(state="attached", timeout=15000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(3000)
+            notes.append("Sayfa açıldı (Telegram köprüsü taklidi aktif).")
+            low = name.lower()
+            if low in ("pickaxeempirebot", "pickaxe_empire_bot"):
+                notes.append("Pickaxe Empire özel profili seçildi.")
+                notes = await v8_pickaxe_flow(page, name, notes, state)
+            elif low == "myageapp":
+                notes = await v8_myage_page_flow(page, name, notes, state)
+            else:
+                state["nav_links"] = nav_links
+                notes = await uni_flow(page, name, notes, state)
+            return notes
+        finally:
+            if context is not None:
+                await uni_save_state(context, name)
+            try:
+                await asyncio.wait_for(browser.close(), 15)
+            except Exception:
+                pass
+
+
+def _v8_notes_outcome(notes: list) -> str:
+    text = "\n".join(notes)
+    if "Evrensel sonuç: OK" in text:
+        return "ok"
+    if "Evrensel sonuç: ATLANDI" in text or "Evrensel sonuç: BELIRSIZ" in text:
+        return "skip"
+    if "toplama doğrulandı" in text or "toplama dogrulandi" in text or "doğrulandı" in text:
+        return "ok"
+    if "claim atlandı" in text or "claim atlandi" in text or "Kasa zaten" in text:
+        return "skip"
+    if "toplandı kabul edilmedi" in text or "toplandi kabul edilmedi" in text:
+        return "skip"
+    return "err"
+
+
+# ---------- bot başına istatistik / otomatik bekletme ----------
+
+def uni_per(bot: str) -> dict:
+    per = V8_AP.setdefault("per", {})
+    return per.setdefault(bot, {"ok": 0, "skip": 0, "err": 0, "fail": 0, "last": 0})
+
+
+def uni_track(bot: str, outcome: str):
+    st = uni_per(bot)
+    st[outcome] = int(st.get(outcome, 0)) + 1
+    st["last"] = time.time()
+    st["fail"] = int(st.get("fail", 0)) + 1 if outcome == "err" else 0
+
+
+def uni_paused(bot: str) -> bool:
+    st = uni_per(bot)
+    if int(st.get("fail", 0)) < UNI_FAIL_PAUSE:
+        return False
+    # 12 saatte bir yine de dene
+    return time.time() - float(st.get("last") or 0) < 12 * 3600
+
+
+# ---------- hesaptaki tüm mini app botlarını bul ----------
+
+async def uni_discover_bots(limit: int = 400) -> list:
+    from telethon.tl.functions.users import GetFullUserRequest
+    found = []
+    own = ""
+    try:
+        own = (bot_app.bot.username or "").lower()
+    except Exception:
+        pass
+    async for d in tg_client.iter_dialogs(limit=limit):
+        e = d.entity
+        if not getattr(e, "bot", False):
+            continue
+        un = (getattr(e, "username", None) or "").lower()
+        if not un or un == own or UNI_BOT_NAME_RISK.search(un):
+            continue
+        has = bool(getattr(e, "bot_has_main_app", False))
+        if not has:
+            try:
+                full = await tg_client(GetFullUserRequest(e))
+                mb = getattr(getattr(full.full_user, "bot_info", None), "menu_button", None)
+                has = type(mb).__name__ == "BotMenuButton"
+            except Exception as ex:
+                if "FloodWait" in type(ex).__name__:
+                    break
+            await asyncio.sleep(0.6)
+        if has:
+            found.append(un)
+    return found
+
+
+async def uni_auto_add(name: str, notes: list):
+    if not V8_AP.get("auto_add"):
+        return
+    txt = "\n".join(notes or [])
+    if "açılış adresi alınamadı" in txt.lower() or "acilis adresi alinamadi" in txt.lower() or "Hedef bot" in txt:
+        return
+    if UNI_BOT_NAME_RISK.search(name):
+        return
+    bots = v8_ap_bots()
+    if name not in bots:
+        bots.append(name)
+        V8_AP["bots"] = bots
+        await persist_v8_ap()
+        await bot_app.bot.send_message(ADMIN_USER_ID, f"➕ @{name} otopilot listesine otomatik eklendi ({len(bots)} bot).")
+
+
+async def auto_link(name: str, short: str = "", start: str = ""):
+    if name in V8_TASKS and not V8_TASKS[name].done():
+        await v8_report(name, "Zaten sirada veya calisiyor.")
+        return
+    await v8_report(name, "İş sıraya alındı (evrensel mini app motoru). dur ile iptal.")
+
+    global AUTO_STOP
+    AUTO_STOP = False
+
+    async def job():
+        outcome, notes = await v8_run_and_track(name, short, start)
+        uni_track(name, outcome)
+        await persist_v8_ap()
+        await uni_auto_add(name, notes)
+
+    V8_TASKS[name] = spawn(job())
+
+
+def v8_ap_status_text() -> str:
+    on = "AÇIK" if V8_AP.get("on") else "KAPALI"
+    last = V8_AP.get("last") or 0
+    ago = f" | son tur: {int((time.time() - last) / 60)} dk önce" if last else ""
+    bl = v8_ap_bots()
+    paused = [b for b in bl if uni_paused(b)]
+    if len(bl) <= 15:
+        bots_s = ", ".join("@" + x for x in bl) if bl else "(liste boş)"
+    else:
+        bots_s = ", ".join("@" + x for x in bl[:15]) + f" … (+{len(bl) - 15})"
+    return (
+        f"V8 Otopilot: {on}\n"
+        f"Botlar ({len(bl)}): {bots_s}\n"
+        f"Beklemede (üst üste hata): {', '.join('@' + b for b in paused) or '-'}\n"
+        f"Oto-ekle (radar yeni mini app bulunca): {'AÇIK' if V8_AP.get('auto_add') else 'KAPALI'}\n"
+        f"Son bot: @{V8_AP.get('bot', '-')}\n"
+        f"Aralık: {V8_AP.get('min_m')}-{V8_AP.get('max_m')} dk (rastgele)\n"
+        f"Başarılı: {V8_AP.get('n_ok', 0)} | Atlanan: {V8_AP.get('n_skip', 0)} | Hata: {V8_AP.get('n_err', 0)}{ago}\n"
+        f"Son not: {V8_AP.get('last_note', '')[:120]}\n\n"
+        f"otopilot aç / kapat\n"
+        f"otopilot tara  → hesabındaki tüm mini app botlarını ekle\n"
+        f"otopilot hepsi → tara + aç\n"
+        f"otopilot otoekle aç / kapat\n"
+        f"otopilot ekle botadi  |  otopilot sil botadi  |  otopilot temizle\n"
+        f"Tek sefer: @botadi veya t.me linki"
+    )
+
 
 
 async def main():
@@ -4761,7 +5532,7 @@ async def main():
     INSPECT_LOCK = asyncio.Lock()
 
     print("=" * 60)
-    print("AIRDROP RADARI v3 + GROQ")
+    print("AIRDROP RADARI v3 + GROQ + V8.28 EVRENSEL MINI APP")
     print("=" * 60)
     print("[KONFIG] ADMIN =", ADMIN_USER_ID)
     print("[KONFIG] PORT =", PORT)
@@ -4850,7 +5621,7 @@ async def main():
             f"Groq: {'acik' if GROQ_API_KEY else 'kapali'}\n"
             f"V8 otopilot: {'AÇIK' if V8_AP.get('on') else 'kapalı'} "
             f"({V8_AP.get('min_m')}-{V8_AP.get('max_m')} dk)\n\n"
-            f"Özel sohbet: @MyAgeApp  |  otopilot aç  |  dur",
+            f"Özel sohbet: @botadi  |  otopilot hepsi  |  otopilot aç  |  dur",
         )
     except Exception as e:
         print("[ADMIN MSG HATA]", repr(e))
