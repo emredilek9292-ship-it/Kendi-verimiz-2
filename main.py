@@ -3223,62 +3223,129 @@ async def v810_screen(page):
     except Exception:
         return ''
 
-def v821_find_balance(text):
+def _v821_clean_lines(text):
     if not text:
-        return None
-    lines=[x.strip() for x in text.splitlines() if x.strip()]
-    for i,line in enumerate(lines):
-        if line.lower()=='balance':
-            # Bakiye degeri Balance'in hemen altindaki sayidir.
-            for j in range(i+1,min(i+4,len(lines))):
-                if re.fullmatch(r'\d+(?:[.,]\d+)*',lines[j]):
-                    try:
-                        return float(lines[j].replace(',',''))
-                    except Exception:
-                        pass
+        return []
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+def _v821_first_pure_number(lines, start, window=5):
+    """Etiketten sonraki window satırda yalnızca saf sayı olan ilk satırı döndür."""
+    for j in range(start, min(start + window, len(lines))):
+        s = lines[j].replace(",", "").replace(" ", "")
+        if re.fullmatch(r"\d+(?:\.\d+)?", s):
+            try:
+                return float(s)
+            except ValueError:
+                pass
     return None
+
+
+def v821_find_balance(text):
+    """
+    Balance değerini güvenli oku.
+    - 'Balance' tam satır eşleşmesi aranır.
+    - Altındaki ilk saf sayı alınır.
+    - Aynı etiketten birden fazla aday veya sayı yoksa None döner (başarı ilan edilmez).
+    """
+    lines = _v821_clean_lines(text)
+    candidates = []
+    for i, line in enumerate(lines):
+        if line.lower() == "balance":
+            val = _v821_first_pure_number(lines, i + 1, window=4)
+            if val is not None:
+                candidates.append(val)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
 
 def v821_find_vault(text):
-    if not text:
-        return None
-    lines=[x.strip() for x in text.splitlines() if x.strip()]
-    for i,line in enumerate(lines):
-        if line.lower()=='vault':
-            # Kasa degeri Vault'un hemen altindaki 0 satiridir.
-            for j in range(i+1,min(i+4,len(lines))):
-                if re.fullmatch(r'\d+(?:[.,]\d+)*',lines[j]):
-                    try:
-                        return float(lines[j].replace(',',''))
-                    except Exception:
-                        pass
+    """
+    Vault (kasa) miktarını güvenli oku.
+    - 'Vault' tam satır eşleşmesi aranır.
+    - '21 AGE an hour...' gibi metinli satırlar atlanır, ilk saf sayı alınır.
+    - Birden fazla aday veya sayı yoksa None.
+    """
+    lines = _v821_clean_lines(text)
+    candidates = []
+    for i, line in enumerate(lines):
+        if line.lower() == "vault":
+            val = _v821_first_pure_number(lines, i + 1, window=5)
+            if val is not None:
+                candidates.append(val)
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
-def v821_verify(before,after):
-    notes=['V8.21: Balance satirinin hemen altindaki sayi bakiye olarak okundu.']
-    b=v821_find_balance(before)
-    a=v821_find_balance(after)
-    vb=v821_find_vault(before)
-    va=v821_find_vault(after)
-    if b is None or a is None:
-        notes.append('Bakiye etiketi okunamadi; bakiye kontrolu yapilmadi.')
-    elif a>b:
-        notes.append(f'Bakiye artti: {b:g} -> {a:g}.')
-    elif a==b:
-        notes.append(f'Bakiye degismedi: {b:g} -> {a:g}.')
+
+def v821_diagnose(text, label=""):
+    """Sadece teşhis. Tıklama yapmaz. Belirsiz durumda değeri reddeder."""
+    notes = []
+    if label:
+        notes.append(f"[{label}]")
+    lines = _v821_clean_lines(text)
+    bal = v821_find_balance(text)
+    vault = v821_find_vault(text)
+
+    bal_hits = [i for i, ln in enumerate(lines) if ln.lower() == "balance"]
+    if not bal_hits:
+        notes.append("Balance etiketi hiç bulunamadı.")
+    elif len(bal_hits) > 1:
+        notes.append(f"Balance etiketi {len(bal_hits)} kez göründü → belirsiz, değer alınmadı.")
+        for idx in bal_hits[:3]:
+            notes.append("  çevresi: " + " | ".join(lines[idx:idx+4]))
+    elif bal is None:
+        notes.append("Balance bulundu ama altında saf sayı yok.")
+        idx = bal_hits[0]
+        notes.append("  çevresi: " + " | ".join(lines[idx:idx+5]))
     else:
-        notes.append(f'Bakiye azaldi: {b:g} -> {a:g}.')
-    if vb is None or va is None:
-        notes.append('Kasa etiketi okunamadi; kasa kontrolu yapilmadi.')
+        notes.append(f"Balance net okundu: {bal:g}")
+
+    vault_hits = [i for i, ln in enumerate(lines) if ln.lower() == "vault"]
+    if not vault_hits:
+        notes.append("Vault etiketi hiç bulunamadı.")
+    elif len(vault_hits) > 1:
+        notes.append(f"Vault etiketi {len(vault_hits)} kez göründü → belirsiz, değer alınmadı.")
+        for idx in vault_hits[:3]:
+            notes.append("  çevresi: " + " | ".join(lines[idx:idx+5]))
+    elif vault is None:
+        notes.append("Vault bulundu ama altında saf sayı yok.")
+        idx = vault_hits[0]
+        notes.append("  çevresi: " + " | ".join(lines[idx:idx+6]))
     else:
-        notes.append(f'Kasa: {vb:g} -> {va:g}.')
-    if vb is not None and va is not None and vb==2 and va==0:
-        notes.append('Kasa 2 -> 0; kasa sifirlandi.')
+        notes.append(f"Vault (kasa) net okundu: {vault:g}")
+
+    return notes
+
+
+def v821_verify(before, after):
+    """
+    Claim öncesi/sonrası karşılaştırma (sadece okuma).
+    Başarı yalnızca her iki değer de net okunursa ve
+    kasa sıfırlanıp bakiye artarsa ilan edilir.
+    """
+    notes = ["V8.21-safe: Balance/Vault güvenli okuma (çoklu aday veya belirsizse reddedilir)."]
+    notes.extend(v821_diagnose(before, "ÖNCE"))
+    notes.extend(v821_diagnose(after, "SONRA"))
+
+    b = v821_find_balance(before)
+    a = v821_find_balance(after)
+    vb = v821_find_vault(before)
+    va = v821_find_vault(after)
+
+    if None in (b, a, vb, va):
+        notes.append("Değerlerden en az biri belirsiz → toplandı kabul edilmedi.")
+        return notes
+
+    notes.append(f"Bakiye: {b:g} → {a:g}")
+    notes.append(f"Kasa:   {vb:g} → {va:g}")
+
+    if va == 0 and a > b:
+        notes.append("Kasa sıfırlandı ve bakiye arttı → toplama doğrulandı.")
     else:
-        notes.append('Kasa 2 -> 0 bulunamadi; kasa sifirlanmadi.')
-    if b is not None and a is not None and a>b and vb==2 and va==0:
-        notes.append('Kasa 2 -> 0 ve bakiye artti; toplama dogrulandi.')
-    else:
-        notes.append('Beklenen kasa sifirlanmasi ve bakiye artisi birlikte gorulmedi; toplandi kabul edilmedi.')
+        notes.append("Beklenen kasa=0 + bakiye artışı birlikte görülmedi → toplandı kabul edilmedi.")
+
     return notes
 
 async def v816_find_claim(page):
@@ -3403,9 +3470,9 @@ async def v8_browser(name,url,state):
             notes.append(f"Claim adayi bulundu ve tiklandi: {label}.")
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
-            notes.extend(v821_verify(before_text,after_text))
-            notes.append("V8.21: bakiye etiketi Balance satirinin hemen altindaki sayi olarak okundu; satir numarasina baglanmadi.")
-            notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
+            notes.extend(v821_verify(before_text, after_text))
+            notes.append("V8.21-safe: Balance/Vault çoklu aday veya belirsizse reddedilir; başarı yalnız net kasa=0 + bakiye artışı ile ilan edilir.")
+            notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz. Bu sürüm otomatik tekrar kurmaz.")
             return notes
         finally:
             try:
@@ -3521,9 +3588,9 @@ async def v8_browser(name,url,state):
             await page.wait_for_timeout(3000)
             notes.append("Claim tiklamasi tamamlandi; ikinci tiklama yapilmadi.")
             after_text=await v810_screen(page)
-            notes.extend(v821_verify(before_text,after_text))
-            notes.append("V8.21: bakiye etiketi Balance satirinin hemen altindaki sayi olarak okundu; satir numarasina baglanmadi.")
-            notes.append("Sonradan acilan onay/odeme pencerelerine basilmaz. Bu surum otomatik tekrar kurmaz.")
+            notes.extend(v821_verify(before_text, after_text))
+            notes.append("V8.21-safe: Balance/Vault çoklu aday veya belirsizse reddedilir; başarı yalnız net kasa=0 + bakiye artışı ile ilan edilir.")
+            notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz. Bu sürüm otomatik tekrar kurmaz.")
             return notes
         finally:
             try:
