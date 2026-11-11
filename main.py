@@ -3184,9 +3184,25 @@ async def keepalive_loop():
 # ===================== MAIN =====================
 
 
-# ===== V8: exact MyAgeApp announcement only; single-run worker =====
+# ===== V8: MyAgeApp — güvenli claim + kontrollü otopilot =====
 V8_TASKS={}
 V8_LOCK=None
+V8_AP_KEY = os.getenv("V8_AP_KEY", "radar:v8_ap:v1").strip()
+V8_AP_FILE = os.getenv("V8_AP_FILE", "/tmp/radar_v8_ap.json")
+# on: otopilot açık mı | min_m/max_m: tur aralığı (dk) | istatistikler
+V8_AP = {
+    "on": False,
+    "bot": "myageapp",
+    "min_m": 45,
+    "max_m": 75,
+    "last": 0.0,
+    "n_ok": 0,
+    "n_skip": 0,
+    "n_err": 0,
+    "last_vault": None,
+    "last_bal": None,
+    "last_note": "",
+}
 
 
 def v8_canonical(text):
@@ -3211,6 +3227,39 @@ async def v8_public(url):
         return bool(rows) and all(ipaddress.ip_address(row[4][0]).is_global for row in rows)
     except Exception:
         return False
+
+
+async def persist_v8_ap():
+    await save_json(V8_AP_KEY, V8_AP_FILE, V8_AP)
+
+
+async def load_v8_ap():
+    data = await load_json(V8_AP_KEY, V8_AP_FILE)
+    if isinstance(data, dict):
+        V8_AP.update({k: data[k] for k in V8_AP if k in data})
+    print("[V8 OTOPILOT]", "acik" if V8_AP.get("on") else "kapali",
+          f"aralik={V8_AP.get('min_m')}-{V8_AP.get('max_m')}dk",
+          f"ok={V8_AP.get('n_ok')} skip={V8_AP.get('n_skip')} err={V8_AP.get('n_err')}")
+
+
+def v8_ap_status_text() -> str:
+    on = "AÇIK" if V8_AP.get("on") else "KAPALI"
+    last = V8_AP.get("last") or 0
+    ago = ""
+    if last:
+        m = int((time.time() - last) / 60)
+        ago = f" | son tur: {m} dk önce"
+    return (
+        f"V8 Otopilot: {on}\n"
+        f"Bot: @{V8_AP.get('bot', 'myageapp')}\n"
+        f"Aralık: {V8_AP.get('min_m')}-{V8_AP.get('max_m')} dk (rastgele)\n"
+        f"Başarılı: {V8_AP.get('n_ok', 0)} | Atlanan: {V8_AP.get('n_skip', 0)} | Hata: {V8_AP.get('n_err', 0)}"
+        f"{ago}\n"
+        f"Son kasa: {V8_AP.get('last_vault')} | Son bakiye: {V8_AP.get('last_bal')}\n"
+        f"Son not: {V8_AP.get('last_note', '')[:120]}\n\n"
+        f"Aç: otopilot aç   |  Kapat: otopilot kapat / dur\n"
+        f"Tek sefer: @MyAgeApp yaz"
+    )
 
 
 async def v8_report(name,text):
@@ -3580,6 +3629,14 @@ async def v8_browser(name,url,state):
             if risk.search(await claim.evaluate("e => (e.parentElement?.innerText || e.innerText).slice(0,1000)",timeout=3000)):
                 return notes+["Claim baglami degisti; tiklanmadi."]
             before_text=await v810_screen(page)
+            pre_vault = v821_find_vault(before_text)
+            pre_bal = v821_find_balance(before_text)
+            if pre_vault is not None and pre_vault <= 0:
+                notes.append(f"Kasa zaten {pre_vault:g}; claim atlandı (gereksiz tıklama yok).")
+                if pre_bal is not None:
+                    notes.append(f"Bakiye: {pre_bal:g}")
+                notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
+                return notes
             state["stage"]="claim_tiklama"
             try:
                 await claim.click(timeout=10000,no_wait_after=True)
@@ -3590,7 +3647,7 @@ async def v8_browser(name,url,state):
             after_text=await v810_screen(page)
             notes.extend(v821_verify(before_text, after_text))
             notes.append("V8.21-safe: Balance/Vault çoklu aday veya belirsizse reddedilir; başarı yalnız net kasa=0 + bakiye artışı ile ilan edilir.")
-            notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz. Bu sürüm otomatik tekrar kurmaz.")
+            notes.append("Sonradan açılan onay/ödeme pencerelerine basılmaz.")
             return notes
         finally:
             try:
@@ -3646,19 +3703,202 @@ async def auto_link(name: str,short: str="",start: str=""):
     if name in V8_TASKS and not V8_TASKS[name].done():
         await v8_report(name,"Zaten sirada veya calisiyor.")
         return
-    await v8_report(name,"V8 is siraya alindi. Yalniz taninmis MyAgeApp duyurusu kapatilacak; claim uygun bulunursa bir kez denenecek. Otomatik tekrar yok. dur ile iptal edebilirsin.")
+    await v8_report(name,"V8 iş sıraya alındı. Tanınmış duyuru kapatılır; kasa > 0 ise Claim bir kez denenir. dur ile iptal.")
     V8_TASKS[name]=spawn(v8_run(name,short,start))
+
+
+def _v8_notes_outcome(notes: list) -> str:
+    text = "\n".join(notes)
+    if "toplama doğrulandı" in text or "toplama dogrulandi" in text:
+        return "ok"
+    if "claim atlandı" in text or "claim atlandi" in text or "Kasa zaten" in text:
+        return "skip"
+    if "toplandı kabul edilmedi" in text or "toplandi kabul edilmedi" in text:
+        return "skip"
+    return "err"
+
+
+async def v8_run_and_track(name="myageapp", short="", start=""):
+    """Tek tur çalıştır, V8_AP istatistiğini güncelle."""
+    global V8_LOCK
+    if V8_LOCK is None:
+        V8_LOCK = asyncio.Lock()
+    state = {"stage": "sirada"}
+
+    async def work():
+        state["stage"] = "telegram_hedefi"
+        ent = await asyncio.wait_for(resolve_entity(name), 30)
+        if not getattr(ent, "bot", False):
+            return ["Hedef bot değil."]
+        state["stage"] = "telegram_kilidi"
+        if not await try_lock(TG_LOCK, 30):
+            return ["Telegram sırası boşalmadı."]
+        try:
+            state["stage"] = "start_gonderme"
+            await asyncio.wait_for(tg_client.send_message(ent, f"/start {start}".strip()), 30)
+            await asyncio.sleep(INSPECT_WAIT)
+        finally:
+            TG_LOCK.release()
+        state["stage"] = "mini_uygulama_kilidi"
+        if not await try_lock(APP_LOCK, 30):
+            return ["Mini uygulama sırası boşalmadı."]
+        try:
+            state["stage"] = "yetkili_adres_alma"
+            url, how, public = await asyncio.wait_for(get_webview_url(ent, name, short, start), 90)
+        finally:
+            APP_LOCK.release()
+        if not url:
+            return ["Yetkili açılış adresi alınamadı."]
+        return await v8_browser(name, url, state)
+
+    try:
+        async with V8_LOCK:
+            notes = await asyncio.wait_for(work(), 240)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        import traceback
+        stack = " > ".join(
+            f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}"
+            for f in traceback.extract_tb(e.__traceback__)[-6:]
+        )
+        print(f"[V8] stage={state['stage']} type={type(e).__name__} stack={stack}", flush=True)
+        notes = [f"Aşama: {state['stage']}", f"Hata: {type(e).__name__}",
+                 "Gizli bilgiler yazılmadı; ödül başarısı doğrulanmadı."]
+
+    outcome = _v8_notes_outcome(notes)
+    # son bakiye/kasa notlardan kabaca çekmeye çalış
+    joined = "\n".join(notes)
+    import re as _re
+    m_bal = _re.search(r"Bakiye(?: net okundu)?:\s*([0-9.]+)\s*→\s*([0-9.]+)", joined)
+    m_vault = _re.search(r"Kasa:\s*([0-9.]+)\s*→\s*([0-9.]+)", joined)
+    if m_bal:
+        V8_AP["last_bal"] = float(m_bal.group(2))
+    else:
+        m2 = _re.search(r"Balance net okundu:\s*([0-9.]+)", joined)
+        if m2:
+            V8_AP["last_bal"] = float(m2.group(1))
+    if m_vault:
+        V8_AP["last_vault"] = float(m_vault.group(2))
+    else:
+        m2 = _re.search(r"Vault \(kasa\) net okundu:\s*([0-9.]+)", joined)
+        if m2:
+            V8_AP["last_vault"] = float(m2.group(1))
+        m3 = _re.search(r"Kasa zaten ([0-9.]+)", joined)
+        if m3:
+            V8_AP["last_vault"] = float(m3.group(1))
+
+    V8_AP["last"] = time.time()
+    V8_AP["last_note"] = notes[-1] if notes else ""
+    if outcome == "ok":
+        V8_AP["n_ok"] = int(V8_AP.get("n_ok") or 0) + 1
+    elif outcome == "skip":
+        V8_AP["n_skip"] = int(V8_AP.get("n_skip") or 0) + 1
+    else:
+        V8_AP["n_err"] = int(V8_AP.get("n_err") or 0) + 1
+    await persist_v8_ap()
+    await v8_report(name, "\n".join(notes))
+    return outcome, notes
+
+
+async def v8_autopilot_loop():
+    """MyAgeApp kasa claim otopilotu. Sadece V8_AP['on'] iken tur atar."""
+    print("[V8 OTOPILOT] döngü hazır (kapalı başlar; 'otopilot aç' ile devreye girer)", flush=True)
+    while True:
+        try:
+            if not V8_AP.get("on"):
+                await asyncio.sleep(20)
+                continue
+            # aralık kontrolü
+            min_m = int(V8_AP.get("min_m") or 45)
+            max_m = int(V8_AP.get("max_m") or 75)
+            if max_m < min_m:
+                max_m = min_m
+            wait_s = random.randint(min_m * 60, max_m * 60)
+            last = float(V8_AP.get("last") or 0)
+            elapsed = time.time() - last
+            if last > 0 and elapsed < wait_s:
+                await asyncio.sleep(min(60, wait_s - elapsed))
+                continue
+            # çakışan tek seferlik iş varsa bekle
+            busy = any(not t.done() for t in V8_TASKS.values())
+            if busy:
+                await asyncio.sleep(30)
+                continue
+            bot = (V8_AP.get("bot") or "myageapp").lower()
+            await bot_app.bot.send_message(
+                ADMIN_USER_ID,
+                f"🔁 V8 otopilot turu başlıyor: @{bot}\n"
+                f"Kasa > 0 ise Claim bir kez denenecek. Durdurmak: dur / otopilot kapat",
+                disable_web_page_preview=True,
+            )
+            # Tek seferlik işlerle çakışmasın diye ayrı anahtar; döngü task'ını iptal etme
+            key = f"ap:{bot}"
+            task = asyncio.create_task(v8_run_and_track(bot))
+            V8_TASKS[key] = task
+            try:
+                outcome, notes = await task
+            except asyncio.CancelledError:
+                notes = ["Tur iptal edildi."]
+                outcome = "err"
+                raise
+            finally:
+                V8_TASKS.pop(key, None)
+            # bir sonraki tur için taze rastgele bekleme
+            wait_s = random.randint(min_m * 60, max_m * 60)
+            await bot_app.bot.send_message(
+                ADMIN_USER_ID,
+                f"💤 V8 otopilot: sonraki kontrol ~{wait_s // 60} dk sonra.\n"
+                f"Durum: {v8_ap_status_text()}",
+                disable_web_page_preview=True,
+            )
+            # bekleme sırasında kapatılırsa çıksın
+            end = time.time() + wait_s
+            while time.time() < end:
+                if not V8_AP.get("on"):
+                    break
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            print("[V8 OTOPILOT] iptal", flush=True)
+            raise
+        except Exception as e:
+            print("[V8 OTOPILOT HATA]", repr(e), flush=True)
+            V8_AP["n_err"] = int(V8_AP.get("n_err") or 0) + 1
+            V8_AP["last_note"] = f"döngü hata: {type(e).__name__}"
+            try:
+                await persist_v8_ap()
+            except Exception:
+                pass
+            await asyncio.sleep(120)
 
 
 async def v8_stop():
     global AUTO_STOP
-    AUTO_STOP=True
-    tasks=[t for t in V8_TASKS.values() if not t.done()]
+    AUTO_STOP = True
+    was_on = bool(V8_AP.get("on"))
+    V8_AP["on"] = False
+    await persist_v8_ap()
+    tasks = [t for t in V8_TASKS.values() if t is not None and not t.done()]
     for t in tasks:
-        t.cancel()
+        try:
+            t.cancel()
+        except Exception:
+            pass
     if tasks:
-        await asyncio.gather(*tasks,return_exceptions=True)
-    await bot_app.bot.send_message(ADMIN_USER_ID,"V8 isleri durduruldu. Gonderilmis islemler geri alinamaz.")
+        await asyncio.gather(*tasks, return_exceptions=True)
+    msg = "V8 işleri durduruldu."
+    if was_on:
+        msg += " Otopilot kapatıldı."
+    msg += " Gönderilmiş işlemler geri alınamaz."
+    await bot_app.bot.send_message(ADMIN_USER_ID, msg)
+
+
+async def v8_ap_set(on: bool):
+    V8_AP["on"] = bool(on)
+    if on and not V8_AP.get("last"):
+        V8_AP["last"] = 0.0  # hemen ilk turu tetikleyebilsin
+    await persist_v8_ap()
+    await bot_app.bot.send_message(ADMIN_USER_ID, v8_ap_status_text(), disable_web_page_preview=True)
 
 
 async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
@@ -3666,11 +3906,21 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if not user or not msg:
         return
     if user.id!=ADMIN_USER_ID or update.effective_chat.type!="private":
-        await msg.reply_text("V8 yalnizca bot sahibinin ozel sohbetinde kullanilir.")
+        await msg.reply_text("V8 yalnızca bot sahibinin özel sohbetinde kullanılır.")
         return
-    text=msg.text or msg.caption or ""
-    if text.strip().lower() in {"dur","durdur","kapat"}:
+    text=(msg.text or msg.caption or "").strip()
+    low=text.lower()
+    if low in {"dur","durdur","kapat"}:
         await v8_stop()
+        return
+    if low in {"otopilot", "otopilot durum", "otopilot status"}:
+        await msg.reply_text(v8_ap_status_text())
+        return
+    if low in {"otopilot aç", "otopilot ac", "otopilot on", "otopilot baslat", "otopilot başlat"}:
+        await v8_ap_set(True)
+        return
+    if low in {"otopilot kapat", "otopilot off", "otopilot durdur"}:
+        await v8_ap_set(False)
         return
     for e in list(msg.entities or [])+list(msg.caption_entities or []):
         if getattr(e,"url",None):
@@ -3692,8 +3942,16 @@ async def cmd_dur(update: Update,context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("V8: MyAgeApp icin bilinen duyuru OK + tek claim denemesi. "
-        "Bot sahibinin ozel sohbetinden @MyAgeApp gonder. Otomatik tekrar/rutin/otopilot kapali. dur ile iptal et.")
+    await update.effective_message.reply_text(
+        "V8 MyAgeApp\n\n"
+        "• Tek sefer: özel sohbetten @MyAgeApp gönder\n"
+        "• Otopilot aç: otopilot aç\n"
+        "• Otopilot kapat: otopilot kapat  veya  dur\n"
+        "• Durum: otopilot\n\n"
+        "Otopilot yalnızca kasa > 0 iken Claim dener; "
+        "bakiye artışı + kasa=0 doğrulanmadan başarı saymaz. "
+        "Cüzdan/ödeme işlerine dokunmaz."
+    )
 
 
 async def main():
@@ -3788,18 +4046,19 @@ async def main():
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
     spawn(keepalive_loop())
-    print("[V8] routine_loop bu surumde baslatilmadi",flush=True)
-    print("[V8] autopilot_loop bu surumde baslatilmadi",flush=True)
-    print("[V8] claims_loop bu surumde baslatilmadi",flush=True)
+    await load_v8_ap()
+    spawn(v8_autopilot_loop())
+    print("[V8] otopilot döngüsü hazır (kapalı; 'otopilot aç' ile çalışır)", flush=True)
+    print("[V8] eski routine/claims loop bu sürümde başlatılmadı", flush=True)
 
     try:
         await bot_app.bot.send_message(
             ADMIN_CHAT_ID,
-            f"Radar aktif (v3 + Groq)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
+            f"Radar aktif (v3 + Groq + V8 otopilot)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
             f"Groq: {'acik' if GROQ_API_KEY else 'kapali'}\n"
-            f"Otomatik inceleme: {'acik' if INSPECT else 'kapali'}\n"
-            f"Rutin: {len(ROUTINES)}\n\n"
-            f"/add -100... ile grup ekle, /incele botadi ile dene",
+            f"V8 otopilot: {'AÇIK' if V8_AP.get('on') else 'kapalı'} "
+            f"({V8_AP.get('min_m')}-{V8_AP.get('max_m')} dk)\n\n"
+            f"Özel sohbet: @MyAgeApp  |  otopilot aç  |  dur",
         )
     except Exception as e:
         print("[ADMIN MSG HATA]", repr(e))
