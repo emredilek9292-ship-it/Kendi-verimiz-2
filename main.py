@@ -1,5 +1,5 @@
 """
-Airdrop / oyun bot radari (v3 + Groq + V8.30 evrensel mini app motoru — tüm görevler)
+Airdrop / oyun bot radari (v3 + Groq + V8.31 evrensel mini app motoru — tüm görevler + profil sonrası görevler)
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -3828,6 +3828,12 @@ async def v8_pxe_run_community_tasks(page, notes, state, max_tasks: int = 8):
             await page.wait_for_timeout(2500)
             # Açılan metinden / sayfadan link topla
             txt = await v810_screen(page)
+            try:
+                _d = await page.evaluate("() => window.__uni ? window.__uni.drain() : {links: []}") or {}
+                for _l in _d.get("links") or []:
+                    txt += "\n" + str(_l.get("url", ""))
+            except Exception:
+                pass
             targets = await v8_pxe_extract_join_targets(txt)
             # link butonları
             for a in await page.locator("a[href*='t.me']").all():
@@ -3868,9 +3874,13 @@ async def v8_pxe_run_community_tasks(page, notes, state, max_tasks: int = 8):
             "Satırlara tıklandı ama açık t.me linki yok; bilinen Pickaxe kanallarına yedek katılım deneniyor."
         )
         # Mini app çoğu zaman Telegram'a yönlendirir; yaygın duyuru/sohbet adları
-        fallbacks = ["PickaxeEmpire", "pickaxeempire", "PickaxeEmpireChat", "pickaxeempirechat"]
-        n = await v8_pxe_do_joins(fallbacks, notes)
-        notes.append(f"Yedek katılım: {n}/{len(fallbacks)} (yanlış kullanıcı adı olursa zararsız hata).")
+        fallbacks = ["PickaxeEmpire", "PickaxeEmpireChat"]
+        if time.time() - float(V8_AP.get("pxe_fb_t") or 0) < 7 * 86400:
+            notes.append("Yedek kanallara bu hafta zaten katılındı; tekrar denenmedi.")
+        else:
+            n = await v8_pxe_do_joins(fallbacks, notes)
+            V8_AP["pxe_fb_t"] = time.time()
+            notes.append(f"Yedek katılım: {n}/{len(fallbacks)}.")
     else:
         notes.append("Tıklanacak güvenli katılım satırı bulunamadı (hepsi tamamlanmış veya farklı metin).")
 
@@ -4665,6 +4675,8 @@ UNI_ADS = os.getenv("UNI_ADS", "0").strip() == "1"                   # "reklam i
 UNI_BOT_START = os.getenv("UNI_BOT_START", "0").strip() == "1"       # görevdeki başka botlara /start
 UNI_FAIL_PAUSE = int(os.getenv("UNI_FAIL_PAUSE", "5") or 5)          # üst üste bu kadar hata → bot beklemeye
 UNI_STATE_DIR = os.getenv("UNI_STATE_DIR", "/tmp/uni_state")
+UNI_AFTER_PROFILE = os.getenv("UNI_AFTER_PROFILE", "1").strip() != "0"  # MyAge/Pickaxe sonrası evrensel görevler
+V8_AP.setdefault("pxe_fb_t", 0)
 V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "600") or 600)
 
 V8_AP.setdefault("auto_add", False)   # radar yeni mini app bulunca listeye eklesin mi
@@ -5518,8 +5530,16 @@ async def v8_browser(name, url, state):
             if low in ("pickaxeempirebot", "pickaxe_empire_bot"):
                 notes.append("Pickaxe Empire özel profili seçildi.")
                 notes = await v8_pickaxe_flow(page, name, notes, state)
+                if UNI_AFTER_PROFILE:
+                    state["nav_links"] = nav_links
+                    notes.append("— Kalan görevler için evrensel motor —")
+                    notes = await uni_flow(page, name, notes, state)
             elif low == "myageapp":
                 notes = await v8_myage_page_flow(page, name, notes, state)
+                if UNI_AFTER_PROFILE:
+                    state["nav_links"] = nav_links
+                    notes.append("— Kalan görevler için evrensel motor (Spin / Achievements / Tasks) —")
+                    notes = await uni_flow(page, name, notes, state)
             else:
                 state["nav_links"] = nav_links
                 notes = await uni_flow(page, name, notes, state)
@@ -5535,6 +5555,8 @@ async def v8_browser(name, url, state):
 
 def _v8_notes_outcome(notes: list) -> str:
     text = "\n".join(notes)
+    if "toplama doğrulandı" in text or "toplama dogrulandi" in text or "HOLDING arttı" in text:
+        return "ok"
     if "Evrensel sonuç: OK" in text:
         return "ok"
     if "Evrensel sonuç: ATLANDI" in text or "Evrensel sonuç: BELIRSIZ" in text:
@@ -5631,7 +5653,13 @@ async def auto_link(name: str, short: str = "", start: str = ""):
         outcome, notes = await v8_run_and_track(name, short, start)
         uni_track(name, outcome)
         await persist_v8_ap()
-        await uni_auto_add(name, notes)
+        if outcome == "ok" and name not in v8_ap_bots() and not UNI_BOT_NAME_RISK.search(name):
+            # elle çalıştırılıp başarılı olan bot otopilota eklenir
+            V8_AP["bots"] = v8_ap_bots() + [name]
+            await persist_v8_ap()
+            await bot_app.bot.send_message(ADMIN_USER_ID, f"➕ @{name} başarılı çalıştı, otopilot listesine eklendi ({len(V8_AP['bots'])} bot). Çıkarmak için: otopilot sil {name}")
+        else:
+            await uni_auto_add(name, notes)
 
     V8_TASKS[name] = spawn(job())
 
