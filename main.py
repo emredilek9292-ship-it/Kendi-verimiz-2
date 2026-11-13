@@ -1,5 +1,14 @@
 """
-Airdrop / oyun bot radari (v3 + Groq + V8.33 evrensel mini app motoru — tüm görevler + profil sonrası görevler)
+Airdrop / oyun bot radari (v3 + V8.33 evrensel mini app motoru + V9 GROQ SİHİRBAZI)
+
+V9 Sihirbaz (yeni):
+  - Groq akıllandı: model zinciri (kapalı/limitli model atlanır), JSON modu, 429 bekleme, Gemini yedek.
+  - Mini app ekran yazılarını okur, cümleleri anlar; kural motoru bitince yapay zeka kalan güvenli
+    görevleri yapar (tıkla / gizli kodu yaz / kaydır / geri). Cüzdan-ödeme-davet adımları kodla engelli.
+  - Referans linkini ağ cevaplarından, sayfadan, Kopyala butonundan (pano yakalanır), Davet ekranından
+    ve bot sohbetinden bulur, kaydeder.
+  - Her mini app için Türkçe ÖZET + altında REFERANS LİNKİ gönderir; yapamadıklarını nedeniyle yazar.
+  - Komutlar: sihirbaz · özet botadi · özetler · referanslar · ref botadi link · sor <soru>
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -2175,7 +2184,7 @@ async def ref_finder(bot: str):
             for n in probe["notes"]:
                 lines.append(f"ℹ️ {n}")
         if not found:
-            lines += ["", f"Uygulamada Davet sayfasındaki Kopyala ile linki alıp şunu yazarsan kaydederim:",
+            lines += ["", "Uygulamada Davet sayfasındaki Kopyala ile linki alıp şunu yazarsan kaydederim:",
                       f"/ref {bot} <link>"]
         await send_admin("\n".join(lines))
     except Exception as e:
@@ -5886,6 +5895,1322 @@ def v8_ap_status_text() -> str:
 
 
 
+# =====================================================================
+# V9 — GROQ SİHİRBAZI (akıllı mini app asistanı)
+# ---------------------------------------------------------------------
+#  1) Akıllı Groq: model zinciri (biri kapalıysa / limiti dolduysa sıradakine
+#     geçer), JSON modu, 429'da bekleme süresini okur, Gemini yedek.
+#  2) Ekran okuma: mini app'te gezilen her ekranın yazısı kaydedilir; Groq
+#     yazıları/cümleleri okuyup anlar (hangi dilde olursa olsun).
+#  3) Yapay zeka ile görev: kural motoru bitince Groq ekrana bakıp "sıradaki
+#     güvenli adım" kararını verir (tıkla / kod yaz / kaydır / geri / bitir).
+#     Cüzdan, ödeme, Stars, TON, satın alma, davet/paylaşım ASLA yapılmaz —
+#     yapay zeka istese bile kod engeller.
+#  4) Referans avcısı: ağ cevapları (API JSON), sayfa HTML'i, kutucuklar,
+#     "Kopyala" butonu (pano yakalanır), Davet/Friends sekmesi, paylaş linki
+#     ve en son bot sohbetinden kişisel referans linkini bulur, kaydeder.
+#  5) Her mini app için Türkçe ÖZET + altında REFERANS LİNKİ gönderir.
+#     Yapamadığı şeyleri nedeniyle birlikte "❗ Yapamadıklarım" bölümüne yazar.
+#  6) Hata düzeltmeleri: 'dur' sonrası otopilot döngüsünün ölmesi, 4096
+#     karakteri aşan raporların çökmesi, 800+ sohbetli hesapta botların
+#     yanlışlıkla engellenmesi, FloodWait sırasında katılım denemesi,
+#     tıklanamayan butonlar (5 farklı tıklama yöntemi), açılmayan sayfa
+#     (temiz oturumla 1 kez daha dener).
+# Komutlar (özel sohbet): sihirbaz · özet botadi · özetler · referanslar ·
+#   ref botadi link · sor <soru> · sihirbaz aç/kapat · sihirbaz ai aç/kapat ·
+#   özet mod her|yeni|kapalı
+# =====================================================================
+
+from urllib.parse import unquote as _wiz_unquote
+
+if not os.getenv("V8_JOB_TIMEOUT"):
+    V8_JOB_TIMEOUT = 900  # sihirbaz adımları (AI + referans) için ek süre
+
+WIZ_AI_STEPS = int(os.getenv("WIZ_AI_STEPS", "10") or 10)          # bir botta en fazla AI kararı
+WIZ_AI_BUDGET_S = int(os.getenv("WIZ_AI_BUDGET_S", "170") or 170)  # AI keşif süresi (sn)
+WIZ_REF_BUDGET_S = int(os.getenv("WIZ_REF_BUDGET_S", "70") or 70)  # referans avı süresi (sn)
+WIZ_AI_GAP = float(os.getenv("WIZ_AI_GAP", "2.5") or 2.5)          # iki Groq isteği arası en az sn
+WIZ_SUM_KEY = os.getenv("WIZ_SUM_KEY", "radar:wiz_sum:v1").strip()
+WIZ_SUM_FILE = os.getenv("WIZ_SUM_FILE", "/tmp/radar_wiz_sum.json")
+WIZ_RESEND_H = int(os.getenv("WIZ_RESEND_H", "24") or 24)          # 'yeni' modda aynı bot özeti en az kaç saatte bir
+
+_wiz_chain_env = os.getenv("GROQ_MODELS", "").strip()
+GROQ_CHAIN = [m.strip() for m in (
+    ([GROQ_MODEL] if GROQ_MODEL else [])
+    + (_wiz_chain_env.split(",") if _wiz_chain_env else
+       ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b",
+        "qwen/qwen3.8-27b", "llama-3.1-8b-instant"])
+) if m.strip()]
+GROQ_CHAIN = list(dict.fromkeys(GROQ_CHAIN))
+
+V8_AP.setdefault("wiz_on", True)       # sihirbaz (özet + referans) açık mı
+V8_AP.setdefault("wiz_ai", True)       # yapay zeka ile görev adımları açık mı
+V8_AP.setdefault("wiz_ap_mode", "yeni")  # otopilotta özet: her | yeni | kapali
+
+WIZ_SUM: dict = {}          # bot -> {"t","outcome","summary","ref","ref_src","problems"}
+WIZ_CUR: dict = {}          # o an çalışan botun canlı verisi
+WIZ_ME = {"id": None}
+GROQ_STATE = {"dead": {}, "cool": {}, "last": 0.0, "lock": None, "used": {}}
+
+WIZ_SYSTEM = (
+    "Sen Telegram mini uygulamaları (tap-to-earn, farm, airdrop, görev oyunları) konusunda uzman, "
+    "dikkatli bir asistansın. Metinler HANGİ DİLDE olursa olsun (İngilizce, Rusça, Çince...) okuyup "
+    "anlarsın ve HER ZAMAN TÜRKÇE cevap verirsin. Kurallar: 1) Sadece sana verilen bilgiyi kullan, "
+    "ASLA uydurma; bilmiyorsan 'belirsiz' de. 2) Cüzdan bağlama, ödeme, Stars, TON, USDT, satın alma, "
+    "yatırım, çekim, depozito, telefon numarası, arkadaş daveti, hikaye/paylaşım adımlarını ASLA önerme "
+    "ve seçme. 3) Kısa, net, maddeli yaz."
+)
+
+WIZ_RISK_INPUT_RE = re.compile(
+    r"wallet|address|adres|e-?mail|phone|telefon|card|kart|password|şifre|sifre|seed|mnemonic|private|"
+    r"amount|miktar|tutar|iban|\b0x|\bUQ|\bEQ|кошел|адрес|телефон|пароль", re.I)
+WIZ_REF_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})(?:/([A-Za-z0-9_]{1,64}))?/?\?(start|startapp)="
+    r"([A-Za-z0-9_\-%=.]{2,160})", re.I)
+WIZ_CODE_RE = re.compile(
+    r'"(ref(?:erral)?_?code|invite_?code|refCode|inviteCode|referralCode|ref_?link|referral_?link|invite_?link|'
+    r'inviteLink|referralLink|refLink|ref_?url|invite_?url|share_?link|shareLink|startParam|start_param)"\s*:\s*"([^"]{2,200})"',
+    re.I)
+WIZ_REF_NAV_RE = re.compile(
+    r"friend|frens|fren\b|invite|refer|referral|affiliate|squad|team\b|партн|друз|приглас|реферал|davet|arkada[şs]|ekip|tak[ıi]m|ortakl",
+    re.I)
+WIZ_COPY_RE = re.compile(r"copy|kopyala|копир|скопир|^\[ikon\]$|📋|⧉", re.I)
+WIZ_SHARE_RE = re.compile(r"invite|share|send|davet|payla[şs]|gönder|gonder|приглас|поделит|отправ", re.I)
+
+WIZ_SHIM_JS = r"""
+(() => {
+  const U = window.__uni;
+  if (!U || U.__wiz) return;
+  U.__wiz = 1;
+  U.clips = []; U.allLinks = [];
+  const origPush = Array.prototype.push;
+  U.links.push = function (...a) { try { origPush.apply(U.allLinks, a); } catch (e) {} return origPush.apply(this, a); };
+  // pano (Kopyala butonu) yakala — gerçek panoya yazmaz
+  try {
+    const fake = { writeText: (t) => { U.clips.push(String(t || '')); return Promise.resolve(); },
+                   readText: () => Promise.resolve(''),
+                   write: () => Promise.resolve(), read: () => Promise.resolve([]) };
+    Object.defineProperty(navigator, 'clipboard', { value: fake, configurable: true });
+  } catch (e) {}
+  try {
+    const oe = document.execCommand ? document.execCommand.bind(document) : null;
+    document.execCommand = function (cmd, ...rest) {
+      try {
+        if (String(cmd).toLowerCase() === 'copy') {
+          const a = document.activeElement;
+          let t = (window.getSelection && String(window.getSelection())) || '';
+          if (!t && a && 'value' in a) t = a.value;
+          U.clips.push(String(t || ''));
+          return true;
+        }
+      } catch (e) {}
+      return oe ? oe(cmd, ...rest) : false;
+    };
+  } catch (e) {}
+  U.fire = (t, d) => {
+    try {
+      const W = window.Telegram && window.Telegram.WebView;
+      if (W && typeof W.receiveEvent === 'function') { W.receiveEvent(t, d || {}); return true; }
+    } catch (e) {}
+    return false;
+  };
+  // yazı kutuları (kod girme görevleri için)
+  U.inputs = () => {
+    const out = [];
+    let n = 0;
+    for (const el of document.querySelectorAll('input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]), textarea')) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 20 || r.height < 10) continue;
+      const st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden') continue;
+      const id = 'w' + (++n);
+      el.setAttribute('data-wiz', id);
+      let ctx = '', p = el.parentElement;
+      for (let i = 0; p && i < 4; i++, p = p.parentElement) { const t = (p.innerText || '').replace(/\s+/g, ' ').trim(); if (t.length > 6) { ctx = t.slice(0, 160); break; } }
+      out.push({ id, ph: (el.placeholder || el.getAttribute('aria-label') || el.name || '').slice(0, 60),
+                 val: (el.value || '').slice(0, 200), ro: !!el.readOnly, type: el.type || 'text', ctx });
+      if (out.length >= 12) break;
+    }
+    return out;
+  };
+  // sayfadaki her yerden referans adayı
+  U.refBlob = () => {
+    const parts = [];
+    try { parts.push(document.documentElement.innerHTML.slice(0, 600000)); } catch (e) {}
+    try { for (const el of document.querySelectorAll('input, textarea')) parts.push(el.value || ''); } catch (e) {}
+    try { parts.push(U.clips.join('\n')); } catch (e) {}
+    try { parts.push(U.allLinks.map(x => x.url).join('\n')); } catch (e) {}
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); parts.push(k + '=' + String(localStorage.getItem(k)).slice(0, 2000)); } } catch (e) {}
+    return parts.join('\n');
+  };
+})();
+"""
+
+
+# ---------------------------------------------------------------- Groq ----
+
+def _wiz_is_gptoss(model: str) -> bool:
+    return model.lower().startswith("openai/gpt-oss")
+
+
+def _wiz_retry_after(resp, data) -> float:
+    try:
+        ra = resp.headers.get("retry-after")
+        if ra:
+            return float(ra)
+    except Exception:
+        pass
+    msg = json.dumps(data)[:600] if data else ""
+    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", msg)
+    if m:
+        return int(m.group(1) or 0) * 60 + float(m.group(2))
+    m = re.search(r"try again in (\d+)m", msg)
+    if m:
+        return int(m.group(1)) * 60
+    return 20.0
+
+
+async def groq_chat(messages: list, json_mode: bool = False, max_tokens: int = 900,
+                    temperature: float = 0.2, timeout: int = 60, gemini: bool = True):
+    """Akıllı Groq çağrısı: model zinciri + 429 bekleme + JSON modu. (metin | None, not) döner."""
+    if not GROQ_API_KEY and not (gemini and GEMINI_API_KEY):
+        return None, "GROQ_API_KEY yok"
+    assert http_session is not None
+    if GROQ_STATE["lock"] is None:
+        GROQ_STATE["lock"] = asyncio.Lock()
+    last_note = "Groq hata"
+    for model in (GROQ_CHAIN if GROQ_API_KEY else []):
+        now = time.time()
+        if GROQ_STATE["dead"].get(model, 0) > now or GROQ_STATE["cool"].get(model, 0) > now:
+            continue
+        use_json = json_mode
+        use_reason = _wiz_is_gptoss(model)
+        for attempt in range(4):
+            async with GROQ_STATE["lock"]:
+                gap = WIZ_AI_GAP - (time.time() - GROQ_STATE["last"])
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                GROQ_STATE["last"] = time.time()
+            body = {"model": model, "messages": messages, "temperature": temperature,
+                    "max_tokens": max_tokens + (1200 if _wiz_is_gptoss(model) else 0)}
+            if use_reason:
+                body["reasoning_effort"] = "low"
+            if use_json:
+                body["response_format"] = {"type": "json_object"}
+            try:
+                async with http_session.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json=body, timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = {}
+                    st = resp.status
+                    err = json.dumps(data.get("error") or {})[:400] if isinstance(data, dict) else ""
+                    if st == 429:
+                        wait = _wiz_retry_after(resp, data)
+                        last_note = f"Groq {model} limit"
+                        if wait <= 12 and attempt < 3:
+                            await asyncio.sleep(wait + 0.5)
+                            continue
+                        GROQ_STATE["cool"][model] = time.time() + min(wait, 6 * 3600)
+                        print(f"[GROQ] {model} limit doldu, {int(wait)} sn sıradaki modele geçiliyor", flush=True)
+                        break
+                    if st in (500, 502, 503, 504):
+                        last_note = f"Groq {model} {st}"
+                        await asyncio.sleep(2 + attempt * 3)
+                        continue
+                    if st == 400 and use_json and ("response_format" in err or "json" in err.lower()):
+                        use_json = False  # model JSON modunu desteklemiyor / bozuk JSON üretti → düz metin
+                        continue
+                    if st == 401:
+                        return None, "Groq anahtarı geçersiz (401)"
+                    el = err.lower()
+                    if st in (403, 404) or (st == 400 and any(w in el for w in (
+                            "decommission", "does not exist", "not found", "not have access", "model_not", "terms"))):
+                        GROQ_STATE["dead"][model] = time.time() + 6 * 3600
+                        last_note = f"Groq {model} kullanılamıyor ({st})"
+                        print(f"[GROQ] {model} kullanılamıyor: {st} {err[:160]}", flush=True)
+                        break
+                    if st == 400 and "reasoning" in el and use_reason:
+                        use_reason = False
+                        continue
+                    if st >= 400:
+                        last_note = f"Groq {model} {st}"
+                        print(f"[GROQ] {model} {st} {err[:200]}", flush=True)
+                        break
+                    msg = ((data.get("choices") or [{}])[0].get("message") or {})
+                    raw = (msg.get("content") or "").strip()
+                    raw = re.sub(r"(?s)<think>.*?</think>", "", raw).strip()
+                    if raw:
+                        GROQ_STATE["used"][model] = GROQ_STATE["used"].get(model, 0) + 1
+                        return raw, model
+                    last_note = f"Groq {model} boş cevap"
+                    break
+            except Exception as e:
+                last_note = f"Groq {model} {type(e).__name__}"
+                print("[GROQ EX]", model, repr(e), flush=True)
+                await asyncio.sleep(2)
+    # Groq'un tümü düşerse Gemini yedeği
+    if gemini and GEMINI_API_KEY:
+        flat = "\n\n".join(f"[{m['role']}]\n{m['content']}" for m in messages)
+        if json_mode:
+            flat += "\n\nSADECE geçerli JSON döndür."
+        raw, note = await _gemini(flat)
+        if raw:
+            return raw, "gemini"
+        last_note += f" / {note}"
+    return None, last_note
+
+
+def wiz_json(text: str):
+    if not text:
+        return None
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.M).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", t, re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
+
+
+# Eski Groq fonksiyonunu akıllı zincire bağla (radar rehberi / inceleme raporu da akıllanır)
+async def _groq(prompt_full: str):
+    raw, note = await groq_chat([{"role": "system", "content": WIZ_SYSTEM},
+                                 {"role": "user", "content": prompt_full}], max_tokens=1024, gemini=False)
+    return (raw, "") if raw else (None, note)
+
+
+# --------------------------------------------------- rapor / güvenli gönderim ----
+
+def _wiz_chunks(text: str, n: int = 3800) -> list:
+    out, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > n:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(line[:n])
+            line = line[n:]
+        if len(cur) + len(line) + 1 > n:
+            out.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        out.append(cur)
+    return [c for c in out if c.strip()] or ["(boş)"]
+
+
+async def wiz_send(text: str, kb=None):
+    """4096 sınırına takılmadan parça parça gönderir."""
+    chunks = _wiz_chunks(text or "(boş)")
+    for i, ch in enumerate(chunks):
+        try:
+            await bot_app.bot.send_message(ADMIN_USER_ID, ch.rstrip(), disable_web_page_preview=True,
+                                           reply_markup=kb if i == len(chunks) - 1 else None)
+        except Exception as e:
+            print("[WIZ SEND]", repr(e), flush=True)
+            try:
+                await bot_app.bot.send_message(ADMIN_USER_ID, ch.rstrip()[:3900], disable_web_page_preview=True)
+            except Exception:
+                pass
+
+
+async def v8_report(name, text):  # DÜZELTME: uzun log artık çökmeden parça parça gider
+    await wiz_send(f"@{name} — V8 SONUC\n{text}")
+
+
+# ------------------------------------------------------- kalıcı özetler ----
+
+async def wiz_persist():
+    if len(WIZ_SUM) > 300:
+        for k, _ in sorted(WIZ_SUM.items(), key=lambda kv: kv[1].get("t", 0))[: len(WIZ_SUM) - 300]:
+            WIZ_SUM.pop(k, None)
+    await save_json(WIZ_SUM_KEY, WIZ_SUM_FILE, WIZ_SUM)
+
+
+async def wiz_load():
+    data = await load_json(WIZ_SUM_KEY, WIZ_SUM_FILE)
+    if isinstance(data, dict):
+        WIZ_SUM.update(data)
+    print("[SIHIRBAZ] kayıtlı özet:", len(WIZ_SUM), "| Groq zinciri:", ", ".join(GROQ_CHAIN), flush=True)
+
+
+_wiz_load_v8_ap_base = load_v8_ap
+
+
+async def load_v8_ap():
+    await _wiz_load_v8_ap_base()
+    await wiz_load()
+
+
+async def wiz_me_id():
+    if WIZ_ME["id"] is None and tg_client:
+        try:
+            WIZ_ME["id"] = (await tg_client.get_me()).id
+        except Exception:
+            WIZ_ME["id"] = 0
+    return WIZ_ME["id"] or 0
+
+
+# ------------------------------------------------- ekran kaydı + tıklama ----
+
+def wiz_new_cur(name: str, start: str = "") -> dict:
+    cur = {"bot": name, "start": start or "", "screens": [], "sig": set(), "fails": [], "ai_log": [],
+           "ai_issues": [], "refs": {}, "codes": [], "net_n": 0, "ai_gain": [], "ai_steps": 0}
+    WIZ_CUR.clear()
+    WIZ_CUR.update(cur)
+    return WIZ_CUR
+
+
+async def uni_screen(page) -> str:
+    """Ekran yazısını okur ve sihirbaz için kaydeder (aynı ekranı iki kez saklamaz)."""
+    try:
+        txt = await page.locator("body").inner_text(timeout=4000)
+    except Exception:
+        return ""
+    if WIZ_CUR and txt:
+        sig = hashlib.sha1(uni_norm(txt)[:900].encode("utf-8", "ignore")).hexdigest()[:12]
+        if sig not in WIZ_CUR["sig"] and len(WIZ_CUR["screens"]) < 30:
+            WIZ_CUR["sig"].add(sig)
+            lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+            WIZ_CUR["screens"].append(" | ".join(dict.fromkeys(lines))[:1500])
+    return txt
+
+
+async def uni_click(page, c: dict) -> bool:
+    """DÜZELTME: 5 farklı yöntemle tıklar; hiçbiri olmazsa 'yapamadım' listesine yazar."""
+    loc = page.locator(f'[data-uni="{c["id"]}"]')
+    try:
+        cnt = await loc.count()
+    except Exception:
+        cnt = 0
+    if cnt:
+        try:
+            await loc.first.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        try:
+            await loc.first.click(timeout=5000, no_wait_after=True)
+            return True
+        except Exception:
+            pass
+        try:
+            await loc.first.click(timeout=3000, no_wait_after=True, force=True)
+            return True
+        except Exception:
+            pass
+        try:
+            box = await loc.first.bounding_box()
+            if box and box["width"] > 0:
+                x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                try:
+                    await page.touchscreen.tap(x, y)
+                except Exception:
+                    await page.mouse.click(x, y)
+                return True
+        except Exception:
+            pass
+        try:
+            await loc.first.dispatch_event("click", timeout=2500)
+            return True
+        except Exception:
+            pass
+    try:
+        ok = await page.evaluate(
+            "(id) => { const el = document.querySelector('[data-uni=\"' + id + '\"]'); if (!el) return false; el.click(); return true; }",
+            c["id"])
+        if ok:
+            return True
+    except Exception:
+        pass
+    if WIZ_CUR is not None and WIZ_CUR:
+        t = (c.get("text") or "?")[:40]
+        msg = f"'{t}' butonuna basılamadı (öğe kayboldu ya da üstü kapalı)"
+        if msg not in WIZ_CUR["fails"] and len(WIZ_CUR["fails"]) < 20:
+            WIZ_CUR["fails"].append(msg)
+    return False
+
+
+# ------------------------------------------------- referans toplama ----
+
+def wiz_add_refs(blob: str, src: str):
+    if not WIZ_CUR or not blob:
+        return 0
+    blob = blob.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+    n = 0
+    # paylaş linkleri: t.me/share/url?url=<kodlu ref>
+    for m in re.finditer(r"(?:t\.me|telegram\.me)/share/url\?([^\s\"'<>]+)", blob, re.I):
+        qs = parse_qs(m.group(1))
+        for v in (qs.get("url") or []) + (qs.get("text") or []):
+            n += wiz_add_refs(_wiz_unquote(v), src + "/paylaş")
+    for m in WIZ_REF_RE.finditer(blob):
+        bot_n, short, kind, param = m.group(1), m.group(2) or "", m.group(3), m.group(4)
+        low = bot_n.lower()
+        if low in SKIP_LINK_NAMES or low in ("share", "addlist"):
+            continue
+        param = _wiz_unquote(param).rstrip(".")
+        if WIZ_CUR.get("start") and param == WIZ_CUR["start"]:
+            continue  # bizi davet edenin linki, bizim değil
+        if re.fullmatch(r"[a-z]+(?:_[a-z]+)+", param):
+            continue  # botun kendi eylem parametresi
+        link = f"https://t.me/{bot_n}" + (f"/{short}" if short else "") + f"?{kind}={param}"
+        score = 1
+        if low == (WIZ_CUR.get("bot") or "").lower():
+            score += 3
+        me = WIZ_ME.get("id") or 0
+        if me and str(me) in param:
+            score += 4
+        if "pano" in src or "kopya" in src:
+            score += 2
+        if "davet" in src:
+            score += 1
+        old = WIZ_CUR["refs"].get(link)
+        if not old or old[0] < score:
+            WIZ_CUR["refs"][link] = (score, src)
+            n += 1
+    for m in WIZ_CODE_RE.finditer(blob):
+        k, v = m.group(1), m.group(2)
+        if "t.me/" in v:
+            n += wiz_add_refs(v, src + "/api")
+        elif 2 <= len(v) <= 64 and not v.startswith("eyJ") and (k, v) not in WIZ_CUR["codes"] and len(WIZ_CUR["codes"]) < 8:
+            if not (WIZ_CUR.get("start") and v == WIZ_CUR["start"]):
+                WIZ_CUR["codes"].append((k, v))
+    return n
+
+
+WIZ_REF_MIN_SCORE = 3  # başka botların (partner görev) linkleri yanlışlıkla 'senin referansın' sayılmasın
+
+
+def wiz_best_ref():
+    if not WIZ_CUR or not WIZ_CUR.get("refs"):
+        return None, ""
+    link, (score, src) = max(WIZ_CUR["refs"].items(), key=lambda kv: kv[1][0])
+    if score < WIZ_REF_MIN_SCORE:
+        return None, ""
+    return link, src
+
+
+async def wiz_collect_dom(page, src: str):
+    try:
+        blob = await page.evaluate("() => window.__uni && window.__uni.refBlob ? window.__uni.refBlob() : ''")
+    except Exception:
+        blob = ""
+    return wiz_add_refs(blob or "", src)
+
+
+def wiz_attach_network(page):
+    """API cevaplarındaki referans linki / kodunu dinler (sadece okur)."""
+    async def cap(resp):
+        try:
+            if not WIZ_CUR or WIZ_CUR.get("net_n", 0) > 250:
+                return
+            ct = (resp.headers or {}).get("content-type", "")
+            u = resp.url
+            if not ("json" in ct or "/api" in u or "graphql" in u or "text/plain" in ct):
+                return
+            WIZ_CUR["net_n"] = WIZ_CUR.get("net_n", 0) + 1
+            body = await asyncio.wait_for(resp.body(), 6)
+            if body and len(body) < 600_000:
+                wiz_add_refs(body.decode("utf-8", "ignore"), "ağ/API")
+        except Exception:
+            pass
+
+    page.on("response", lambda r: asyncio.ensure_future(cap(r)))
+
+
+async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
+    """Davet/Friends ekranını açıp referans linkini arar. Hiçbir şey paylaşılmaz/gönderilmez."""
+    state["stage"] = "sihirbaz_referans"
+    deadline = time.time() + WIZ_REF_BUDGET_S
+    await wiz_collect_dom(page, "sayfa")
+    link, _ = wiz_best_ref()
+    if link and WIZ_CUR["refs"][link][0] >= 4:
+        return
+    tried = set()
+    for _round in range(3):
+        if time.time() > deadline or AUTO_STOP:
+            break
+        cands = await uni_scan(page)
+        navs = [c for c in cands if WIZ_REF_NAV_RE.search(c.get("text") or "")
+                and not UNI_RISK_RE.search(c.get("text") or "") and len(c.get("text") or "") <= 30
+                and uni_norm(c["text"]) not in tried]
+        navs.sort(key=lambda c: (not c.get("navbar"), not c.get("bottom"), c["y"]))
+        if not navs:
+            break
+        tab = navs[0]
+        tried.add(uni_norm(tab["text"]))
+        if not await uni_click(page, tab):
+            continue
+        await page.wait_for_timeout(2800)
+        await uni_screen(page)
+        await wiz_collect_dom(page, "davet ekranı")
+        # Kopyala butonları (pano yakalanır, gerçek panoya gitmez)
+        cands = await uni_scan(page)
+        copies = [c for c in cands if WIZ_COPY_RE.search(c.get("text") or "")
+                  and (c.get("text") != "[ikon]" or re.search(r"link|t\.me|invite|refer|davet|code|kod|ссылк", c.get("ctx") or "", re.I))
+                  and not UNI_RISK_RE.search(c.get("text") or "")]
+        for c in copies[:3]:
+            if time.time() > deadline:
+                break
+            if await uni_click(page, c):
+                await page.wait_for_timeout(1200)
+                await wiz_collect_dom(page, "pano (kopyala)")
+        link, _ = wiz_best_ref()
+        if link:
+            break
+        # Davet et / Paylaş: köprü taklidi linki yakalar, Telegram'da HİÇBİR ŞEY paylaşılmaz
+        shares = [c for c in await uni_scan(page) if WIZ_SHARE_RE.search(c.get("text") or "")
+                  and not UNI_RISK_RE.search(c.get("text") or "") and len(c.get("text") or "") <= 40]
+        for c in shares[:2]:
+            if time.time() > deadline:
+                break
+            if await uni_click(page, c):
+                await page.wait_for_timeout(1500)
+                await wiz_collect_dom(page, "davet butonu (paylaşılmadı)")
+        link, _ = wiz_best_ref()
+        if link:
+            break
+    if link:
+        notes.append(f"Referans linki bulundu ({WIZ_CUR['refs'][link][1]}).")
+    elif WIZ_CUR["codes"]:
+        notes.append("Referans kodu benzeri alan bulundu: " + ", ".join(f"{k}={v}" for k, v in WIZ_CUR["codes"][:3]))
+
+
+# ------------------------------------------------- yapay zeka ile görev ----
+
+WIZ_STEP_PROMPT = (
+    "Bir Telegram mini uygulamasının içindesin ve kullanıcının hesabında güvenli görevleri tamamlıyorsun.\n"
+    "Aşağıda ekranın yazısı, tıklanabilir öğeler (id [tür] yazı — bağlam) ve yazı kutuları var.\n"
+    "Görevin: ekrandaki cümleleri OKU, ANLA ve ödül kazandıran SIRADAKİ TEK güvenli adımı seç.\n"
+    "Öncelik: açık pencereyi kapat/onayla > ödül topla (Claim/Collect/Daily/Check-in/Farm) > "
+    "görev başlat (Join/Subscribe/Visit/Watch/Play) > görev doğrula (Check/Verify) > görev sekmesine git.\n"
+    "Bir görev 'gizli kod / secret code / keyword' istiyorsa ve kod ekranda/metinde açıkça yazıyorsa "
+    "'yaz' eylemiyle o kutuya yaz. Kodu TAHMİN ETME.\n"
+    "YASAK: cüzdan, ödeme, Stars, TON, satın alma, yükseltme için para, davet/arkadaş, paylaş/hikaye, "
+    "telefon, e-posta. 'Denendi' listesindeki işe yaramamış öğeleri tekrar seçme.\n"
+    "Yapacak güvenli bir şey kalmadıysa eylem='bitir' de; bir görevi yapamıyorsan 'sorun' alanına "
+    "nedenini Türkçe yaz (ör: 'X görevi Twitter hesabı istiyor').\n"
+    "SADECE şu JSON'u döndür:\n"
+    '{"ekran":"ekranın 1 cümle Türkçe özeti","eylem":"tikla|yaz|kaydir|geri|bitir",'
+    '"id":"u12 veya w1","metin":"yaz eylemi için","neden":"kısa","sorun":""}\n\n'
+)
+
+
+async def wiz_ai_explore(page, name: str, notes: list, state: dict):
+    """Kural motorundan sonra Groq ile ekranı okuyup kalan görevleri yapmayı dener."""
+    if not (V8_AP.get("wiz_ai") and GROQ_API_KEY and WIZ_AI_STEPS > 0):
+        return
+    state["stage"] = "sihirbaz_ai"
+    run = state.get("uni_run") or {"clicked": {}, "actions": 0, "log": [], "gains": [], "joined": set(),
+                                   "join_ok": 0, "bot_seen": set(), "visited": [], "risky": set(),
+                                   "blocked": set(), "navs": {}, "navq": []}
+    deadline = time.time() + WIZ_AI_BUDGET_S
+    history, tried_bad, idle = [], {}, 0
+    written = set()
+    start_text = await uni_screen(page)
+    for step in range(1, WIZ_AI_STEPS + 1):
+        if time.time() > deadline or AUTO_STOP:
+            break
+        cands = await uni_scan(page)
+        try:
+            inputs = await page.evaluate("() => window.__uni && window.__uni.inputs ? window.__uni.inputs() : []") or []
+        except Exception:
+            inputs = []
+        allowed, lines = {}, []
+        cands.sort(key=lambda c: (not c.get("overlay"), c["y"]))
+        for c in cands:
+            k = uni_classify(c) or "diğer"
+            if k in ("risk", "skip"):
+                continue
+            t = (c.get("text") or "").strip()
+            if UNI_RISK_RE.search(t) or WIZ_REF_NAV_RE.search(t) and k not in ("reward", "check"):
+                continue
+            if tried_bad.get(uni_norm(t), 0) >= 2:
+                continue
+            allowed[c["id"]] = c
+            ctx = (c.get("ctx") or "")[:70].replace("\n", " ")
+            flag = " (pencere)" if c.get("overlay") else (" (alt menü)" if c.get("navbar") else "")
+            lines.append(f'{c["id"]} [{k}]{flag} "{t[:50]}" — {ctx}')
+            if len(lines) >= 45:
+                break
+        in_lines, in_ok = [], {}
+        for i in inputs:
+            if i.get("ro") or WIZ_RISK_INPUT_RE.search((i.get("ph") or "") + " " + (i.get("ctx") or "")):
+                continue
+            in_ok[i["id"]] = i
+            in_lines.append(f'{i["id"]} [yazı kutusu] ipucu="{i.get("ph", "")}" — {i.get("ctx", "")[:90]}')
+        if not allowed and not in_ok:
+            break
+        screen = await uni_screen(page)
+        scr = " | ".join([ln.strip() for ln in screen.splitlines() if ln.strip()])[:2000]
+        hist = "\n".join(history[-8:]) or "(yok)"
+        bad = ", ".join(list(tried_bad)[:12]) or "(yok)"
+        prompt = (WIZ_STEP_PROMPT + f"UYGULAMA: @{name}\nADIM: {step}/{WIZ_AI_STEPS}\n\nEKRAN YAZISI:\n{scr}\n\n"
+                  f"TIKLANABİLİR ÖĞELER:\n" + "\n".join(lines) +
+                  (("\n\nYAZI KUTULARI:\n" + "\n".join(in_lines)) if in_lines else "") +
+                  f"\n\nÖNCEKİ ADIMLAR:\n{hist}\n\nDENENDİ, İŞE YARAMADI: {bad}")
+        raw, model = await groq_chat([{"role": "system", "content": WIZ_SYSTEM},
+                                      {"role": "user", "content": prompt}], json_mode=True, max_tokens=300)
+        dec = wiz_json(raw)
+        if not dec:
+            WIZ_CUR["ai_issues"].append(f"Yapay zeka cevap vermedi ({model})")
+            break
+        WIZ_CUR["ai_steps"] += 1
+        act = str(dec.get("eylem") or "").lower().strip()
+        sorun = str(dec.get("sorun") or "").strip()
+        if sorun and sorun not in WIZ_CUR["ai_issues"] and len(WIZ_CUR["ai_issues"]) < 10:
+            WIZ_CUR["ai_issues"].append(sorun[:200])
+        if act in ("bitir", "done", "finish", ""):
+            history.append(f"{step}. bitir: {str(dec.get('neden') or '')[:80]}")
+            break
+        before = screen
+        did, label = False, ""
+        if act in ("tikla", "tıkla", "click"):
+            c = allowed.get(str(dec.get("id") or "").strip())
+            if not c:
+                history.append(f"{step}. geçersiz id seçildi ({dec.get('id')}) — listeden seç")
+                idle += 1
+                if idle >= 3:
+                    break
+                continue
+            label = c["text"][:40]
+            did = await uni_click(page, c)
+        elif act == "yaz":
+            i = in_ok.get(str(dec.get("id") or "").strip())
+            val = str(dec.get("metin") or "").strip()
+            if not i or not val or len(val) > 40 or WIZ_RISK_INPUT_RE.search(val) or UNI_RISK_RE.search(val):
+                history.append(f"{step}. yazma reddedildi (güvenli değil / geçersiz)")
+                idle += 1
+                continue
+            wkey = (uni_norm(i.get("ph") or "") + "|" + uni_norm(i.get("ctx") or "")[:60], val)
+            if wkey in written:
+                history.append(f"{step}. '{val}' bu kutuya ZATEN yazıldı — şimdi yanındaki gönder/onayla/check butonuna bas")
+                idle += 1
+                if idle >= 3:
+                    break
+                continue
+            written.add(wkey)
+            try:
+                await page.locator(f'[data-wiz="{i["id"]}"]').fill(val, timeout=4000)
+                did, label = True, f"{val} yazıldı"
+            except Exception:
+                WIZ_CUR["fails"].append(f"'{i.get('ph') or 'kutu'}' kutusuna yazılamadı")
+        elif act in ("kaydir", "kaydır", "scroll"):
+            try:
+                await page.mouse.wheel(0, 650)
+                await page.evaluate("() => { const el = [...document.querySelectorAll('*')].filter(e => e.scrollHeight > e.clientHeight + 40 && /auto|scroll/.test(getComputedStyle(e).overflowY)).sort((a, b) => b.clientHeight - a.clientHeight)[0]; if (el) el.scrollBy(0, 650); else window.scrollBy(0, 650); }")
+                did, label = True, "aşağı kaydırıldı"
+            except Exception:
+                pass
+        elif act in ("geri", "back"):
+            try:
+                fired = await page.evaluate("() => window.__uni && window.__uni.fire ? window.__uni.fire('back_button_pressed', {}) : false")
+                if not fired:
+                    await page.go_back(timeout=5000)
+                did, label = True, "geri"
+            except Exception:
+                pass
+        if not did:
+            tried_bad[uni_norm(label or str(dec.get("id")))] = tried_bad.get(uni_norm(label or str(dec.get("id"))), 0) + 1
+            history.append(f"{step}. {act} {label} → yapılamadı")
+            idle += 1
+            if idle >= 3:
+                break
+            continue
+        run["actions"] = run.get("actions", 0) + 1
+        run["log"].append(f"AI/{act}: {label[:30]}")
+        await page.wait_for_timeout(2600)
+        try:
+            await uni_handle_links(page, name, run, notes)
+        except Exception:
+            pass
+        after = await uni_screen(page)
+        gained = uni_gain(before, after)
+        diff = uni_diff(before, after)
+        changed = uni_norm(before)[:1500] != uni_norm(after)[:1500]
+        if gained and diff:
+            WIZ_CUR["ai_gain"].extend(diff[:2])
+        res = ("kazanç: " + ", ".join(diff[:2])) if gained and diff else ("ekran değişti" if changed else "değişmedi")
+        history.append(f"{step}. {act} '{label}' → {res} ({str(dec.get('neden') or '')[:60]})")
+        WIZ_CUR["ai_log"].append(f"{act} '{label}' → {res}")
+        if act == "yaz":
+            idle = 0  # yazmak tek başına ekranı değiştirmez; sıradaki adım gönder/onayla olur
+        elif not changed:
+            tried_bad[uni_norm(label)] = tried_bad.get(uni_norm(label), 0) + 1
+            idle += 1
+            if idle >= 3:
+                break
+        else:
+            idle = 0
+    if WIZ_CUR["ai_log"]:
+        notes.append(f"Sihirbaz (yapay zeka) {len(WIZ_CUR['ai_log'])} adım: " + " · ".join(WIZ_CUR["ai_log"][:12])[:1200])
+    end_text = await uni_screen(page)
+    if WIZ_CUR["ai_gain"] or uni_gain(start_text, end_text):
+        notes.append("Evrensel sonuç: OK")
+
+
+# --------------------------------------------------------- tarayıcı ----
+
+class _WizRetry(Exception):
+    pass
+
+
+async def v8_browser(name, url, state, _retry: bool = False):
+    """DÜZELTME: sayfa hata verirse / boş gelirse bozuk kayıtlı oturumu silip temiz oturumla 1 kez daha dener."""
+    try:
+        return await _wiz_browser_once(name, url, state, _retry)
+    except _WizRetry as r:
+        try:
+            os.remove(uni_state_path(name))
+        except Exception:
+            pass
+        if _retry:
+            return [f"{r}; temiz oturumla da açılamadı, işlem yapılmadı."]
+        if WIZ_CUR:
+            WIZ_CUR["fails"].append(f"İlk açılışta sorun ({r}); kayıtlı oturum silinip yeniden denendi")
+        return await v8_browser(name, url, state, _retry=True)
+
+
+async def _wiz_browser_once(name, url, state, _retry: bool = False):
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    if not await v8_public(url):
+        return ["Adres guvenlik kontrolunden gecmedi."]
+    notes = []
+    retry_needed = False
+    async with async_playwright() as p:
+        state["stage"] = "chromium_baslatma"
+        browser = await p.chromium.launch(headless=True, timeout=60000, args=["--disable-dev-shm-usage"])
+        context = None
+        try:
+            context = await uni_new_context(browser, name)
+            await context.add_init_script(UNI_SHIM_JS)
+            await context.add_init_script(WIZ_SHIM_JS)
+            cache = {}
+            nav_links = []
+
+            async def guard(route):
+                req = route.request
+                u = req.url
+                host = urlparse(u).netloc
+                try:
+                    if req.is_navigation_request() and uni_tme_from_nav(u):
+                        nav_links.append(u)
+                        if WIZ_CUR:
+                            wiz_add_refs(u, "yönlendirme")
+                        await route.abort()
+                        return
+                    if host not in cache:
+                        cache[host] = await v8_public(u)
+                    if cache[host] and urlparse(u).scheme == "https":
+                        await route.continue_()
+                    else:
+                        await route.abort()
+                except Exception:
+                    try:
+                        await route.abort()
+                    except Exception:
+                        pass
+
+            await context.route("**/*", guard)
+            page = await context.new_page()
+            page.set_default_timeout(10000)
+            if WIZ_CUR:
+                wiz_attach_network(page)
+            state["stage"] = "sayfa_acilisi"
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                if response and response.status >= 400:
+                    retry_needed = True
+                    raise _WizRetry(f"HTTP {response.status}")
+            except PWTimeout:
+                notes.append("Acilis suresi asildi; yuklenen ekran kontrol ediliyor.")
+            await page.locator("body").wait_for(state="attached", timeout=15000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(3000)
+            first = await uni_screen(page)
+            if not first.strip() and not _retry:
+                # boş ekran: bozuk kayıtlı oturum olabilir → temiz oturumla bir kez daha
+                await page.wait_for_timeout(5000)
+                first = await uni_screen(page)
+                if not first.strip():
+                    retry_needed = True
+                    raise _WizRetry("ekran boş geldi")
+            notes.append("Sayfa açıldı (Telegram köprüsü taklidi aktif)." + (" [temiz oturum]" if _retry else ""))
+            low = name.lower()
+            if low in ("pickaxeempirebot", "pickaxe_empire_bot"):
+                notes.append("Pickaxe Empire özel profili seçildi.")
+                notes = await v8_pickaxe_flow(page, name, notes, state)
+                if UNI_AFTER_PROFILE:
+                    state["nav_links"] = nav_links
+                    notes.append("— Kalan görevler için evrensel motor —")
+                    notes = await uni_flow(page, name, notes, state)
+            elif low == "myageapp":
+                notes = await v8_myage_page_flow(page, name, notes, state)
+                if UNI_AFTER_PROFILE:
+                    state["nav_links"] = nav_links
+                    notes.append("— Kalan görevler için evrensel motor (Spin / Achievements / Tasks) —")
+                    notes = await uni_flow(page, name, notes, state)
+            else:
+                state["nav_links"] = nav_links
+                notes = await uni_flow(page, name, notes, state)
+            # ---- sihirbaz: yapay zeka + referans ----
+            if V8_AP.get("wiz_on") and WIZ_CUR:
+                try:
+                    await asyncio.wait_for(wiz_ai_explore(page, name, notes, state), WIZ_AI_BUDGET_S + 60)
+                except asyncio.TimeoutError:
+                    WIZ_CUR["ai_issues"].append("Yapay zeka adımları süre sınırına takıldı")
+                except Exception as e:
+                    WIZ_CUR["ai_issues"].append(f"Yapay zeka adımı hata verdi: {type(e).__name__}")
+                try:
+                    await asyncio.wait_for(wiz_ref_hunt(page, name, notes, state), WIZ_REF_BUDGET_S + 30)
+                except Exception as e:
+                    print("[WIZ REF]", repr(e), flush=True)
+                run = state.get("uni_run") or {}
+                for sg, st in (run.get("task_sig") or {}).items():
+                    if not st.get("eff") and len(WIZ_CUR["fails"]) < 20:
+                        WIZ_CUR["fails"].append(f"Görev satırına basıldı ama bir şey açılmadı: {sg[:60]}")
+                for r_ in list(run.get("risky") or [])[:6]:
+                    WIZ_CUR["fails"].append(f"Güvenlik için basılmadı: {r_}")
+            return notes
+        finally:
+            if context is not None and not retry_needed:
+                await uni_save_state(context, name)
+            try:
+                await asyncio.wait_for(browser.close(), 15)
+            except Exception:
+                pass
+    return notes
+
+
+# ------------------------------------------------- özet + referans çıktısı ----
+
+WIZ_SUM_PROMPT = (
+    "Aşağıda bir Telegram mini uygulamasında botun gezdiği ekranların yazıları, yaptığı işlemlerin logu "
+    "ve yapamadığı şeyler var. Bunları OKU ve kullanıcı için TÜRKÇE bir özet yaz. SADECE verilen "
+    "bilgiyi kullan, uydurma. Tam olarak şu formatta yaz (başlıkları koru):\n"
+    "🎮 Uygulama: <ad> — <1 cümle ne olduğu>\n"
+    "📌 Nasıl çalışıyor: <2-3 cümle: tap/farm/görev/puan/token mantığı>\n"
+    "✅ Bu turda yaptıklarım:\n- ...\n"
+    "❗ Yapamadıklarım ve nedeni:\n- ... (yoksa '- yok')\n"
+    "👉 Senin elle yapman gerekenler:\n- ... (yoksa '- yok')\n"
+    "💰 Token / airdrop: <ekranda geçen bilgi, yoksa 'belirsiz'>\n"
+    "⭐ Değerlendirme: <1 cümle: devam etmeye değer mi, dikkat edilecek risk>\n"
+    "En fazla 1500 karakter.\n\n"
+)
+
+
+def wiz_fallback_summary(name: str, outcome: str, notes: list) -> str:
+    fails = WIZ_CUR.get("fails", []) + WIZ_CUR.get("ai_issues", [])
+    scr = (WIZ_CUR.get("screens") or [""])[0][:300]
+    out = [f"🎮 Uygulama: @{name}", "📌 Ekran: " + (scr or "okunamadı"),
+           "✅ Sonuç: " + uni_short_line(name, outcome, notes).split(" — ", 1)[-1]]
+    out.append("❗ Yapamadıklarım:\n" + ("\n".join("- " + f for f in fails[:8]) if fails else "- yok"))
+    prob = uni_problem_tr(notes)
+    if prob:
+        out.append("⚠️ Sorun: " + prob)
+    out.append("(Yapay zeka özeti alınamadı; kural tabanlı özet.)")
+    return "\n".join(out)
+
+
+async def wiz_make_summary(name: str, outcome: str, notes: list) -> str:
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        return wiz_fallback_summary(name, outcome, notes)
+    screens = "\n---\n".join(WIZ_CUR.get("screens", [])[:14])[:6000]
+    log = "\n".join(notes)[-3000:]
+    fails = "\n".join("- " + f for f in (WIZ_CUR.get("fails", []) + WIZ_CUR.get("ai_issues", []))[:15]) or "- yok"
+    prob = uni_problem_tr(notes) or "yok"
+    prompt = (WIZ_SUM_PROMPT + f"UYGULAMA: @{name}\nSONUÇ KODU: {outcome}\nGENEL SORUN: {prob}\n\n"
+              f"EKRAN YAZILARI:\n{screens or '(okunamadı)'}\n\nİŞLEM LOGU:\n{log}\n\nYAPAMADIKLARI:\n{fails}")
+    raw, model = await groq_chat([{"role": "system", "content": WIZ_SYSTEM},
+                                  {"role": "user", "content": prompt}], max_tokens=900)
+    if not raw:
+        return wiz_fallback_summary(name, outcome, notes)
+    return raw.strip()[:2200]
+
+
+async def wiz_ref_from_chat(name: str):
+    """Mini app'te bulunamazsa bot sohbetindeki davet menüsüne bakar."""
+    try:
+        ent = await asyncio.wait_for(resolve_entity(name), 20)
+        if not await try_lock(TG_LOCK, 20):
+            return None
+        try:
+            links = await asyncio.wait_for(ref_from_chat(ent, name), 45)
+        finally:
+            TG_LOCK.release()
+        for l in links or []:
+            wiz_add_refs(l, "bot sohbeti")
+    except Exception as e:
+        print("[WIZ REF CHAT]", repr(e), flush=True)
+    return wiz_best_ref()[0]
+
+
+async def wiz_finish(name: str, outcome: str, notes: list, source: str):
+    """Özet + referans linkini hazırlar, kaydeder, gerektiğinde gönderir."""
+    if not V8_AP.get("wiz_on"):
+        return
+    text_all = "\n".join(notes)
+    opened = "Sayfa açıldı" in text_all
+    link, src = wiz_best_ref()
+    if not link and opened:
+        link = await wiz_ref_from_chat(name)
+        src = WIZ_CUR["refs"][link][1] if link and link in WIZ_CUR.get("refs", {}) else src
+    saved = REFS.get(name) or {}
+    if link and saved.get("src") != "elle":
+        if saved.get("link") != link:
+            REFS[name] = {"link": link, "src": f"sihirbaz/{src}", "t": time.time()}
+            await persist_refs()
+    final_ref = (REFS.get(name) or {}).get("link") or link
+    final_src = (REFS.get(name) or {}).get("src") or src
+
+    prev = WIZ_SUM.get(name) or {}
+    mode = V8_AP.get("wiz_ap_mode", "yeni") if source == "ap" else "her"
+    problems = sorted(set(WIZ_CUR.get("fails", []) + WIZ_CUR.get("ai_issues", [])))
+    send = mode == "her" or (mode == "yeni" and (
+        not prev or time.time() - float(prev.get("t") or 0) > WIZ_RESEND_H * 3600
+        or (final_ref and final_ref != prev.get("ref")) or set(problems) - set(prev.get("problems") or [])))
+    if mode == "kapali":
+        send = False
+    summary = prev.get("summary", "")
+    if send or not prev:
+        summary = await wiz_make_summary(name, outcome, notes)
+    WIZ_SUM[name] = {"t": time.time(), "outcome": outcome, "summary": summary[:2200],
+                     "ref": final_ref or "", "ref_src": final_src or "", "problems": problems[:15]}
+    await wiz_persist()
+    if not send:
+        return
+    if final_ref:
+        ref_txt = f"🔗 Referans linkin ({final_src}):\n{final_ref}"
+    else:
+        codes = WIZ_CUR.get("codes") or []
+        ref_txt = "🔗 Referans linki: bulunamadı."
+        if codes:
+            ref_txt += "\nBulunan kod benzeri alanlar: " + ", ".join(f"{k}={v}" for k, v in codes[:3])
+        if not opened:
+            ref_txt += "\n(Mini uygulama açılamadığı için aranamadı.)"
+        ref_txt += f"\nUygulamada Davet ekranındaki linki kopyalayıp şunu yazarsan kaydederim:\nref {name} https://t.me/..."
+    kb_rows = [[InlineKeyboardButton(f"🤖 @{name} aç"[:60], url=f"https://t.me/{name}")]]
+    if final_ref and final_ref.startswith("https://t.me/"):
+        kb_rows.append([InlineKeyboardButton("🔗 Referans linki", url=final_ref)])
+    await wiz_send(f"🧙 SİHİRBAZ ÖZETİ — @{name}\n\n{summary}\n\n{ref_txt}", InlineKeyboardMarkup(kb_rows))
+
+
+_wiz_run_and_track_base = v8_run_and_track
+WIZ_RUN_LOCK = None
+
+
+async def v8_run_and_track(name="myageapp", short="", start="", source="manual"):
+    """Eski tur + sihirbaz (ekran okuma, AI görev, referans, özet). Botlar sırayla, veriler karışmaz."""
+    global WIZ_RUN_LOCK
+    if WIZ_RUN_LOCK is None:
+        WIZ_RUN_LOCK = asyncio.Lock()
+    async with WIZ_RUN_LOCK:
+        wiz_new_cur(name, start)
+        try:
+            await wiz_me_id()
+            outcome, notes = await _wiz_run_and_track_base(name, short, start)
+            try:
+                await asyncio.wait_for(wiz_finish(name, outcome, notes, source), 150)
+            except Exception as e:
+                print("[WIZ FINISH]", repr(e), flush=True)
+            return outcome, notes
+        finally:
+            WIZ_CUR.clear()
+
+
+# ---------------------------------------------- düzeltilmiş yardımcılar ----
+
+_wiz_do_join_base = do_join
+
+
+async def do_join(target: str) -> str:
+    """DÜZELTME: Telegram bekletirken (FloodWait) tekrar tekrar katılmayı denemez."""
+    if FLOOD_UNTIL > time.time():
+        return f"Telegram bekletiyor ({int((FLOOD_UNTIL - time.time()) / 60) + 1} dk), katılım sonraya bırakıldı."
+    return await _wiz_do_join_base(target)
+
+
+async def uni_dialog_usernames():
+    """DÜZELTME: TÜM sohbetler okunur; okunamazsa None (silme kontrolü atlanır, bot yanlışlıkla engellenmez)."""
+    try:
+        names = set()
+
+        async def collect():
+            async for d in tg_client.iter_dialogs(limit=None):
+                un = (getattr(d.entity, "username", None) or "").lower()
+                if un:
+                    names.add(un)
+        await asyncio.wait_for(collect(), 90)
+        return names if names else None
+    except Exception as e:
+        print(f"[V8] dialog listesi alınamadı: {type(e).__name__}", flush=True)
+        return None
+
+
+_wiz_short_line_base = uni_short_line
+
+
+def uni_short_line(bot: str, outcome: str, notes: list) -> str:
+    line = _wiz_short_line_base(bot, outcome, notes)
+    ref = (REFS.get(bot) or {}).get("link")
+    if ref:
+        line += f"\n   🔗 {ref}"
+    return line
+
+
+async def v8_autopilot_loop():
+    """DÜZELTME: 'dur' ile iş iptal edilince döngü artık ölmüyor; sonra 'otopilot aç' çalışır."""
+    print("[V8 OTOPILOT] döngü hazır (kapalı başlar; 'otopilot aç' ile devreye girer)", flush=True)
+    while True:
+        try:
+            if not V8_AP.get("on"):
+                await asyncio.sleep(20)
+                continue
+            min_m = int(V8_AP.get("min_m") or 45)
+            max_m = max(int(V8_AP.get("max_m") or 75), min_m)
+            wait_s = random.randint(min_m * 60, max_m * 60)
+            last = float(V8_AP.get("last") or 0)
+            elapsed = time.time() - last
+            if last > 0 and elapsed < wait_s:
+                await asyncio.sleep(min(60, wait_s - elapsed))
+                continue
+            if any(not t.done() for t in V8_TASKS.values()):
+                await asyncio.sleep(30)
+                continue
+            bots = v8_ap_bots()
+            if not bots:
+                await asyncio.sleep(300)
+                continue
+            await bot_app.bot.send_message(
+                ADMIN_USER_ID,
+                f"🔁 Otopilot turu başladı: {len(bots)} bot. Bitince tek mesajla özet atacağım.\n(Durdurmak için: dur)",
+                disable_web_page_preview=True,
+            )
+            round_lines = []
+            dialog_names = await uni_dialog_usernames()
+            for bot in bots:
+                if not V8_AP.get("on"):
+                    break
+                if uni_paused(bot):
+                    round_lines.append(f"⏸ @{bot} — üst üste hata verdiği için bekletiliyor")
+                    continue
+                if dialog_names is not None and float(uni_per(bot).get("last") or 0) > 0 and bot not in dialog_names:
+                    await uni_block_bot(bot)
+                    round_lines.append(f"🗑 @{bot} — sohbeti silmişsin; listeden çıkarıldı, bir daha açılmayacak")
+                    continue
+                if any(not t.done() for t in V8_TASKS.values()):
+                    await asyncio.sleep(20)
+                V8_AP["bot"] = bot
+                key = f"ap:{bot}"
+                task = asyncio.create_task(v8_run_and_track(bot, source="ap"))
+                V8_TASKS[key] = task
+                try:
+                    await asyncio.wait({task})  # iş iptal edilse bile döngü ayakta kalır
+                finally:
+                    V8_TASKS.pop(key, None)
+                if task.cancelled():
+                    round_lines.append(f"⏹ @{bot} — durduruldu")
+                    break
+                exc = task.exception()
+                if exc:
+                    outcome, notes = "err", [f"Hata: {type(exc).__name__}"]
+                else:
+                    outcome, notes = task.result()
+                uni_track(bot, outcome)
+                await persist_v8_ap()
+                round_lines.append(uni_short_line(bot, outcome, notes))
+                await asyncio.sleep(random.uniform(8, 20))
+            wait_s = random.randint(min_m * 60, max_m * 60)
+            await uni_send_round_summary(round_lines, wait_s)
+            end = time.time() + wait_s
+            while time.time() < end:
+                if not V8_AP.get("on"):
+                    break
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            print("[V8 OTOPILOT] iptal", flush=True)
+            raise
+        except Exception as e:
+            print("[V8 OTOPILOT HATA]", repr(e), flush=True)
+            V8_AP["n_err"] = int(V8_AP.get("n_err") or 0) + 1
+            V8_AP["last_note"] = f"döngü hata: {type(e).__name__}"
+            try:
+                await persist_v8_ap()
+            except Exception:
+                pass
+            await asyncio.sleep(120)
+
+
+# ------------------------------------------------------------ komutlar ----
+
+WIZ_HELP = (
+    "🧙 SİHİRBAZ KOMUTLARI\n"
+    "• @botadi veya t.me linki — çalıştır + özet + referans linki\n"
+    "• özet botadi — o mini app'in son özeti ve referans linki\n"
+    "• özetler — tüm mini app'ler (tek satır + ref linki)\n"
+    "• referanslar — kayıtlı tüm referans linklerin\n"
+    "• ref botadi https://t.me/... — referans linkini elle kaydet\n"
+    "• sor <soru> — yapay zekaya özetlere bakarak soru sor\n"
+    "• sihirbaz — durum  ·  sihirbaz aç / kapat\n"
+    "• sihirbaz ai aç / kapat — yapay zekanın görev adımları\n"
+    "• özet mod her | yeni | kapalı — otopilotta özet gönderimi\n"
+)
+
+
+def wiz_status_text() -> str:
+    now = time.time()
+    models = []
+    for m in GROQ_CHAIN:
+        if GROQ_STATE["dead"].get(m, 0) > now:
+            s = "kullanılamıyor"
+        elif GROQ_STATE["cool"].get(m, 0) > now:
+            s = f"limit, {int((GROQ_STATE['cool'][m] - now) / 60) + 1} dk"
+        else:
+            s = "hazır"
+        models.append(f"  - {m}: {s} ({GROQ_STATE['used'].get(m, 0)} istek)")
+    return (
+        f"🧙 Sihirbaz: {'AÇIK' if V8_AP.get('wiz_on') else 'KAPALI'}\n"
+        f"Yapay zeka görev adımları: {'AÇIK' if V8_AP.get('wiz_ai') else 'KAPALI'} (en fazla {WIZ_AI_STEPS} adım)\n"
+        f"Otopilotta özet: {V8_AP.get('wiz_ap_mode', 'yeni')}\n"
+        f"Groq: {'anahtar var' if GROQ_API_KEY else 'ANAHTAR YOK'} · Gemini yedek: {'var' if GEMINI_API_KEY else 'yok'}\n"
+        f"Model zinciri:\n" + "\n".join(models) + "\n"
+        f"Kayıtlı özet: {len(WIZ_SUM)} · Referans linki: {len(REFS)}\n\n" + WIZ_HELP
+    )
+
+
+_wiz_on_text_base = on_text
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user, msg = update.effective_user, update.effective_message
+    if not user or not msg or user.id != ADMIN_USER_ID or update.effective_chat.type != "private":
+        return await _wiz_on_text_base(update, context)
+    text = (msg.text or msg.caption or "").strip()
+    low = text.lower().replace("ı", "i").replace("ö", "o").replace("ü", "u").replace("ş", "s").replace("ç", "c").replace("ğ", "g")
+    if low in {"sihirbaz", "sihirbaz durum", "wizard"}:
+        await wiz_send(wiz_status_text())
+        return
+    if low in {"sihirbaz ac", "sihirbaz on"}:
+        V8_AP["wiz_on"] = True
+        await persist_v8_ap()
+        await msg.reply_text("🧙 Sihirbaz AÇIK: her mini app için özet + referans linki gelecek.")
+        return
+    if low in {"sihirbaz kapat", "sihirbaz off"}:
+        V8_AP["wiz_on"] = False
+        await persist_v8_ap()
+        await msg.reply_text("Sihirbaz KAPALI (eski V8 davranışı).")
+        return
+    if low in {"sihirbaz ai ac", "sihirbaz ai on", "ai ac"}:
+        V8_AP["wiz_ai"] = True
+        await persist_v8_ap()
+        await msg.reply_text("Yapay zeka görev adımları AÇIK.")
+        return
+    if low in {"sihirbaz ai kapat", "sihirbaz ai off", "ai kapat"}:
+        V8_AP["wiz_ai"] = False
+        await persist_v8_ap()
+        await msg.reply_text("Yapay zeka görev adımları KAPALI (sadece kural motoru + özet + referans).")
+        return
+    if low.startswith("ozet mod"):
+        m = low.split()[-1]
+        m = {"her": "her", "hepsi": "her", "yeni": "yeni", "kapali": "kapali", "kapat": "kapali"}.get(m)
+        if not m:
+            await msg.reply_text("Kullanım: özet mod her | yeni | kapalı")
+            return
+        V8_AP["wiz_ap_mode"] = m
+        await persist_v8_ap()
+        await msg.reply_text({"her": "Otopilotta her bot için her turda özet gelecek.",
+                              "yeni": f"Otopilotta özet: ilk kez, yeni referans/sorun çıkınca ya da {WIZ_RESEND_H} saatte bir.",
+                              "kapali": "Otopilotta özet gönderilmeyecek (özet: botadi ile bakabilirsin)."}[m])
+        return
+    if low in {"ozetler", "ozet liste", "ozet hepsi"}:
+        if not WIZ_SUM:
+            await msg.reply_text("Henüz özet yok. Bir bot adı / t.me linki gönder ya da 'otopilot aç' yaz.")
+            return
+        icon = {"ok": "✅", "skip": "➖", "err": "❌"}
+        lines = [f"🧙 Mini app özetleri ({len(WIZ_SUM)}):"]
+        for b, v in sorted(WIZ_SUM.items(), key=lambda kv: -float(kv[1].get("t") or 0)):
+            first = next((ln for ln in (v.get("summary") or "").splitlines() if ln.strip()), "")[:110]
+            lines.append(f"\n{icon.get(v.get('outcome'), '•')} @{b} — {first}")
+            lines.append(f"   🔗 {v.get('ref') or (REFS.get(b) or {}).get('link') or 'referans yok'}")
+        await wiz_send("\n".join(lines) + "\n\nAyrıntı: özet botadi")
+        return
+    if low.startswith("ozet "):
+        nm = parse_bot_arg(text.split(None, 1)[1]) or text.split(None, 1)[1].strip().lstrip("@").lower()
+        v = WIZ_SUM.get(nm)
+        if not v:
+            await msg.reply_text(f"@{nm} için özet yok. Önce @{nm} gönderip çalıştır.")
+            return
+        ago = int((time.time() - float(v.get("t") or 0)) / 60)
+        ref = v.get("ref") or (REFS.get(nm) or {}).get("link")
+        await wiz_send(f"🧙 @{nm} — {ago} dk önceki özet\n\n{v.get('summary')}\n\n"
+                       f"🔗 Referans linki: {ref or 'bulunamadı'}")
+        return
+    if low in {"referanslar", "reflerim", "ref liste", "refler"}:
+        if not REFS:
+            await msg.reply_text("Kayıtlı referans linki yok.")
+            return
+        await wiz_send("🔗 Referans linklerin:\n\n" + "\n\n".join(
+            f"@{b} ({v.get('src', '?')}):\n{v.get('link')}" for b, v in REFS.items()))
+        return
+    if low.startswith("ref ") and len(text.split()) >= 3:
+        parts = text.split()
+        nm, link = parse_bot_arg(parts[1]), parts[2]
+        if not link.lower().startswith("http"):
+            link = "https://" + link
+        if not nm or "t.me/" not in link.lower():
+            await msg.reply_text("Kullanım: ref botadi https://t.me/botadi?startapp=...")
+            return
+        REFS[nm] = {"link": link, "src": "elle", "t": time.time()}
+        await persist_refs()
+        if nm in WIZ_SUM:
+            WIZ_SUM[nm]["ref"] = link
+            await wiz_persist()
+        await msg.reply_text(f"✅ @{nm} referans linki kaydedildi.")
+        return
+    if low.startswith("sor "):
+        q = text.split(None, 1)[1]
+        ctx = "\n\n".join(f"@{b}:\n{(v.get('summary') or '')[:700]}\nRef: {v.get('ref') or '-'}"
+                          for b, v in list(WIZ_SUM.items())[:12])[:7000]
+        await msg.reply_text("🧙 Düşünüyorum…")
+        raw, model = await groq_chat([
+            {"role": "system", "content": WIZ_SYSTEM},
+            {"role": "user", "content": f"Kullanıcının mini app özetleri:\n{ctx or '(özet yok)'}\n\nSORU: {q}\n\n"
+                                        f"Türkçe, kısa ve net cevap ver; özetlerde yoksa bilmediğini söyle."}], max_tokens=700)
+        await wiz_send(raw or f"Cevap alınamadı ({model}).")
+        return
+    if low in {"komutlar", "yardim", "help"}:
+        await wiz_send(UNI_HELP_TEXT + "\n\n" + WIZ_HELP)
+        return
+    return await _wiz_on_text_base(update, context)
+
+
+@admin_only
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "🧙 V9 Groq Sihirbazı + V8 Mini App\n\n"
+        "• Bot adı / t.me linki gönder → mini app açılır, ekran yazıları okunur, kural motoru + yapay zeka "
+        "güvenli görevleri yapar, referans linkin bulunur, sonunda Türkçe ÖZET + altında REFERANS LİNKİ gelir.\n"
+        "• Yapamadığı şeyleri nedeniyle '❗ Yapamadıklarım' bölümünde yazar.\n"
+        "• otopilot tara / otopilot hepsi / otopilot aç / dur\n"
+        "• özetler · özet botadi · referanslar · sor <soru> · sihirbaz\n\n"
+        "Cüzdan, ödeme, Stars, TON, satın alma, davet ve paylaşım adımlarına asla basılmaz."
+    )
+
+
+
 async def main():
     global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK, APP_LOCK
 
@@ -5901,11 +7226,11 @@ async def main():
     INSPECT_LOCK = asyncio.Lock()
 
     print("=" * 60)
-    print("AIRDROP RADARI v3 + GROQ + V8.28 EVRENSEL MINI APP")
+    print("AIRDROP RADARI v3 + V8.33 EVRENSEL MINI APP + V9 GROQ SIHIRBAZI")
     print("=" * 60)
     print("[KONFIG] ADMIN =", ADMIN_USER_ID)
     print("[KONFIG] PORT =", PORT)
-    print("[KONFIG] GROQ =", GROQ_MODEL if GROQ_API_KEY else "yok")
+    print("[KONFIG] GROQ =", (" > ".join(GROQ_CHAIN)) if GROQ_API_KEY else "yok")
     print("[KONFIG] GEMINI =", GEMINI_MODEL if GEMINI_API_KEY else "yok")
     print("[KONFIG] MOD =", "sadece bot linkleri" if ONLY_BOTS else "genis filtre")
     print("[KONFIG] INSPECT =", INSPECT, "| RUTIN =", ROUTINES_ON)
@@ -5986,11 +7311,12 @@ async def main():
     try:
         await bot_app.bot.send_message(
             ADMIN_CHAT_ID,
-            f"Radar aktif (v3 + Groq + V8 otopilot)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
-            f"Groq: {'acik' if GROQ_API_KEY else 'kapali'}\n"
+            f"Radar aktif (v3 + V8 otopilot + 🧙 V9 Groq Sihirbazı)\nDinlenen: {len(ACTIVE_SOURCES)}\n"
+            f"Groq: {'acik' if GROQ_API_KEY else 'kapali'} · Sihirbaz: {'AÇIK' if V8_AP.get('wiz_on') else 'kapalı'}"
+            f" · AI görev: {'AÇIK' if V8_AP.get('wiz_ai') else 'kapalı'}\n"
             f"V8 otopilot: {'AÇIK' if V8_AP.get('on') else 'kapalı'} "
             f"({V8_AP.get('min_m')}-{V8_AP.get('max_m')} dk)\n\n"
-            f"Özel sohbet: @botadi  |  otopilot hepsi  |  otopilot aç  |  dur",
+            f"Özel sohbet: @botadi  |  otopilot hepsi  |  otopilot aç  |  özetler  |  sihirbaz  |  dur",
         )
     except Exception as e:
         print("[ADMIN MSG HATA]", repr(e))
