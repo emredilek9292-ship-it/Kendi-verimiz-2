@@ -1,5 +1,5 @@
 """
-Airdrop / oyun bot radari (v3 + Groq + V8.32 evrensel mini app motoru — tüm görevler + profil sonrası görevler)
+Airdrop / oyun bot radari (v3 + Groq + V8.33 evrensel mini app motoru — tüm görevler + profil sonrası görevler)
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -2727,11 +2727,12 @@ async def on_group_message(event):
         # Otomatik inceleme: botlara /start yazip cevabi oku (grup mesajinda uyari varsa acma)
         if INSPECT and bots and not warn:
             for b in bots:
-                spawn(inspect_bot(b))
+                if b.lower().lstrip("@") not in (V8_AP.get("blocked") or []):
+                    spawn(inspect_bot(b))
         # Oto-ekle açıksa: yeni bulunan botu evrensel motorla dene, açılırsa otopilot listesine ekle
         if bots and not warn and V8_AP.get("auto_add"):
             for b in bots:
-                if not UNI_BOT_NAME_RISK.search(b):
+                if not UNI_BOT_NAME_RISK.search(b) and b.lower().lstrip("@") not in (V8_AP.get("blocked") or []):
                     spawn(auto_link(b))
     except Exception as e:
         print("[LISTENER]", repr(e))
@@ -3210,6 +3211,12 @@ V8_AP = {
     "last_bal": None,
     "last_note": "",
     "cursor": 0,  # listedeki sıradaki bot
+    # V8.33: yeniden başlatmada kaybolmasın
+    "auto_add": False,
+    "per": {},
+    "pxe_fb_t": 0,
+    "blocked": [],     # 'otopilot sil' ile çıkarılan / sohbeti silinen botlar — bir daha açılmaz
+    "report": "kisa",  # kisa | detay
 }
 
 
@@ -3252,10 +3259,11 @@ async def load_v8_ap():
 
 def v8_ap_bots() -> list:
     bots = V8_AP.get("bots")
-    if isinstance(bots, list) and bots:
-        return [str(b).lower().lstrip("@") for b in bots if str(b).strip()]
+    blocked = set(V8_AP.get("blocked") or [])
+    if isinstance(bots, list):
+        return [str(b).lower().lstrip("@") for b in bots if str(b).strip() and str(b).lower().lstrip("@") not in blocked]
     b = (V8_AP.get("bot") or "myageapp").lower().lstrip("@")
-    return [b] if b else ["myageapp"]
+    return [b] if b and b not in blocked else []
 
 
 def v8_ap_status_text() -> str:
@@ -4406,7 +4414,9 @@ async def v8_run_and_track(name="myageapp", short="", start=""):
     else:
         V8_AP["n_err"] = int(V8_AP.get("n_err") or 0) + 1
     await persist_v8_ap()
-    await v8_report(name, "\n".join(notes))
+    V8_LAST[name] = {"t": time.time(), "outcome": outcome, "notes": list(notes)}
+    if V8_AP.get("report") == "detay":
+        await v8_report(name, "\n".join(notes))
     return outcome, notes
 
 
@@ -4436,19 +4446,27 @@ async def v8_autopilot_loop():
                 continue
             bots = v8_ap_bots()
             if not bots:
-                V8_AP["bots"] = ["myageapp", "pickaxeempirebot"]
-                bots = v8_ap_bots()
+                # liste boşsa silinmiş botları geri ekleme; sadece bekle
+                await asyncio.sleep(300)
+                continue
             # Listedeki tüm botları bu turda sırayla çalıştır
             await bot_app.bot.send_message(
                 ADMIN_USER_ID,
-                f"🔁 V8 otopilot turu: {', '.join('@'+b for b in bots)}\n"
-                f"Durdurmak: dur / otopilot kapat",
+                f"🔁 Otopilot turu başladı: {len(bots)} bot. Bitince tek mesajla özet atacağım.\n(Durdurmak için: dur)",
                 disable_web_page_preview=True,
             )
+            round_lines = []
+            dialog_names = await uni_dialog_usernames()
             for bot in bots:
                 if not V8_AP.get("on"):
                     break
                 if uni_paused(bot):
+                    round_lines.append(f"⏸ @{bot} — üst üste hata verdiği için bekletiliyor")
+                    continue
+                # sohbeti Telegram'dan sildiysen: listeden çıkar, bir daha açma
+                if dialog_names is not None and float(uni_per(bot).get("last") or 0) > 0 and bot not in dialog_names:
+                    await uni_block_bot(bot)
+                    round_lines.append(f"🗑 @{bot} — sohbeti silmişsin; listeden çıkarıldı, bir daha açılmayacak")
                     continue
                 busy = any(not t.done() for t in V8_TASKS.values())
                 if busy:
@@ -4467,14 +4485,10 @@ async def v8_autopilot_loop():
                     V8_TASKS.pop(key, None)
                 uni_track(bot, outcome)
                 await persist_v8_ap()
+                round_lines.append(uni_short_line(bot, outcome, notes))
                 await asyncio.sleep(random.uniform(8, 20))
             wait_s = random.randint(min_m * 60, max_m * 60)
-            await bot_app.bot.send_message(
-                ADMIN_USER_ID,
-                f"💤 V8 otopilot: sonraki tur ~{wait_s // 60} dk sonra.\n"
-                f"{v8_ap_status_text()}",
-                disable_web_page_preview=True,
-            )
+            await uni_send_round_summary(round_lines, wait_s)
             # bekleme sırasında kapatılırsa çıksın
             end = time.time() + wait_s
             while time.time() < end:
@@ -4545,7 +4559,7 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
     if low in {"otopilot aç", "otopilot ac", "otopilot on", "otopilot baslat", "otopilot başlat"}:
         # Varsayılan listeyi garantile
         if not v8_ap_bots():
-            V8_AP["bots"] = ["myageapp", "pickaxeempirebot"]
+            await msg.reply_text("Otopilot listesi boş. Önce 'otopilot tara' yaz ya da 'otopilot ekle botadi' ile bot ekle.")
         await v8_ap_set(True)
         return
     if low in {"otopilot kapat", "otopilot off", "otopilot durdur"}:
@@ -4559,7 +4573,8 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"Tarama hatası: {type(e).__name__}")
             return
         bots = v8_ap_bots()
-        new = [b for b in found if b not in bots]
+        blocked = set(V8_AP.get("blocked") or [])
+        new = [b for b in found if b not in bots and b not in blocked]
         V8_AP["bots"] = bots + new
         await persist_v8_ap()
         await msg.reply_text(
@@ -4580,7 +4595,7 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Oto-ekle KAPALI.")
         return
     if low in {"otopilot temizle", "otopilot sifirla", "otopilot sıfırla"}:
-        V8_AP["bots"] = ["myageapp"]
+        V8_AP["bots"] = []
         V8_AP["per"] = {}
         await persist_v8_ap()
         await msg.reply_text(v8_ap_status_text())
@@ -4593,19 +4608,46 @@ async def on_text(update: Update,context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Kullanım: otopilot ekle botadi")
             return
         bots = v8_ap_bots()
+        V8_AP["blocked"] = [b for b in (V8_AP.get("blocked") or []) if b != name]
         if name not in bots:
             bots.append(name)
             V8_AP["bots"] = bots
-            await persist_v8_ap()
-        await msg.reply_text(v8_ap_status_text())
+        await persist_v8_ap()
+        await msg.reply_text(f"✅ @{name} otopilota eklendi. Listede {len(v8_ap_bots())} bot var.")
         return
     if low.startswith("otopilot sil") or low.startswith("otopilot del"):
         parts = text.split()
         name = parts[-1].lstrip("@").lower() if len(parts) >= 3 else ""
-        bots = [b for b in v8_ap_bots() if b != name]
-        V8_AP["bots"] = bots or ["myageapp"]
+        if not name:
+            await msg.reply_text("Kullanım: otopilot sil botadi")
+            return
+        await uni_block_bot(name)
+        await msg.reply_text(f"🗑 @{name} listeden çıkarıldı ve engellendi. 'otopilot tara' bile onu tekrar eklemez.\nGeri eklemek için: otopilot ekle {name}")
+        return
+    if low in {"rapor kısa", "rapor kisa", "rapor ozet", "rapor özet"}:
+        V8_AP["report"] = "kisa"
         await persist_v8_ap()
-        await msg.reply_text(v8_ap_status_text())
+        await msg.reply_text("Rapor: KISA. Her tur sonunda tek bir özet mesajı gelecek.")
+        return
+    if low in {"rapor detay", "rapor uzun"}:
+        V8_AP["report"] = "detay"
+        await persist_v8_ap()
+        await msg.reply_text("Rapor: DETAY. Her bot için teknik log da gelecek.")
+        return
+    if low.startswith("detay ") or low.startswith("son "):
+        nm = low.split(None, 1)[1].strip().lstrip("@")
+        rec = V8_LAST.get(nm)
+        if not rec:
+            await msg.reply_text(f"@{nm} için bu oturumda kayıt yok.")
+        else:
+            await msg.reply_text(f"@{nm} — son çalışmanın tam logu:\n" + "\n".join(rec["notes"])[:3900], disable_web_page_preview=True)
+        return
+    if low in {"komutlar", "yardım", "yardim", "help"}:
+        await msg.reply_text(UNI_HELP_TEXT)
+        return
+    if low in {"engelliler", "otopilot engelli"}:
+        bl = V8_AP.get("blocked") or []
+        await msg.reply_text("Engellenen botlar: " + (", ".join("@" + b for b in bl) if bl else "yok"))
         return
     for e in list(msg.entities or [])+list(msg.caption_entities or []):
         if getattr(e,"url",None):
@@ -4732,7 +4774,7 @@ UNI_NAV_RE = re.compile(
 )
 UNI_TASK_VERB_RE = re.compile(
     r"\b(?:join|subscribe|follow|visit|watch|play|open|start|launch|check out|explore|try|read|"
-    r"telegram|channel|chat|group|community|twitter|\bx\b|youtube|tiktok|instagram|discord|website|partner|"
+    r"telegram|channel|chat|group|community|twitter|on x\b|x\.com|youtube|tiktok|instagram|discord|website|partner|"
     r"kat[ıi]l|abone|takip|ziyaret|izle|oyna|kanal|sohbet|grup|"
     r"подпиш|вступ|перейд|канал|чат|смотр)\w*",
     re.I,
@@ -5120,7 +5162,7 @@ def uni_classify(c: dict) -> str:
         return ""
     if text == "[ikon]" and UNI_TASK_VERB_RE.search(ctx[:160]):
         return "task"
-    if UNI_AMOUNT_RE.match(text) and UNI_TASK_VERB_RE.search(ctx[:160]):
+    if UNI_AMOUNT_RE.match(text) and UNI_TASK_VERB_RE.search(ctx[:160]) and len(ctx) < 160:
         return "task"
     if 8 <= len(rowtxt) <= 140 and UNI_TASK_VERB_RE.search(rowtxt):
         return "task"
@@ -5294,6 +5336,10 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
                 order += [("check", x) for x in fresh(pg(groups["check"]), "check", limit=2)]
             gos = pg(groups["go"])
             tasks = groups["task"]
+            # tüm görev satırları sadece görev sekmelerinde (Earn/Tasks/Görevler…); Mine/Profile/Upgrade'de sadece sosyal görevler
+            task_tab = label != "ana" and bool(UNI_NAV_RE.match(re.sub(r"[\d+#>].*$", "", uni_norm(label)).strip() or "x"))
+            if not task_tab:
+                tasks = [c for c in tasks if UNI_SOCIAL_RE.search(c["text"] + " " + c["ctx"][:120]) and not UNI_AMOUNT_RE.match(c["text"])]
             if label == "ana":
                 gos = [c for c in gos if UNI_MAIN_GO_RE.match(c["text"]) or UNI_SOCIAL_RE.search(c["text"] + " " + c["ctx"][:120])]
                 tasks = [c for c in tasks if UNI_SOCIAL_RE.search(c["text"] + " " + c["ctx"][:120])]
@@ -5646,7 +5692,7 @@ async def uni_discover_bots(limit: int = 400) -> list:
 
 
 async def uni_auto_add(name: str, notes: list):
-    if not V8_AP.get("auto_add"):
+    if not V8_AP.get("auto_add") or name in (V8_AP.get("blocked") or []):
         return
     txt = "\n".join(notes or [])
     if "açılış adresi alınamadı" in txt.lower() or "acilis adresi alinamadi" in txt.lower() or "Hedef bot" in txt:
@@ -5661,11 +5707,141 @@ async def uni_auto_add(name: str, notes: list):
         await bot_app.bot.send_message(ADMIN_USER_ID, f"➕ @{name} otopilot listesine otomatik eklendi ({len(bots)} bot).")
 
 
+# ---------- V8.33: anlaşılır raporlar + engelli botlar ----------
+
+V8_LAST: dict = {}
+
+UNI_HELP_TEXT = (
+    "📖 KOMUTLAR\n"
+    "• otopilot aç / otopilot kapat — otomatik turları başlat/durdur\n"
+    "• otopilot hepsi — hesabındaki mini app botlarını bul + başlat\n"
+    "• otopilot tara — sadece bul ve listeye ekle\n"
+    "• otopilot ekle botadi — listeye ekle\n"
+    "• otopilot sil botadi — listeden çıkar ve ENGELLE (tekrar eklenmez)\n"
+    "• engelliler — engellenen botları göster\n"
+    "• otopilot — durum\n"
+    "• rapor kısa — tur sonunda tek özet (varsayılan)\n"
+    "• rapor detay — her bot için teknik log da gelsin\n"
+    "• detay botadi — o botun son tam logunu göster\n"
+    "• @botadi veya t.me linki — tek sefer çalıştır\n"
+    "• dur — çalışan işi durdur\n"
+    "Not: Telegram'da bir botun sohbetini silersen otopilot onu kendiliğinden listeden çıkarır."
+)
+
+UNI_STAGE_TR = {
+    "telegram_hedefi": "bot Telegram'da bulunamadı",
+    "telegram_kilidi": "Telegram meşguldü",
+    "start_gonderme": "/start gönderilemedi",
+    "mini_uygulama_kilidi": "başka bir iş sürüyordu",
+    "yetkili_adres_alma": "mini uygulama açılamadı (Telegram adres vermedi)",
+    "sayfa_acilisi": "sayfa yüklenemedi",
+    "chromium_baslatma": "tarayıcı başlatılamadı",
+}
+
+
+def uni_problem_tr(notes: list) -> str:
+    text = "\n".join(notes or [])
+    low = text.lower()
+    stage = ""
+    m = re.search(r"Aşama:\s*(\S+)", text)
+    if m:
+        stage = m.group(1)
+    err = ""
+    m = re.search(r"Hata:\s*(\S+)", text)
+    if m:
+        err = m.group(1)
+    if "açılış adresi alınamadı" in low or "acilis adresi alinamadi" in low:
+        return "mini uygulama açılamadı (Telegram adres vermedi)"
+    if "hedef bot" in low and "bulunamad" in low:
+        return "bot Telegram'da bulunamadı"
+    if stage in UNI_STAGE_TR:
+        return UNI_STAGE_TR[stage]
+    if stage.startswith("uni_") or "Timeout" in err:
+        return "uygulama içinde zaman aşımı (çok yavaş açıldı)"
+    if "FloodWait" in err:
+        return "Telegram çok sık istek dedi, sonra tekrar denenecek"
+    if err:
+        return f"beklenmeyen hata ({err})"
+    if "canvas tabanlı" in low:
+        return "oyun canvas tabanlı, butonlara tıklanamıyor"
+    return ""
+
+
+def uni_short_line(bot: str, outcome: str, notes: list) -> str:
+    text = "\n".join(notes or [])
+    icon = {"ok": "✅", "skip": "➖", "err": "❌"}.get(outcome, "•")
+    parts = []
+    if "toplama doğrulandı" in text or "HOLDING arttı" in text:
+        parts.append("ödül toplandı")
+    m = re.search(r"Yapılan (\d+) işlem", text)
+    if m:
+        parts.append(f"{m.group(1)} tıklama")
+    m = re.search(r"Görev kanalları: (\d+)/(\d+)", text)
+    if m:
+        parts.append(f"{m.group(1)} kanala katıldı")
+    m = re.search(r"Ekrandaki değişim: ([^\n]+)", text)
+    if m:
+        parts.append(m.group(1).split(" | ")[0][:50])
+    if outcome == "skip":
+        if "BELIRSIZ" in text:
+            parts.append("tıkladı ama sonuç görülmedi")
+        elif not parts:
+            parts.append("yapılacak bir şey yok (hepsi alınmış ya da süre dolmamış)")
+    prob = uni_problem_tr(notes) if outcome != "ok" else ""
+    if outcome == "err" and not prob:
+        prob = "hata"
+    line = f"{icon} @{bot} — " + (", ".join(parts) if parts else ("tamam" if outcome == "ok" else ""))
+    if prob:
+        line = line.rstrip(" —,") + f" — sorun: {prob}"
+    return line.rstrip(" —")
+
+
+async def uni_send_round_summary(lines: list, wait_s: int):
+    ok = sum(1 for l in lines if l.startswith("✅"))
+    sk = sum(1 for l in lines if l.startswith("➖"))
+    er = sum(1 for l in lines if l.startswith("❌"))
+    head = f"📋 Tur bitti — ✅ {ok} başarılı · ➖ {sk} boş · ❌ {er} hata\n"
+    tail = (f"\n\n💤 Sonraki tur ~{wait_s // 60} dk sonra."
+            f"\nBir botun ayrıntısı için: detay botadi  ·  Komutlar: komutlar")
+    body = "\n".join(lines) if lines else "(çalıştırılan bot yok)"
+    msg = head + "\n" + body
+    for i in range(0, len(msg), 3500):
+        chunk = msg[i:i + 3500]
+        if i + 3500 >= len(msg):
+            chunk += tail
+        await bot_app.bot.send_message(ADMIN_USER_ID, chunk, disable_web_page_preview=True)
+
+
+async def uni_dialog_usernames():
+    """Hesaptaki sohbetlerin kullanıcı adları; hata olursa None (silme kontrolü atlanır)."""
+    try:
+        names = set()
+        async for d in tg_client.iter_dialogs(limit=800):
+            un = (getattr(d.entity, "username", None) or "").lower()
+            if un:
+                names.add(un)
+        return names if names else None
+    except Exception as e:
+        print(f"[V8] dialog listesi alınamadı: {type(e).__name__}", flush=True)
+        return None
+
+
+async def uni_block_bot(name: str):
+    name = (name or "").lstrip("@").lower()
+    if not name:
+        return
+    V8_AP["bots"] = [b for b in v8_ap_bots() if b != name]
+    bl = V8_AP.setdefault("blocked", [])
+    if name not in bl:
+        bl.append(name)
+    await persist_v8_ap()
+
+
 async def auto_link(name: str, short: str = "", start: str = ""):
     if name in V8_TASKS and not V8_TASKS[name].done():
         await v8_report(name, "Zaten sirada veya calisiyor.")
         return
-    await v8_report(name, "İş sıraya alındı (evrensel mini app motoru). dur ile iptal.")
+    await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} çalıştırılıyor… (1–5 dk sürer, bitince kısa sonuç gelecek)")
 
     global AUTO_STOP
     AUTO_STOP = False
@@ -5674,7 +5850,8 @@ async def auto_link(name: str, short: str = "", start: str = ""):
         outcome, notes = await v8_run_and_track(name, short, start)
         uni_track(name, outcome)
         await persist_v8_ap()
-        if outcome == "ok" and name not in v8_ap_bots() and not UNI_BOT_NAME_RISK.search(name):
+        await bot_app.bot.send_message(ADMIN_USER_ID, uni_short_line(name, outcome, notes) + f"\n(Tam log: detay {name})", disable_web_page_preview=True)
+        if outcome == "ok" and name not in v8_ap_bots() and name not in (V8_AP.get("blocked") or []) and not UNI_BOT_NAME_RISK.search(name):
             # elle çalıştırılıp başarılı olan bot otopilota eklenir
             V8_AP["bots"] = v8_ap_bots() + [name]
             await persist_v8_ap()
@@ -5703,13 +5880,8 @@ def v8_ap_status_text() -> str:
         f"Son bot: @{V8_AP.get('bot', '-')}\n"
         f"Aralık: {V8_AP.get('min_m')}-{V8_AP.get('max_m')} dk (rastgele)\n"
         f"Başarılı: {V8_AP.get('n_ok', 0)} | Atlanan: {V8_AP.get('n_skip', 0)} | Hata: {V8_AP.get('n_err', 0)}{ago}\n"
-        f"Son not: {V8_AP.get('last_note', '')[:120]}\n\n"
-        f"otopilot aç / kapat\n"
-        f"otopilot tara  → hesabındaki tüm mini app botlarını ekle\n"
-        f"otopilot hepsi → tara + aç\n"
-        f"otopilot otoekle aç / kapat\n"
-        f"otopilot ekle botadi  |  otopilot sil botadi  |  otopilot temizle\n"
-        f"Tek sefer: @botadi veya t.me linki"
+        f"Engelli: {len(V8_AP.get('blocked') or [])} bot  ·  Rapor: {'DETAY' if V8_AP.get('report') == 'detay' else 'KISA'}\n\n"
+        f"Tüm komutlar için: komutlar"
     )
 
 
