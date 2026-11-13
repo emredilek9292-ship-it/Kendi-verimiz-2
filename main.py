@@ -5873,8 +5873,12 @@ async def auto_link(name: str, short: str = "", start: str = ""):
         await v8_report(name, "Zaten sirada veya calisiyor.")
         return
     ahead = sum(1 for t in V8_TASKS.values() if not t.done())
-    queue_txt = f" — sırada önünde {ahead} bot var, sırayla çalışır" if ahead else ""
-    await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} çalıştırılıyor… (1–5 dk sürer, bitince kısa sonuç gelecek){queue_txt}")
+    if ahead:
+        await bot_app.bot.send_message(
+            ADMIN_USER_ID, f"⏳ @{name} sıraya alındı — önünde {ahead} bot var (botlar tek tek çalışır, "
+            f"tahmini {ahead * 2}–{ahead * 6} dk). Sırası gelince ▶️ mesajı gelecek. Durumu görmek için: sıra")
+    else:
+        await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} çalıştırılıyor… (1–5 dk sürer, bitince kısa sonuç gelecek). Durum: sıra")
 
     global AUTO_STOP
     AUTO_STOP = False
@@ -5965,7 +5969,7 @@ def v8_ap_status_text() -> str:
 from urllib.parse import unquote as _wiz_unquote
 
 if not os.getenv("V8_JOB_TIMEOUT"):
-    V8_JOB_TIMEOUT = 900  # sihirbaz adımları (AI + referans) için ek süre
+    V8_JOB_TIMEOUT = 720  # sihirbaz adımları (AI + referans) için ek süre; tek bot en fazla ~12 dk
 
 WIZ_AI_STEPS = int(os.getenv("WIZ_AI_STEPS", "10") or 10)          # bir botta en fazla AI kararı
 WIZ_AI_BUDGET_S = int(os.getenv("WIZ_AI_BUDGET_S", "170") or 170)  # AI keşif süresi (sn)
@@ -6307,7 +6311,7 @@ async def load_v8_ap():
 async def wiz_me_id():
     if WIZ_ME["id"] is None and tg_client:
         try:
-            WIZ_ME["id"] = (await tg_client.get_me()).id
+            WIZ_ME["id"] = (await asyncio.wait_for(tg_client.get_me(), 20)).id
         except Exception:
             WIZ_ME["id"] = 0
     return WIZ_ME["id"] or 0
@@ -6842,6 +6846,8 @@ class _WizRetry(Exception):
 
 async def v8_browser(name, url, state, _retry: bool = False):
     """DÜZELTME: sayfa hata verirse / boş gelirse bozuk kayıtlı oturumu silip temiz oturumla 1 kez daha dener."""
+    if WIZ_LIVE.get("bot") == name:
+        WIZ_LIVE["state"] = state
     try:
         return await _wiz_browser_once(name, url, state, _retry)
     except _WizRetry as r:
@@ -6969,6 +6975,7 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
                     WIZ_CUR["ai_issues"].append("Yapay zeka adımları süre sınırına takıldı")
                 except Exception as e:
                     WIZ_CUR["ai_issues"].append(f"Yapay zeka adımı hata verdi: {type(e).__name__}")
+                state["stage"] = "sihirbaz_ref"
                 try:
                     await asyncio.wait_for(wiz_ref_hunt(page, name, notes, state), WIZ_REF_BUDGET_S + 30)
                 except Exception as e:
@@ -7118,6 +7125,44 @@ async def wiz_finish(name: str, outcome: str, notes: list, source: str):
 
 _wiz_run_and_track_base = v8_run_and_track
 WIZ_RUN_LOCK = None
+WIZ_QUEUE: list = []   # sırada bekleyen botlar
+WIZ_LIVE: dict = {}    # şu an çalışan bot
+
+WIZ_STAGE_NAMES = {
+    "sirada": "sırada", "telegram_hedefi": "bot Telegram'da aranıyor", "telegram_kilidi": "Telegram sırası bekleniyor",
+    "start_gonderme": "/start gönderiliyor", "mini_uygulama_kilidi": "mini uygulama sırası bekleniyor",
+    "yetkili_adres_alma": "mini uygulama adresi alınıyor", "chromium_baslatma": "tarayıcı açılıyor",
+    "sayfa_acilisi": "sayfa yükleniyor", "sihirbaz_ai": "yapay zeka görevleri yapıyor",
+    "sihirbaz_canvas": "yapay zeka oyun ekranına bakıyor", "sihirbaz_ref": "referans linki aranıyor",
+}
+
+
+def wiz_queue_text() -> str:
+    now = time.time()
+    out = []
+    if WIZ_LIVE.get("bot"):
+        st = (WIZ_LIVE.get("state") or {}).get("stage", "") if isinstance(WIZ_LIVE.get("state"), dict) else ""
+        if WIZ_CUR.get("bot") == WIZ_LIVE["bot"] and not st:
+            st = "hazırlanıyor"
+        st_tr = WIZ_STAGE_NAMES.get(st, st or "başlıyor")
+        if st.startswith("uni_"):
+            st_tr = "uygulama içinde görevler yapılıyor"
+        el = int(now - WIZ_LIVE.get("t0", now))
+        out.append(f"▶️ Şu an çalışan: @{WIZ_LIVE['bot']} — {el // 60} dk {el % 60} sn — aşama: {st_tr}"
+                   f"\n   (bir bot en fazla ~{(V8_JOB_TIMEOUT + 150) // 60} dk sürebilir, sonra kendiliğinden kesilir)")
+    else:
+        out.append("▶️ Şu an çalışan bot yok.")
+    if WIZ_QUEUE:
+        out.append(f"⏳ Sırada {len(WIZ_QUEUE)} bot (tahmini {len(WIZ_QUEUE) * 2}–{len(WIZ_QUEUE) * 6} dk):")
+        for i, it in enumerate(WIZ_QUEUE[:30], 1):
+            src = " (otopilot)" if it.get("source") == "ap" else ""
+            out.append(f"  {i}. @{it['bot']}{src} — {int((now - it['t']) // 60)} dk bekliyor")
+        if len(WIZ_QUEUE) > 30:
+            out.append(f"  … +{len(WIZ_QUEUE) - 30}")
+    else:
+        out.append("⏳ Sıra boş.")
+    out.append("\nSıradan çıkarmak / durdurmak için: iptal botadi  ·  hepsini durdur: dur")
+    return "\n".join(out)
 
 
 async def v8_run_and_track(name="myageapp", short="", start="", source="manual"):
@@ -7125,7 +7170,23 @@ async def v8_run_and_track(name="myageapp", short="", start="", source="manual")
     global WIZ_RUN_LOCK
     if WIZ_RUN_LOCK is None:
         WIZ_RUN_LOCK = asyncio.Lock()
-    async with WIZ_RUN_LOCK:
+    item = {"bot": name, "t": time.time(), "source": source}
+    WIZ_QUEUE.append(item)
+    try:
+        await WIZ_RUN_LOCK.acquire()
+    finally:
+        if item in WIZ_QUEUE:
+            WIZ_QUEUE.remove(item)
+    try:
+        waited = time.time() - item["t"]
+        WIZ_LIVE.clear()
+        WIZ_LIVE.update({"bot": name, "t0": time.time(), "source": source, "state": None})
+        if waited > 20 and source != "ap":
+            try:
+                await bot_app.bot.send_message(
+                    ADMIN_USER_ID, f"▶️ @{name} sırası geldi, şimdi çalışıyor ({int(waited // 60)} dk sırada bekledi).")
+            except Exception:
+                pass
         wiz_new_cur(name, start)
         try:
             await wiz_me_id()
@@ -7137,6 +7198,9 @@ async def v8_run_and_track(name="myageapp", short="", start="", source="manual")
             return outcome, notes
         finally:
             WIZ_CUR.clear()
+    finally:
+        WIZ_LIVE.clear()
+        WIZ_RUN_LOCK.release()
 
 
 # ---------------------------------------------- düzeltilmiş yardımcılar ----
@@ -7272,6 +7336,8 @@ WIZ_HELP = (
     "• referanslar — kayıtlı tüm referans linklerin\n"
     "• ref botadi https://t.me/... — referans linkini elle kaydet\n"
     "• sor <soru> — yapay zekaya özetlere bakarak soru sor\n"
+    "• sıra — şu an hangi bot çalışıyor, hangi aşamada, sırada kimler var\n"
+    "• iptal botadi — o botu sıradan çıkar / durdur\n"
     "• sihirbaz — durum  ·  sihirbaz aç / kapat\n"
     "• sihirbaz ai aç / kapat — yapay zekanın görev adımları\n"
     "• özet mod her | yeni | kapalı — otopilotta özet gönderimi\n"
@@ -7310,6 +7376,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     low = text.lower().replace("ı", "i").replace("ö", "o").replace("ü", "u").replace("ş", "s").replace("ç", "c").replace("ğ", "g")
     if low in {"sihirbaz", "sihirbaz durum", "wizard"}:
         await wiz_send(wiz_status_text())
+        return
+    if low in {"sira", "durum", "kuyruk", "ne yapiyor", "neredesin"}:
+        await wiz_send(wiz_queue_text())
+        return
+    if low.startswith("iptal "):
+        bn = text.split(None, 1)[1].strip().lstrip("@").lower()
+        bn = re.sub(r"^https?://t\.me/", "", bn).split("/")[0].split("?")[0]
+        t = V8_TASKS.get(bn)
+        if t and not t.done():
+            t.cancel()
+            await msg.reply_text(f"@{bn} sıradan çıkarıldı / durduruldu.")
+        else:
+            await msg.reply_text(f"@{bn} sırada ya da çalışırken bulunamadı. Sırayı görmek için: sıra")
         return
     if low in {"sihirbaz ac", "sihirbaz on"}:
         V8_AP["wiz_on"] = True
