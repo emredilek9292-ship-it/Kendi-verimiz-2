@@ -574,7 +574,108 @@ async def ai_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
     return "(Ozet cikarilamadi: " + ", ".join(n for n in notes if n) + ")"
 
 
+
 gemini_guide = ai_guide  # eski ad
+
+
+# ===================== AI BEYİN (Groq) =====================
+# Regex iskelet kalır; Groq yalnızca sınıflandırılamayan / belirsiz adayları önceliklendirir.
+# Sert güvenlik (UNI_RISK / DANGER) AI önerisini her zaman veto edebilir.
+
+AI_BRAIN = os.getenv("AI_BRAIN", "1").strip() != "0"
+AI_BRAIN_MAX = int(os.getenv("AI_BRAIN_MAX", "8") or 8)
+
+BRAIN_RANK_PROMPT = (
+    "Sen Telegram mini app otomasyon yardımcısısın. Aşağıda ekran metni ve tıklanabilir buton listesi var.\n"
+    "Görevin: güvenli, yüksek değerli aksiyonları öncelik sırasıyla seçmek.\n"
+    "SADECE JSON dizi döndür. Her öğe: {\"text\":\"buton metni birebir\",\"kind\":\"reward|task|check|go|dismiss|skip\",\"why\":\"kısa\"}\n"
+    "kind kuralları:\n"
+    "- reward: Claim, Collect, Topla, Harvest, Get reward, Spin (ödül), Daily claim\n"
+    "- task: Join channel, Follow, Katıl, Check-in görevi, Share (sadece işaretle; cüzdan değil)\n"
+    "- check: Check, Verify (görev doğrulama; cüzdan değil)\n"
+    "- go: Start, Go, Open, Continue (güvenli)\n"
+    "- dismiss: Close, OK, Skip (sadece bilinen duyuru/kapat)\n"
+    "- skip: wallet, connect, deposit, withdraw, buy, payment, stake, premium, seed, private key\n"
+    "ASLA skip dışındaki kind ile cüzdan/ödeme/seed öner. En fazla 8 öğe. Uydurma buton yazma.\n\n"
+)
+
+BRAIN_INSPECT_PROMPT = (
+    "Telegram oyun/airdrop bot incelemesi. SADECE verilen metni kullan, Türkçe yaz.\n"
+    "Format:\n"
+    "🎮 Ne: <1 cümle>\n"
+    "✅ Yapılacaklar:\n1. ...\n2. ...\n"
+    "👥 Davet/referans: <varsa nasıl davet edilir, yoksa 'belirsiz'>\n"
+    "⚠️ Risk: <cüzdan/ödeme/telefon varsa yaz, yoksa 'yok'>\n"
+    "En fazla 600 karakter.\n\n"
+    "BİLGİ:\n"
+)
+
+
+async def ai_brain_rank(screen: str, button_texts: list) -> list:
+    """Groq ile buton önceliği. Başarısızsa []. Güvenlik filtresi çağıranda uygulanır."""
+    if not AI_BRAIN or not (GROQ_API_KEY or GEMINI_API_KEY):
+        return []
+    btns = []
+    seen = set()
+    for t in button_texts or []:
+        s = (t or "").strip()
+        if not s or len(s) > 80:
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        btns.append(s)
+        if len(btns) >= 40:
+            break
+    if not btns:
+        return []
+    payload = (
+        BRAIN_RANK_PROMPT
+        + "EKRAN:\n" + (screen or "")[:2500]
+        + "\n\nBUTONLAR:\n" + "\n".join(f"- {b}" for b in btns)
+    )
+    raw = None
+    if GROQ_API_KEY:
+        raw, _ = await _groq(payload)
+    if not raw and GEMINI_API_KEY:
+        raw, _ = await _gemini(payload)
+    if not raw:
+        return []
+    # JSON dizi çıkar
+    m = re.search(r"\[[\s\S]*\]", raw)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return []
+    out = []
+    allowed = {"reward", "task", "check", "go", "dismiss", "skip"}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        kind = str(item.get("kind") or "").strip().lower()
+        why = str(item.get("why") or "").strip()[:80]
+        if not text or kind not in allowed:
+            continue
+        # buton listesinde olmalı (uydurma engeli)
+        if not any(text.lower() == b.lower() or text.lower() in b.lower() or b.lower() in text.lower() for b in btns):
+            continue
+        out.append({"text": text, "kind": kind, "why": why})
+        if len(out) >= AI_BRAIN_MAX:
+            break
+    return out
+
+
+async def ai_inspect_plan(combo: str) -> str:
+    """İnceleme için yapılandırılmış Türkçe plan (davet satırı dahil)."""
+    if not (GROQ_API_KEY or GEMINI_API_KEY):
+        return ""
+    return await ai_guide(combo, BRAIN_INSPECT_PROMPT)
+
+
 
 
 # ===================== BILDIRIM =====================
@@ -624,6 +725,10 @@ async def notify_admin(source_title, text, bots, links, guide, warn):
     else:
         lines += [f"🔗 {u}" for u in links[:6]]
     lines += ["", "Orijinal mesaj:", (text or "")[:500]]
+    # Kayıtlı referanslar (bilinen botlar)
+    for b in (bots or [])[:3]:
+        if b in REFS:
+            lines += ["", f"🔗 @{b} referans:\n{REFS[b]['link']}"]
     rows = []
     for b in bots[:3]:
         rows.append([InlineKeyboardButton(f"🔍 İncele @{b}"[:60], callback_data=f"ins:{b}")])
@@ -714,7 +819,9 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
     labels = [l for l, _ in info["clicks"]] + info["webs"] + info["blocked"] + info["privs"]
     combo = raw_text + "\nBUTONLAR: " + ", ".join(labels)
     warn = [w for w in BAD_WORDS if w in combo.lower()]
-    guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
+    guide = await ai_inspect_plan(combo) if len(raw_text) >= 20 else ""
+    if not guide or guide.startswith("("):
+        guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else guide
 
     lines = [f"{header}: @{bot}", ""]
     ozet_yok = (not guide) or guide.startswith("(")
@@ -744,8 +851,11 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
         lines += ["", "⚠️ Dikkat, şu ifadeler geçiyor: " + ", ".join(warn),
                   "Güvenlik için otomatik işlem butonu koymadım."]
 
+    # Referans her zaman raporun altında (varsa)
     if bot in REFS:
-        lines += ["", f"🔗 Senin referans linkin: {REFS[bot]['link']}"]
+        lines += ["", "────────────", f"🔗 Senin referans linkin:\n{REFS[bot]['link']}"]
+    else:
+        lines += ["", "────────────", "🔗 Referans linki henüz kayıtlı değil → alttaki butondan bul."]
 
     rows = []
     if not warn:
@@ -4679,8 +4789,10 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
         "• Otopilot (tüm liste): otopilot aç / kapat / otopilot\n"
         "• Liste: otopilot ekle botadi  |  otopilot sil botadi\n"
         "• Durdur: dur\n\n"
+        "🧠 AI beyin (Groq): belirsiz butonları önceliklendirir.\n"
         "Cüzdan, ödeme, deposit butonlarına basılmaz. "
-        "Bilinmeyen pop-up otomatik onaylanmaz."
+        "Bilinmeyen pop-up otomatik onaylanmaz.\n"
+        "İnceleme raporunda davet özeti + referans linki altta yer alır."
     )
 
 
@@ -5297,6 +5409,55 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
             k = uni_classify(c)
             if k:
                 groups[k].append(c)
+        # AI beyin: regex boş bıraktıysa veya ödül/görev azsa Groq öncelik verir (güvenlik veto eder)
+        need_brain = (
+            AI_BRAIN
+            and (not groups["reward"] or not groups["task"])
+            and cands
+            and run.get("brain_calls", 0) < 3
+        )
+        if need_brain:
+            run["brain_calls"] = run.get("brain_calls", 0) + 1
+            try:
+                ranked = await ai_brain_rank(
+                    await uni_screen(page),
+                    [c.get("text") or "" for c in cands if (c.get("text") or "") != "[ikon]"],
+                )
+            except Exception as e:
+                ranked = []
+                print("[AI BRAIN]", repr(e), flush=True)
+            if ranked and not run.get("brain_noted"):
+                notes.append("🧠 AI beyin öncelik verdi: " + ", ".join(
+                    f"{r['kind']}:{r['text'][:18]}" for r in ranked[:5]
+                ))
+                run["brain_noted"] = True
+            # buton metni → aday eşle
+            by_txt = {}
+            for c in cands:
+                t = (c.get("text") or "").strip().lower()
+                if t:
+                    by_txt.setdefault(t, []).append(c)
+            for r in ranked:
+                kind = r["kind"]
+                if kind == "skip":
+                    run["risky"].add(r["text"][:30])
+                    continue
+                if kind not in groups:
+                    continue
+                # risk metni AI ödül dese bile engelle
+                if UNI_RISK_RE.search(r["text"]) or DANGER_BTN_RE.search(r["text"]):
+                    run["risky"].add(r["text"][:30])
+                    continue
+                t = r["text"].strip().lower()
+                matched = by_txt.get(t) or []
+                if not matched:
+                    for k, lst in by_txt.items():
+                        if t in k or k in t:
+                            matched = lst
+                            break
+                for c in matched:
+                    if c not in groups[kind]:
+                        groups[kind].append(c)
         for c in groups["risk"]:
             if UNI_RISK_RE.search(c["text"]):
                 run["risky"].add(c["text"][:30])
@@ -5498,6 +5659,26 @@ async def uni_flow(page, name, notes, state):
 
     await uni_handle_links(page, name, run, notes)
     end_text = await uni_screen(page)
+
+    # Kayıtlı referans (varsa alta)
+    ref_hit = None
+    if name in REFS:
+        ref_hit = REFS[name]["link"]
+    else:
+        for k, v in REFS.items():
+            if k.lower() == name.lower():
+                ref_hit = v["link"]
+                break
+    if ref_hit:
+        notes.append("────────────")
+        notes.append(f"🔗 Senin referans linkin: {ref_hit}")
+    else:
+        notes.append("────────────")
+        notes.append("🔗 Referans yok — aranıyor (arka planda).")
+        try:
+            spawn(ref_finder(name))
+        except Exception:
+            pass
 
     # rapor
     if visited_tabs:
@@ -5980,7 +6161,7 @@ async def main():
     spawn(keepalive_loop())
     await load_v8_ap()
     spawn(v8_autopilot_loop())
-    print("[V8] otopilot döngüsü hazır (kapalı; 'otopilot aç' ile çalışır)", flush=True)
+    print(f"[V8] AI beyin={'acik' if AI_BRAIN else 'kapali'} | otopilot döngüsü hazır (kapalı; 'otopilot aç' ile çalışır)", flush=True)
     print("[V8] eski routine/claims loop bu sürümde başlatılmadı", flush=True)
 
     try:
