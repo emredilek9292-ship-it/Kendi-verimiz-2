@@ -72,7 +72,7 @@ RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 INSPECT = os.getenv("INSPECT", "1").strip() != "0"                 # yeni botu otomatik incele
 INSPECT_MIN_INTERVAL = int(os.getenv("INSPECT_MIN_INTERVAL", "120") or 120)  # iki inceleme arasi sn
 INSPECT_HOURLY_MAX = int(os.getenv("INSPECT_HOURLY_MAX", "10") or 10)
-INSPECT_WAIT = int(os.getenv("INSPECT_WAIT", "3") or 3)            # /start'tan sonra cevap bekleme sn
+INSPECT_WAIT = int(os.getenv("INSPECT_WAIT", "7") or 7)            # /start'tan sonra cevap bekleme sn
 JOIN_DAILY_MAX = int(os.getenv("JOIN_DAILY_MAX", "0") or 0)        # 24 saatte en fazla kanal katilimi (0 = sinirsiz)
 ROUTINES_ON = os.getenv("ROUTINES", "1").strip() != "0"
 
@@ -574,109 +574,7 @@ async def ai_guide(text: str, prompt: str = GUIDE_PROMPT) -> str:
     return "(Ozet cikarilamadi: " + ", ".join(n for n in notes if n) + ")"
 
 
-
 gemini_guide = ai_guide  # eski ad
-
-
-# ===================== AI BEYİN (Groq) =====================
-# Regex iskelet kalır; Groq yalnızca sınıflandırılamayan / belirsiz adayları önceliklendirir.
-# Sert güvenlik (UNI_RISK / DANGER) AI önerisini her zaman veto edebilir.
-
-AI_BRAIN = os.getenv("AI_BRAIN", "1").strip() != "0"
-AI_BRAIN_MAX = int(os.getenv("AI_BRAIN_MAX", "8") or 8)
-
-BRAIN_RANK_PROMPT = (
-    "Sen Telegram mini app otomasyon yardımcısısın. Aşağıda ekran metni ve tıklanabilir buton listesi var.\n"
-    "Görevin: güvenli, yüksek değerli aksiyonları öncelik sırasıyla seçmek.\n"
-    "SADECE JSON dizi döndür. Her öğe: {\"text\":\"buton metni birebir\",\"kind\":\"reward|task|check|go|dismiss|skip\",\"why\":\"kısa\"}\n"
-    "kind kuralları:\n"
-    "- reward: Claim, Collect, Topla, Harvest, Get reward, Spin (ödül), Daily claim\n"
-    "- task: Join channel, Follow, Katıl, Check-in görevi, Share (sadece işaretle; cüzdan değil)\n"
-    "- check: Check, Verify (görev doğrulama; cüzdan değil)\n"
-    "- go: Start, Go, Open, Continue (güvenli)\n"
-    "- nav önceliği: Friends, Invite, Davet, Earn, Tasks, Daily önce; Wallet/Shop sonra\n"
-    "- dismiss: Close, OK, Skip (sadece bilinen duyuru/kapat)\n"
-    "- skip: wallet, connect, deposit, withdraw, buy, payment, stake, premium, seed, private key\n"
-    "ASLA skip dışındaki kind ile cüzdan/ödeme/seed öner. En fazla 8 öğe. Uydurma buton yazma.\n\n"
-)
-
-BRAIN_INSPECT_PROMPT = (
-    "Telegram oyun/airdrop bot incelemesi. SADECE verilen metni kullan, Türkçe yaz.\n"
-    "Format:\n"
-    "🎮 Ne: <1 cümle>\n"
-    "✅ Yapılacaklar:\n1. ...\n2. ...\n"
-    "👥 Davet/referans: <varsa nasıl davet edilir, yoksa 'belirsiz'>\n"
-    "⚠️ Risk: <cüzdan/ödeme/telefon varsa yaz, yoksa 'yok'>\n"
-    "En fazla 600 karakter.\n\n"
-    "BİLGİ:\n"
-)
-
-
-async def ai_brain_rank(screen: str, button_texts: list) -> list:
-    """Groq ile buton önceliği. Başarısızsa []. Güvenlik filtresi çağıranda uygulanır."""
-    if not AI_BRAIN or not (GROQ_API_KEY or GEMINI_API_KEY):
-        return []
-    btns = []
-    seen = set()
-    for t in button_texts or []:
-        s = (t or "").strip()
-        if not s or len(s) > 80:
-            continue
-        k = s.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        btns.append(s)
-        if len(btns) >= 40:
-            break
-    if not btns:
-        return []
-    payload = (
-        BRAIN_RANK_PROMPT
-        + "EKRAN:\n" + (screen or "")[:2500]
-        + "\n\nBUTONLAR:\n" + "\n".join(f"- {b}" for b in btns)
-    )
-    raw = None
-    if GROQ_API_KEY:
-        raw, _ = await _groq(payload)
-    if not raw and GEMINI_API_KEY:
-        raw, _ = await _gemini(payload)
-    if not raw:
-        return []
-    # JSON dizi çıkar
-    m = re.search(r"\[[\s\S]*\]", raw)
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(0))
-    except Exception:
-        return []
-    out = []
-    allowed = {"reward", "task", "check", "go", "dismiss", "skip"}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text") or "").strip()
-        kind = str(item.get("kind") or "").strip().lower()
-        why = str(item.get("why") or "").strip()[:80]
-        if not text or kind not in allowed:
-            continue
-        # buton listesinde olmalı (uydurma engeli)
-        if not any(text.lower() == b.lower() or text.lower() in b.lower() or b.lower() in text.lower() for b in btns):
-            continue
-        out.append({"text": text, "kind": kind, "why": why})
-        if len(out) >= AI_BRAIN_MAX:
-            break
-    return out
-
-
-async def ai_inspect_plan(combo: str) -> str:
-    """İnceleme için yapılandırılmış Türkçe plan (davet satırı dahil)."""
-    if not (GROQ_API_KEY or GEMINI_API_KEY):
-        return ""
-    return await ai_guide(combo, BRAIN_INSPECT_PROMPT)
-
-
 
 
 # ===================== BILDIRIM =====================
@@ -726,10 +624,6 @@ async def notify_admin(source_title, text, bots, links, guide, warn):
     else:
         lines += [f"🔗 {u}" for u in links[:6]]
     lines += ["", "Orijinal mesaj:", (text or "")[:500]]
-    # Kayıtlı referanslar (bilinen botlar)
-    for b in (bots or [])[:3]:
-        if b in REFS:
-            lines += ["", f"🔗 @{b} referans:\n{REFS[b]['link']}"]
     rows = []
     for b in bots[:3]:
         rows.append([InlineKeyboardButton(f"🔍 İncele @{b}"[:60], callback_data=f"ins:{b}")])
@@ -820,9 +714,7 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
     labels = [l for l, _ in info["clicks"]] + info["webs"] + info["blocked"] + info["privs"]
     combo = raw_text + "\nBUTONLAR: " + ", ".join(labels)
     warn = [w for w in BAD_WORDS if w in combo.lower()]
-    guide = await ai_inspect_plan(combo) if len(raw_text) >= 20 else ""
-    if not guide or guide.startswith("("):
-        guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else guide
+    guide = await ai_guide(combo, INSPECT_PROMPT) if len(raw_text) >= 20 else ""
 
     lines = [f"{header}: @{bot}", ""]
     ozet_yok = (not guide) or guide.startswith("(")
@@ -852,11 +744,8 @@ async def send_report(bot: str, msgs, header: str, routine_label: Optional[str] 
         lines += ["", "⚠️ Dikkat, şu ifadeler geçiyor: " + ", ".join(warn),
                   "Güvenlik için otomatik işlem butonu koymadım."]
 
-    # Referans her zaman raporun altında (varsa)
     if bot in REFS:
-        lines += ["", "────────────", f"🔗 Senin referans linkin:\n{REFS[bot]['link']}"]
-    else:
-        lines += ["", "────────────", "🔗 Referans linki henüz kayıtlı değil → alttaki butondan bul."]
+        lines += ["", f"🔗 Senin referans linkin: {REFS[bot]['link']}"]
 
     rows = []
     if not warn:
@@ -2268,15 +2157,26 @@ async def ref_finder(bot: str):
             for l, s in found[1:4]:
                 lines.append(f"Diğer aday: {l}")
         else:
-            # Sessiz: ana görev başarılıysa kırmızı ref gürültüsü atma
-            lines = [f"🔗 @{bot}: referans bu turda bulunamadı — sonraki turda Davet sekmesi taranacak."]
-            await send_admin("\n".join(lines))
-            return
+            lines += ["", "❌ Tam referans linkini bulamadım."]
+            if not url:
+                lines.append("Mini uygulama açılamadı: " + how[:300])
         if probe:
             if probe["codes"]:
-                lines += ["", "🔑 Referans alanları:"] + [f"- {p} = {v}" for p, v in probe["codes"][:6]]
+                lines += ["", "🔑 Referansa benzeyen alanlar:"] + [f"- {p} = {v}" for p, v in probe["codes"]]
             if probe["templates"]:
-                lines += ["", "🧩 Link kalıbı:"] + [f"- {t}" for t in probe["templates"][:3]]
+                lines += ["", "🧩 Kodda geçen link kalıbı:"] + [f"- {t}" for t in probe["templates"]]
+            if probe["api"]:
+                lines += ["", "🌐 API'den okuduğum alanlar (değerler yazılmadı):"] + [f"- {a}" for a in probe["api"]]
+            else:
+                if probe.get("hosts"):
+                    lines += ["", "🖥 Uygulama kodunda bulduğum sunucu adresleri:"] + [f"- {h}" for h in probe["hosts"]]
+                if probe.get("paths"):
+                    lines += ["", "🧭 Kodda geçen yol adayları:"] + [f"- {p}" for p in probe["paths"][:20]]
+            for n in probe["notes"]:
+                lines.append(f"ℹ️ {n}")
+        if not found:
+            lines += ["", f"Uygulamada Davet sayfasındaki Kopyala ile linki alıp şunu yazarsan kaydederim:",
+                      f"/ref {bot} <link>"]
         await send_admin("\n".join(lines))
     except Exception as e:
         print("[REF]", repr(e))
@@ -4425,33 +4325,13 @@ async def auto_link(name: str,short: str="",start: str=""):
 
 
 def _v8_notes_outcome(notes: list) -> str:
-    """ok=ödül/işlem görüldü · skip=yapılacak yok · err=hata."""
-    text = "\n".join(notes or [])
-    low = text.lower()
-    if any(x in text for x in (
-        "toplama doğrulandı", "toplama dogrulandi", "HOLDING arttı", "HOLDING artti",
-        "Evrensel sonuç: OK", "doğrulandı (HOLDING", "Günlük ödül doğrulandı",
-    )):
+    text = "\n".join(notes)
+    if "toplama doğrulandı" in text or "toplama dogrulandi" in text:
         return "ok"
-    # Ekranda sayı artışı (ATF: 0.43 → 0.44 / Balance: a → b)
-    if re.search(r":\s*[\d.]+\s*→\s*[\d.]+", text) or re.search(r":\s*[\d.]+\s*->\s*[\d.]+", text):
-        # artış var mı kabaca
-        for m in re.finditer(r"([\d.]+)\s*→\s*([\d.]+)", text):
-            try:
-                if float(m.group(2)) > float(m.group(1)):
-                    return "ok"
-            except ValueError:
-                pass
-    if "Evrensel sonuç: ATLANDI" in text or "Evrensel sonuç: BELIRSIZ" in text:
+    if "claim atlandı" in text or "claim atlandi" in text or "Kasa zaten" in text:
         return "skip"
-    if any(x in low for x in ("claim atlandı", "claim atlandi", "kasa zaten")):
+    if "toplandı kabul edilmedi" in text or "toplandi kabul edilmedi" in text:
         return "skip"
-    if any(x in low for x in ("toplandı kabul edilmedi", "toplandi kabul edilmedi")):
-        return "skip"
-    if any(x in low for x in ("hata:", "zaman aşımı", "timeout", "bulunamadı", "açılamadı", "acilamadi")):
-        return "err"
-    if "yapılan" in low and "işlem" in low and re.search(r"yapılan\s*[1-9]", low):
-        return "ok"  # en az bir tıklama yapıldı
     return "err"
 
 
@@ -4578,8 +4458,7 @@ async def v8_autopilot_loop():
             round_lines = []
             dialog_names = await uni_dialog_usernames()
             for bot in bots:
-                if not V8_AP.get("on") or AUTO_STOP:
-                    round_lines.append("⏸ Otopilot: manuel istek var, tur ara verildi")
+                if not V8_AP.get("on"):
                     break
                 if uni_paused(bot):
                     round_lines.append(f"⏸ @{bot} — üst üste hata verdiği için bekletiliyor")
@@ -4589,22 +4468,9 @@ async def v8_autopilot_loop():
                     await uni_block_bot(bot)
                     round_lines.append(f"🗑 @{bot} — sohbeti silmişsin; listeden çıkarıldı, bir daha açılmayacak")
                     continue
-                # Manuel @bot çalışıyorsa otopilot bekle
-                manual_busy = any(
-                    (not t.done()) and not str(k).startswith("ap:")
-                    for k, t in list(V8_TASKS.items())
-                )
-                if manual_busy or AUTO_STOP:
-                    round_lines.append("⏸ Manuel iş öncelikli — otopilot bekliyor")
-                    while manual_busy or AUTO_STOP:
-                        if not V8_AP.get("on"):
-                            break
-                        await asyncio.sleep(3)
-                        manual_busy = any(
-                            (not t.done()) and not str(k).startswith("ap:")
-                            for k, t in list(V8_TASKS.items())
-                        )
-                    continue
+                busy = any(not t.done() for t in V8_TASKS.values())
+                if busy:
+                    await asyncio.sleep(20)
                 V8_AP["bot"] = bot
                 key = f"ap:{bot}"
                 task = asyncio.create_task(v8_run_and_track(bot))
@@ -4813,10 +4679,8 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
         "• Otopilot (tüm liste): otopilot aç / kapat / otopilot\n"
         "• Liste: otopilot ekle botadi  |  otopilot sil botadi\n"
         "• Durdur: dur\n\n"
-        "🧠 AI beyin (Groq): belirsiz butonları önceliklendirir.\n"
         "Cüzdan, ödeme, deposit butonlarına basılmaz. "
-        "Bilinmeyen pop-up otomatik onaylanmaz.\n"
-        "İnceleme raporunda davet özeti + referans linki altta yer alır."
+        "Bilinmeyen pop-up otomatik onaylanmaz."
     )
 
 
@@ -4844,7 +4708,7 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 
 UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "80") or 80)      # bir turda en fazla tıklama
-UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "420") or 420)          # bir bot için tarayıcı süresi (sn)
+UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "300") or 300)          # bir bot için tarayıcı süresi (sn)
 UNI_TABS = int(os.getenv("UNI_TABS", "8") or 8)                      # gezilecek en fazla sekme
 UNI_TAPS = int(os.getenv("UNI_TAPS", "30") or 30)                    # tapper oyunlarında dokunma (0 = kapalı)
 UNI_JOIN = os.getenv("UNI_JOIN", "1").strip() != "0"                 # görev kanallarına katıl
@@ -4855,7 +4719,7 @@ UNI_FAIL_PAUSE = int(os.getenv("UNI_FAIL_PAUSE", "5") or 5)          # üst üst
 UNI_STATE_DIR = os.getenv("UNI_STATE_DIR", "/tmp/uni_state")
 UNI_AFTER_PROFILE = os.getenv("UNI_AFTER_PROFILE", "1").strip() != "0"  # MyAge/Pickaxe sonrası evrensel görevler
 V8_AP.setdefault("pxe_fb_t", 0)
-V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "720") or 720)
+V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "600") or 600)
 
 V8_AP.setdefault("auto_add", False)   # radar yeni mini app bulunca listeye eklesin mi
 V8_AP.setdefault("per", {})           # bot başına istatistik {bot: {ok,skip,err,fail,last}}
@@ -5323,80 +5187,7 @@ async def uni_click(page, c: dict) -> bool:
         return False
 
 
-
-async def uni_auto_ref(page, name: str, notes: list) -> str:
-    """Mini app ekranından kişisel referans linkini otomatik çıkar ve kaydet. Elle /ref istemez."""
-    name = (name or "").lower().lstrip("@")
-    if not name:
-        return ""
-    # zaten varsa dokunma
-    if name in REFS and REFS[name].get("link"):
-        return REFS[name]["link"]
-    texts = []
-    try:
-        texts.append(await page.locator("body").inner_text(timeout=4000))
-    except Exception:
-        pass
-    try:
-        hrefs = await page.evaluate("""() => {
-          const out = [];
-          for (const a of document.querySelectorAll('a[href], [data-clipboard-text], input, textarea')) {
-            const h = a.getAttribute('href') || a.getAttribute('data-clipboard-text') || a.value || '';
-            if (h && h.length < 400) out.push(h);
-          }
-          // sayfa kaynak / script kırıntıları
-          const html = document.documentElement.innerHTML.slice(0, 200000);
-          const re = /https?:\\/\\/t\\.me\\/[A-Za-z0-9_/?=&%\\-.]{5,120}/g;
-          let m; let n = 0;
-          while ((m = re.exec(html)) && n < 30) { out.push(m[0]); n++; }
-          return out;
-        }""")
-        if hrefs:
-            texts.append("\n".join(hrefs))
-    except Exception:
-        pass
-    blob = "\n".join(texts)
-    # kişisel start / startapp parametreli t.me linkleri
-    pats = [
-        rf"(?:https?://)?t\.me/{re.escape(name)}(?:/[A-Za-z0-9_]*)?\?(?:start|startapp)=[A-Za-z0-9_\-%.]+",
-        rf"(?:https?://)?t\.me/{re.escape(name)}\?[^\s\"'<>]+",
-        r"(?:https?://)?t\.me/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]*)?\?(?:start|startapp)=(?:ref|invite|r)[A-Za-z0-9_\-%.]*",
-    ]
-    found = []
-    for p in pats:
-        for m in re.finditer(p, blob, re.I):
-            link = m.group(0)
-            if not link.startswith("http"):
-                link = "https://" + link
-            # botun düz start'sız ana linki değil
-            if "start=" not in link.lower() and "startapp=" not in link.lower():
-                continue
-            found.append(link)
-    # tekilleştir
-    uniq = []
-    seen = set()
-    for l in found:
-        k = l.lower()
-        if k not in seen:
-            seen.add(k)
-            uniq.append(l)
-    if not uniq:
-        return ""
-    link = uniq[0]
-    REFS[name] = {"link": link, "src": "mini app ekran", "t": time.time()}
-    try:
-        await persist_refs()
-    except Exception:
-        pass
-    notes.append(f"🔗 Referans otomatik kaydedildi (mini app): {link}")
-    return link
-
-
 async def uni_handle_links(page, name: str, run: dict, notes: list):
-    try:
-        await uni_auto_ref(page, name, notes)
-    except Exception as e:
-        print("[UNI REF]", repr(e), flush=True)
     d = await uni_drain(page)
     for b in d.get("blocked") or []:
         run["blocked"].add(b)
@@ -5506,55 +5297,6 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
             k = uni_classify(c)
             if k:
                 groups[k].append(c)
-        # AI beyin: regex boş bıraktıysa veya ödül/görev azsa Groq öncelik verir (güvenlik veto eder)
-        need_brain = (
-            AI_BRAIN
-            and (not groups["reward"] or not groups["task"])
-            and cands
-            and run.get("brain_calls", 0) < 3
-        )
-        if need_brain:
-            run["brain_calls"] = run.get("brain_calls", 0) + 1
-            try:
-                ranked = await ai_brain_rank(
-                    await uni_screen(page),
-                    [c.get("text") or "" for c in cands if (c.get("text") or "") != "[ikon]"],
-                )
-            except Exception as e:
-                ranked = []
-                print("[AI BRAIN]", repr(e), flush=True)
-            if ranked and not run.get("brain_noted"):
-                notes.append("🧠 AI beyin öncelik verdi: " + ", ".join(
-                    f"{r['kind']}:{r['text'][:18]}" for r in ranked[:5]
-                ))
-                run["brain_noted"] = True
-            # buton metni → aday eşle
-            by_txt = {}
-            for c in cands:
-                t = (c.get("text") or "").strip().lower()
-                if t:
-                    by_txt.setdefault(t, []).append(c)
-            for r in ranked:
-                kind = r["kind"]
-                if kind == "skip":
-                    run["risky"].add(r["text"][:30])
-                    continue
-                if kind not in groups:
-                    continue
-                # risk metni AI ödül dese bile engelle
-                if UNI_RISK_RE.search(r["text"]) or DANGER_BTN_RE.search(r["text"]):
-                    run["risky"].add(r["text"][:30])
-                    continue
-                t = r["text"].strip().lower()
-                matched = by_txt.get(t) or []
-                if not matched:
-                    for k, lst in by_txt.items():
-                        if t in k or k in t:
-                            matched = lst
-                            break
-                for c in matched:
-                    if c not in groups[kind]:
-                        groups[kind].append(c)
         for c in groups["risk"]:
             if UNI_RISK_RE.search(c["text"]):
                 run["risky"].add(c["text"][:30])
@@ -5720,15 +5462,7 @@ async def uni_flow(page, name, notes, state):
             navs = [c for k, c in kinds if k == "tabx" and c.get("navbar") and uni_norm(c["text"]) not in visited_tabs]
         if not navs:
             break
-        def _nav_prio(c):
-            t = (c.get("text") or "").lower()
-            boost = 0
-            if re.search(r"friend|invite|davet|refer|arkada[sş]|earn|task|görev|gorev|reward|daily|home|ana", t):
-                boost = -10  # önce bunlar
-            if re.search(r"wallet|shop|market|premium|skin", t):
-                boost = 20
-            return (boost, not c.get("bottom"), c["x"], c["y"])
-        navs.sort(key=_nav_prio)
+        navs.sort(key=lambda c: (not c.get("bottom"), c["x"], c["y"]))
         tab = navs[0]
         lab = tab["text"][:14]
         visited_tabs.add(uni_norm(tab["text"]))
@@ -5764,31 +5498,6 @@ async def uni_flow(page, name, notes, state):
 
     await uni_handle_links(page, name, run, notes)
     end_text = await uni_screen(page)
-
-    # Kayıtlı referans (varsa alta)
-    # Son bir kez ekrandan ref çek (davet sekmesi gezildiyse burada görünür)
-    try:
-        await uni_auto_ref(page, name, notes)
-    except Exception:
-        pass
-    ref_hit = None
-    if name in REFS:
-        ref_hit = REFS[name]["link"]
-    else:
-        for k, v in REFS.items():
-            if k.lower() == name.lower():
-                ref_hit = v["link"]
-                break
-    if ref_hit:
-        notes.append("────────────")
-        notes.append(f"🔗 Senin referans linkin: {ref_hit}")
-    else:
-        notes.append("────────────")
-        notes.append("🔗 Referans bu turda ekranda yoktu; arka planda sohbet+mini app taranıyor.")
-        try:
-            spawn(ref_finder(name))
-        except Exception:
-            pass
 
     # rapor
     if visited_tabs:
@@ -5872,14 +5581,7 @@ async def v8_browser(name, url, state):
             page.set_default_timeout(10000)
             state["stage"] = "sayfa_acilisi"
             try:
-                try:
-                    response = await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-                except Exception as e1:
-                    notes.append(f"İlk yükleme yavaş ({type(e1).__name__}); commit ile yeniden deneniyor.")
-                    try:
-                        response = await page.goto(url, wait_until="commit", timeout=90000)
-                    except Exception as e2:
-                        return notes + [f"Sayfa açılamadı: {type(e2).__name__} (uygulama çok yavaş veya Render kaynak yetmedi)."]
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 if response and response.status >= 400:
                     return [f"HTTP {response.status}; islem yapilmadi."]
             except PWTimeout:
@@ -5919,33 +5621,19 @@ async def v8_browser(name, url, state):
 
 
 def _v8_notes_outcome(notes: list) -> str:
-    """ok=ödül/işlem görüldü · skip=yapılacak yok · err=hata."""
-    text = "\n".join(notes or [])
-    low = text.lower()
-    if any(x in text for x in (
-        "toplama doğrulandı", "toplama dogrulandi", "HOLDING arttı", "HOLDING artti",
-        "Evrensel sonuç: OK", "doğrulandı (HOLDING", "Günlük ödül doğrulandı",
-    )):
+    text = "\n".join(notes)
+    if "toplama doğrulandı" in text or "toplama dogrulandi" in text or "HOLDING arttı" in text:
         return "ok"
-    # Ekranda sayı artışı (ATF: 0.43 → 0.44 / Balance: a → b)
-    if re.search(r":\s*[\d.]+\s*→\s*[\d.]+", text) or re.search(r":\s*[\d.]+\s*->\s*[\d.]+", text):
-        # artış var mı kabaca
-        for m in re.finditer(r"([\d.]+)\s*→\s*([\d.]+)", text):
-            try:
-                if float(m.group(2)) > float(m.group(1)):
-                    return "ok"
-            except ValueError:
-                pass
+    if "Evrensel sonuç: OK" in text:
+        return "ok"
     if "Evrensel sonuç: ATLANDI" in text or "Evrensel sonuç: BELIRSIZ" in text:
         return "skip"
-    if any(x in low for x in ("claim atlandı", "claim atlandi", "kasa zaten")):
+    if "toplama doğrulandı" in text or "toplama dogrulandi" in text or "doğrulandı" in text:
+        return "ok"
+    if "claim atlandı" in text or "claim atlandi" in text or "Kasa zaten" in text:
         return "skip"
-    if any(x in low for x in ("toplandı kabul edilmedi", "toplandi kabul edilmedi")):
+    if "toplandı kabul edilmedi" in text or "toplandi kabul edilmedi" in text:
         return "skip"
-    if any(x in low for x in ("hata:", "zaman aşımı", "timeout", "bulunamadı", "açılamadı", "acilamadi")):
-        return "err"
-    if "yapılan" in low and "işlem" in low and re.search(r"yapılan\s*[1-9]", low):
-        return "ok"  # en az bir tıklama yapıldı
     return "err"
 
 
@@ -6083,44 +5771,29 @@ def uni_short_line(bot: str, outcome: str, notes: list) -> str:
     text = "\n".join(notes or [])
     icon = {"ok": "✅", "skip": "➖", "err": "❌"}.get(outcome, "•")
     parts = []
-    if outcome == "ok":
-        parts.append("BAŞARILI")
-    # yapılan işlemler
-    m = re.search(r"Yapılan (\d+) işlem:\s*([^\n]+)", text)
+    if "toplama doğrulandı" in text or "HOLDING arttı" in text:
+        parts.append("ödül toplandı")
+    m = re.search(r"Yapılan (\d+) işlem", text)
     if m:
         parts.append(f"{m.group(1)} tıklama")
-        # ilk birkaç aksiyon
-        acts = m.group(2)[:120]
-        if acts:
-            parts.append(acts.split(" · ")[0][:40])
-    elif re.search(r"Yapılan (\d+) işlem", text):
-        parts.append(re.search(r"Yapılan (\d+) işlem", text).group(0))
     m = re.search(r"Görev kanalları: (\d+)/(\d+)", text)
-    if m and int(m.group(1)) > 0:
+    if m:
         parts.append(f"{m.group(1)} kanala katıldı")
     m = re.search(r"Ekrandaki değişim: ([^\n]+)", text)
     if m:
-        parts.append(m.group(1).split(" | ")[0][:60])
-    if "toplama doğrulandı" in text or "HOLDING arttı" in text:
-        parts.append("ödül toplandı")
-    if "Referans otomatik kaydedildi" in text or "Bulundu ve kaydedildi" in text:
-        parts.append("ref kaydedildi")
+        parts.append(m.group(1).split(" | ")[0][:50])
     if outcome == "skip":
         if "BELIRSIZ" in text:
-            parts.append("tıkladı ama sonuç okunamadı")
+            parts.append("tıkladı ama sonuç görülmedi")
         elif not parts:
-            parts.append("yapılacak bir şey yok")
+            parts.append("yapılacak bir şey yok (hepsi alınmış ya da süre dolmamış)")
     prob = uni_problem_tr(notes) if outcome != "ok" else ""
     if outcome == "err" and not prob:
         prob = "hata"
-    head = f"{icon} @{bot}"
-    if outcome == "ok":
-        head = f"✅ @{bot}"
-    line = head + " — " + (", ".join(parts) if parts else ("tamam" if outcome == "ok" else ""))
+    line = f"{icon} @{bot} — " + (", ".join(parts) if parts else ("tamam" if outcome == "ok" else ""))
     if prob:
         line = line.rstrip(" —,") + f" — sorun: {prob}"
     return line.rstrip(" —")
-
 
 
 async def uni_send_round_summary(lines: list, wait_s: int):
@@ -6165,57 +5838,26 @@ async def uni_block_bot(name: str):
 
 
 async def auto_link(name: str, short: str = "", start: str = ""):
-    """Manuel @bot: hemen öncelik. Otopilot turunu bekletmez / uzun kuyrukta 10 dk yatmaz."""
-    name = (name or "").lstrip("@").lower()
-    if not name:
-        return
     if name in V8_TASKS and not V8_TASKS[name].done():
-        await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} zaten sırada/çalışıyor.")
+        await v8_report(name, "Zaten sirada veya calisiyor.")
         return
+    await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} çalıştırılıyor… (1–5 dk sürer, bitince kısa sonuç gelecek)")
 
     global AUTO_STOP
-    # Otopilot bir botu uzun süredir eziyorsa kes; manuel iş öne alınsın
-    AUTO_STOP = True
-    await bot_app.bot.send_message(
-        ADMIN_USER_ID,
-        f"▶️ @{name} hemen başlıyor (manuel öncelik).\n"
-        f"Otopilot bu iş bitene kadar bekler; bitince kaldığı yerden devam eder.",
-    )
+    AUTO_STOP = False
 
     async def job():
-        global AUTO_STOP
-        try:
-            # Kısa bekleme: önceki tur AUTO_STOP görsün
-            await asyncio.sleep(1.5)
-            AUTO_STOP = False
-            # Kilit doluysa kullanıcıya söyle, sonsuz sessiz bekleme yok
-            if V8_LOCK and V8_LOCK.locked():
-                await bot_app.bot.send_message(
-                    ADMIN_USER_ID,
-                    f"⌛ @{name}: önceki mini app kapanıyor (en fazla ~60 sn)…",
-                )
-            t0 = time.time()
-            outcome, notes = await v8_run_and_track(name, short, start)
-            took = int(time.time() - t0)
-            uni_track(name, outcome)
+        outcome, notes = await v8_run_and_track(name, short, start)
+        uni_track(name, outcome)
+        await persist_v8_ap()
+        await bot_app.bot.send_message(ADMIN_USER_ID, uni_short_line(name, outcome, notes) + f"\n(Tam log: detay {name})", disable_web_page_preview=True)
+        if outcome == "ok" and name not in v8_ap_bots() and name not in (V8_AP.get("blocked") or []) and not UNI_BOT_NAME_RISK.search(name):
+            # elle çalıştırılıp başarılı olan bot otopilota eklenir
+            V8_AP["bots"] = v8_ap_bots() + [name]
             await persist_v8_ap()
-            line = uni_short_line(name, outcome, notes)
-            if outcome == "ok":
-                msg = (
-                    f"✅ İŞLEM TAMAM ({took} sn)\n{line}\n\nNe yaptı: "
-                    + next((n for n in notes if n.startswith("Yapılan")), "ödül/görev işlendi")[:500]
-                    + f"\n\n(Detay: detay {name})"
-                )
-            elif outcome == "skip":
-                msg = f"➖ BOŞ TUR ({took} sn)\n{line}\n(Detay: detay {name})"
-            else:
-                msg = f"❌ HATA ({took} sn)\n{line}\n(Detay: detay {name})"
-            await bot_app.bot.send_message(ADMIN_USER_ID, msg, disable_web_page_preview=True)
-            # Manuel başarıda listeyi şişirme (otopilot ekle sen de)
-            if outcome == "ok" and V8_AP.get("auto_add"):
-                await uni_auto_add(name, notes)
-        finally:
-            AUTO_STOP = False
+            await bot_app.bot.send_message(ADMIN_USER_ID, f"➕ @{name} başarılı çalıştı, otopilot listesine eklendi ({len(V8_AP['bots'])} bot). Çıkarmak için: otopilot sil {name}")
+        else:
+            await uni_auto_add(name, notes)
 
     V8_TASKS[name] = spawn(job())
 
@@ -6338,7 +5980,7 @@ async def main():
     spawn(keepalive_loop())
     await load_v8_ap()
     spawn(v8_autopilot_loop())
-    print(f"[V8] AI beyin={'acik' if AI_BRAIN else 'kapali'} | otopilot döngüsü hazır (kapalı; 'otopilot aç' ile çalışır)", flush=True)
+    print("[V8] otopilot döngüsü hazır (kapalı; 'otopilot aç' ile çalışır)", flush=True)
     print("[V8] eski routine/claims loop bu sürümde başlatılmadı", flush=True)
 
     try:
