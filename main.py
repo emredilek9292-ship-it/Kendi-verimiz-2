@@ -1101,12 +1101,24 @@ async def get_webview_url(ent, username: str, short: str = "", start: str = "", 
         except Exception as e:
             notes.append(f"ana uygulama: {friendly_err(e)}")
 
-    # 4) menu tusu
+    # 4) menu tusu — DÜZELTME: menü butonunun kendi adresi Telegram'dan okunup veriliyor
+    menu_url = ""
     try:
-        res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", from_bot_menu=True))
+        from telethon.tl.functions.users import GetFullUserRequest
+        full = await tg_client(GetFullUserRequest(ent))
+        mb = getattr(getattr(full.full_user, "bot_info", None), "menu_button", None)
+        menu_url = getattr(mb, "url", "") or ""
+    except Exception as e:
+        notes.append(f"bot bilgisi: {friendly_err(e)}")
+    try:
+        kw = {"url": menu_url} if menu_url else {}
+        res = await tg_client(M.RequestWebViewRequest(peer=ent, bot=ent, platform="android", from_bot_menu=True, **kw))
         return res.url, "menü tuşundan açıldı", pub_urls
     except Exception as e:
         notes.append(f"menü tuşu: {friendly_err(e)}")
+    has_main = bool(getattr(ent, "bot_has_main_app", False))
+    if not menu_url and not has_main and not wv_urls and not shorts:
+        notes.insert(0, "BU BOT MİNİ UYGULAMA DEĞİL (menü butonu yok, ana uygulama yok, mesajda mini uygulama butonu yok — sadece sohbet botu)")
 
     # 5) yaygin kisa adlari dene (ana uygulama tanimli degilse t.me/bot/<kisaad> seklinde olabilir)
     tried = set(shorts)
@@ -4374,7 +4386,7 @@ async def v8_run_and_track(name="myageapp", short="", start=""):
         finally:
             APP_LOCK.release()
         if not url:
-            return ["Yetkili açılış adresi alınamadı."]
+            return ["Yetkili açılış adresi alınamadı.", str(how or "")[:900]]
         return await v8_browser(name, url, state)
 
     try:
@@ -5000,7 +5012,7 @@ UNI_SHIM_JS = r"""
     }
     return best ? { x: best.left + best.width / 2, y: best.top + best.height / 2, w: best.width, h: best.height } : null;
   };
-  U.hasCanvas = () => Array.from(document.querySelectorAll('canvas')).some(c => { const r = c.getBoundingClientRect(); return r.width * r.height > window.innerWidth * window.innerHeight * 0.5; });
+  U.hasCanvas = () => { const vw = Math.min(window.innerWidth, screen.width || window.innerWidth), vh = Math.min(window.innerHeight, screen.height || window.innerHeight); return Array.from(document.querySelectorAll('canvas')).some(c => { const r = c.getBoundingClientRect(); return r.width * r.height > vw * vh * 0.4; }); };
 })();
 """
 
@@ -5535,7 +5547,7 @@ async def uni_flow(page, name, notes, state):
         if snippet:
             notes.append("Ekran özeti: " + snippet[:400])
         notes.append("Evrensel sonuç: ATLANDI (yapılacak güvenli işlem yok ya da hepsi zaten alınmış).")
-    elif run["gains"] or total or run["join_ok"]:
+    elif run["gains"] or uni_gain(start_text, end_text) or run["join_ok"]:
         notes.append("Evrensel sonuç: OK")
     else:
         notes.append("Evrensel sonuç: BELIRSIZ (tıklandı ama ekranda değişim okunamadı).")
@@ -5759,6 +5771,8 @@ def uni_problem_tr(notes: list) -> str:
     m = re.search(r"Hata:\s*(\S+)", text)
     if m:
         err = m.group(1)
+    if "mini uygulama değil" in low or "MİNİ UYGULAMA DEĞİL" in text:
+        return "bu bot mini uygulama değil (sadece sohbet botu), atlanabilir"
     if "açılış adresi alınamadı" in low or "acilis adresi alinamadi" in low:
         return "mini uygulama açılamadı (Telegram adres vermedi)"
     if "hedef bot" in low and "bulunamad" in low:
@@ -5790,7 +5804,15 @@ def uni_short_line(bot: str, outcome: str, notes: list) -> str:
         parts.append(f"{m.group(1)} kanala katıldı")
     m = re.search(r"Ekrandaki değişim: ([^\n]+)", text)
     if m:
-        parts.append(m.group(1).split(" | ")[0][:50])
+        # DÜZELTME: sadece ARTAN değer gösterilir (7.16 → 1.42 gibi azalanlar kazanç değildir)
+        for part in m.group(1).split(" | "):
+            mm = re.search(r"([0-9.,]+)\s*→\s*([0-9.,]+)\s*$", part)
+            try:
+                if mm and float(mm.group(2).replace(",", "")) > float(mm.group(1).replace(",", "")):
+                    parts.append(part[:50])
+                    break
+            except ValueError:
+                pass
     if outcome == "skip":
         if "BELIRSIZ" in text:
             parts.append("tıkladı ama sonuç görülmedi")
@@ -5850,12 +5872,31 @@ async def auto_link(name: str, short: str = "", start: str = ""):
     if name in V8_TASKS and not V8_TASKS[name].done():
         await v8_report(name, "Zaten sirada veya calisiyor.")
         return
-    await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} çalıştırılıyor… (1–5 dk sürer, bitince kısa sonuç gelecek)")
+    ahead = sum(1 for t in V8_TASKS.values() if not t.done())
+    queue_txt = f" — sırada önünde {ahead} bot var, sırayla çalışır" if ahead else ""
+    await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} çalıştırılıyor… (1–5 dk sürer, bitince kısa sonuç gelecek){queue_txt}")
 
     global AUTO_STOP
     AUTO_STOP = False
 
     async def job():
+        try:
+            await _job()
+        except asyncio.CancelledError:
+            try:
+                await bot_app.bot.send_message(ADMIN_USER_ID, f"⏹ @{name} durduruldu.")
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            # DÜZELTME: iş hata verirse artık sessiz kalmaz, sebebi yazılır
+            print(f"[V8 JOB] {name} {e!r}", flush=True)
+            try:
+                await bot_app.bot.send_message(ADMIN_USER_ID, f"❌ @{name} — beklenmeyen hata: {type(e).__name__} {str(e)[:150]}")
+            except Exception:
+                pass
+
+    async def _job():
         outcome, notes = await v8_run_and_track(name, short, start)
         uni_track(name, outcome)
         await persist_v8_ap()
@@ -6049,6 +6090,10 @@ WIZ_SHIM_JS = r"""
 
 # ---------------------------------------------------------------- Groq ----
 
+def _wiz_is_qwen(model: str) -> bool:
+    return "qwen" in (model or "").lower()
+
+
 def _wiz_is_gptoss(model: str) -> bool:
     return model.lower().startswith("openai/gpt-oss")
 
@@ -6071,7 +6116,7 @@ def _wiz_retry_after(resp, data) -> float:
 
 
 async def groq_chat(messages: list, json_mode: bool = False, max_tokens: int = 900,
-                    temperature: float = 0.2, timeout: int = 60, gemini: bool = True):
+                    temperature: float = 0.2, timeout: int = 60, gemini: bool = True, models: list = None):
     """Akıllı Groq çağrısı: model zinciri + 429 bekleme + JSON modu. (metin | None, not) döner."""
     if not GROQ_API_KEY and not (gemini and GEMINI_API_KEY):
         return None, "GROQ_API_KEY yok"
@@ -6079,12 +6124,13 @@ async def groq_chat(messages: list, json_mode: bool = False, max_tokens: int = 9
     if GROQ_STATE["lock"] is None:
         GROQ_STATE["lock"] = asyncio.Lock()
     last_note = "Groq hata"
-    for model in (GROQ_CHAIN if GROQ_API_KEY else []):
+    for model in ((models or GROQ_CHAIN) if GROQ_API_KEY else []):
         now = time.time()
         if GROQ_STATE["dead"].get(model, 0) > now or GROQ_STATE["cool"].get(model, 0) > now:
             continue
         use_json = json_mode
         use_reason = _wiz_is_gptoss(model)
+        use_hide = _wiz_is_qwen(model)  # qwen düşünme metnini gizle (cevap kısa ve temiz gelsin)
         for attempt in range(4):
             async with GROQ_STATE["lock"]:
                 gap = WIZ_AI_GAP - (time.time() - GROQ_STATE["last"])
@@ -6095,6 +6141,9 @@ async def groq_chat(messages: list, json_mode: bool = False, max_tokens: int = 9
                     "max_tokens": max_tokens + (1200 if _wiz_is_gptoss(model) else 0)}
             if use_reason:
                 body["reasoning_effort"] = "low"
+            if use_hide:
+                body["reasoning_format"] = "hidden"
+                body["max_tokens"] = max_tokens + 1500
             if use_json:
                 body["response_format"] = {"type": "json_object"}
             try:
@@ -6134,8 +6183,8 @@ async def groq_chat(messages: list, json_mode: bool = False, max_tokens: int = 9
                         last_note = f"Groq {model} kullanılamıyor ({st})"
                         print(f"[GROQ] {model} kullanılamıyor: {st} {err[:160]}", flush=True)
                         break
-                    if st == 400 and "reasoning" in el and use_reason:
-                        use_reason = False
+                    if st == 400 and "reasoning" in el and (use_reason or use_hide):
+                        use_reason = use_hide = False
                         continue
                     if st >= 400:
                         last_note = f"Groq {model} {st}"
@@ -6144,6 +6193,8 @@ async def groq_chat(messages: list, json_mode: bool = False, max_tokens: int = 9
                     msg = ((data.get("choices") or [{}])[0].get("message") or {})
                     raw = (msg.get("content") or "").strip()
                     raw = re.sub(r"(?s)<think>.*?</think>", "", raw).strip()
+                    if raw.startswith("<think>"):  # düşünme yarıda kesildi → cevap yok
+                        raw = ""
                     if raw:
                         GROQ_STATE["used"][model] = GROQ_STATE["used"].get(model, 0) + 1
                         return raw, model
@@ -6661,6 +6712,130 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
 
 # --------------------------------------------------------- tarayıcı ----
 
+# ------------------------------------------- canvas oyunları (görüntü) ----
+# Unity/Phaser gibi oyunlarda butonlar HTML değil, resim içinde. Bu modda ekran görüntüsü
+# Groq'un görüntü okuyabilen modeline gönderilir; model nereye dokunulacağını söyler.
+
+WIZ_VISION_MODELS = [m.strip() for m in (os.getenv("WIZ_VISION_MODEL", "qwen/qwen3.8-27b") or "").split(",") if m.strip()]
+WIZ_CANVAS_STEPS = int(os.getenv("WIZ_CANVAS_STEPS", "8") or 8)
+WIZ_CANVAS_BUDGET_S = int(os.getenv("WIZ_CANVAS_BUDGET_S", "180") or 180)
+
+WIZ_CANVAS_PROMPT = (
+    "Bu bir Telegram mini oyununun ekran görüntüsü ({w}x{h} piksel). Butonlar resmin içinde.\n"
+    "Görevin: ekrandaki yazıları OKU, oyunu ANLA ve ödül kazandıran SIRADAKİ TEK güvenli dokunuşu seç.\n"
+    "Öncelik: açık pencereyi kapat/onayla (OK, Close, X, Continue, Got it) > ödül topla (Claim, Collect, Daily, "
+    "Free, Check-in) > görev/oyna (Play, Start, Tap, Tasks) > bitir.\n"
+    "YASAK: cüzdan, Connect Wallet, ödeme, Stars, TON, satın alma (Buy, Shop, fiyatlı butonlar), davet/arkadaş, paylaş.\n"
+    "Daha önce işe yaramayan noktalar: {bad}\nÖnceki adımlar: {hist}\n"
+    "SADECE şu JSON'u döndür:\n"
+    '{{"ekran":"ekranın 1-2 cümle Türkçe açıklaması","yazilar":"ekranda okuduğun önemli yazılar/sayılar",'
+    '"bakiye":"ana bakiye sayısı ya da boş","eylem":"dokun|bitir","x":0,"y":0,"buton":"dokunulacak butonun yazısı",'
+    '"neden":"kısa","sorun":""}}'
+)
+
+
+def _wiz_num(v):
+    try:
+        return float(re.sub(r"[^0-9.]", "", str(v).replace(",", "")) or "x")
+    except ValueError:
+        return None
+
+
+async def wiz_canvas_explore(page, name: str, notes: list, state: dict):
+    if not (V8_AP.get("wiz_ai") and GROQ_API_KEY and WIZ_CANVAS_STEPS > 0 and WIZ_VISION_MODELS):
+        return False
+    state["stage"] = "sihirbaz_canvas"
+    import base64
+    vp = page.viewport_size or {"width": 390, "height": 844}
+    w, h = int(vp["width"]), int(vp["height"])
+    deadline = time.time() + WIZ_CANVAS_BUDGET_S
+    hist, bad, log = [], [], []
+    first_bal, last_bal, idle = None, None, 0
+    prev_shot = b""
+    for step in range(1, WIZ_CANVAS_STEPS + 1):
+        if time.time() > deadline or AUTO_STOP:
+            break
+        try:
+            shot = await page.screenshot(type="jpeg", quality=55, timeout=10000)
+        except Exception as e:
+            WIZ_CUR["ai_issues"].append(f"Oyun ekranının görüntüsü alınamadı ({type(e).__name__})")
+            break
+        prompt = WIZ_CANVAS_PROMPT.format(w=w, h=h, bad=", ".join(bad[-6:]) or "(yok)",
+                                          hist=" | ".join(hist[-5:]) or "(yok)")
+        msg = [{"role": "system", "content": WIZ_SYSTEM},
+               {"role": "user", "content": [
+                   {"type": "text", "text": prompt},
+                   {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(shot).decode()}}]}]
+        raw, model = await groq_chat(msg, json_mode=True, max_tokens=400, gemini=False, models=WIZ_VISION_MODELS)
+        dec = wiz_json(raw)
+        if not dec:
+            WIZ_CUR["ai_issues"].append(f"Görüntü okuyan yapay zeka cevap vermedi ({model})")
+            break
+        WIZ_CUR["ai_steps"] += 1
+        desc = (str(dec.get("ekran") or "") + " " + str(dec.get("yazilar") or "")).strip()
+        if desc and len(WIZ_CUR["screens"]) < 30:
+            WIZ_CUR["screens"].append("[oyun ekranı, görüntüden okundu] " + desc[:500])
+        bal = _wiz_num(dec.get("bakiye"))
+        if bal is not None:
+            first_bal = bal if first_bal is None else first_bal
+            last_bal = bal
+        sorun = str(dec.get("sorun") or "").strip()
+        if sorun and sorun not in WIZ_CUR["ai_issues"] and len(WIZ_CUR["ai_issues"]) < 10:
+            WIZ_CUR["ai_issues"].append(sorun[:200])
+        act = str(dec.get("eylem") or "").lower()
+        btn = str(dec.get("buton") or "")[:40]
+        if act not in ("dokun", "tikla", "tıkla", "click", "tap"):
+            break
+        if UNI_RISK_RE.search(btn) or WIZ_REF_NAV_RE.search(btn):
+            hist.append(f"{step}. '{btn}' güvenlik nedeniyle reddedildi")
+            bad.append(btn)
+            WIZ_CUR["fails"].append(f"Güvenlik için basılmadı (oyun içi): {btn}")
+            idle += 1
+            if idle >= 3:
+                break
+            continue
+        x, y = _wiz_num(dec.get("x")), _wiz_num(dec.get("y"))
+        if x is None or y is None or not (0 < x < w and 0 < y < h):
+            hist.append(f"{step}. geçersiz koordinat ({dec.get('x')},{dec.get('y')})")
+            idle += 1
+            if idle >= 3:
+                break
+            continue
+        try:
+            await page.mouse.click(x, y)
+        except Exception:
+            try:
+                await page.touchscreen.tap(x, y)
+            except Exception:
+                pass
+        await page.wait_for_timeout(2500)
+        try:
+            after = await page.screenshot(type="jpeg", quality=55, timeout=10000)
+        except Exception:
+            after = b""
+        changed = after != shot and after != prev_shot
+        prev_shot = shot
+        res = "ekran değişti" if changed else "değişmedi"
+        hist.append(f"{step}. dokun '{btn}' ({int(x)},{int(y)}) → {res}")
+        log.append(f"'{btn or f'{int(x)},{int(y)}'}' → {res}")
+        if changed:
+            idle = 0
+        else:
+            bad.append(f"{btn} ({int(x)},{int(y)})")
+            idle += 1
+            if idle >= 3:
+                break
+    if log:
+        notes.append(f"Sihirbaz (görüntü ile canvas oyunu) {len(log)} dokunuş: " + " · ".join(log[:10])[:900])
+        WIZ_CUR.setdefault("cv_log", []).extend(log)
+    if first_bal is not None and last_bal is not None and last_bal > first_bal:
+        notes.append(f"Ekrandaki değişim: Bakiye (görüntüden): {first_bal:g} → {last_bal:g}")
+        WIZ_CUR.setdefault("cv_gain", []).append(f"Bakiye {first_bal:g} → {last_bal:g}")
+        notes.append("Evrensel sonuç: OK")
+        return True
+    return bool(log)
+
+
 class _WizRetry(Exception):
     pass
 
@@ -6745,7 +6920,14 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
                 # boş ekran: bozuk kayıtlı oturum olabilir → temiz oturumla bir kez daha
                 await page.wait_for_timeout(5000)
                 first = await uni_screen(page)
-                if not first.strip():
+                try:
+                    has_cv = await page.evaluate("() => !!document.querySelector('canvas')")
+                except Exception:
+                    has_cv = False
+                if not first.strip() and has_cv:
+                    # DÜZELTME: canvas oyunlarında yazı olmaz; boş sanılıp oturum silinmez, yüklenmesi beklenir
+                    await page.wait_for_timeout(8000)
+                elif not first.strip():
                     retry_needed = True
                     raise _WizRetry("ekran boş geldi")
             notes.append("Sayfa açıldı (Telegram köprüsü taklidi aktif)." + (" [temiz oturum]" if _retry else ""))
@@ -6768,6 +6950,19 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
                 notes = await uni_flow(page, name, notes, state)
             # ---- sihirbaz: yapay zeka + referans ----
             if V8_AP.get("wiz_on") and WIZ_CUR:
+                try:
+                    is_canvas = await page.evaluate("() => window.__uni && window.__uni.hasCanvas ? window.__uni.hasCanvas() : false")
+                except Exception:
+                    is_canvas = False
+                if is_canvas:
+                    try:
+                        did_cv = await asyncio.wait_for(wiz_canvas_explore(page, name, notes, state), WIZ_CANVAS_BUDGET_S + 60)
+                        if not did_cv:
+                            WIZ_CUR["fails"].append("Canvas oyununda görüntüden güvenli bir dokunuş bulunamadı")
+                    except asyncio.TimeoutError:
+                        WIZ_CUR["ai_issues"].append("Canvas oyunu adımları süre sınırına takıldı")
+                    except Exception as e:
+                        WIZ_CUR["ai_issues"].append(f"Canvas oyunu adımı hata verdi: {type(e).__name__}")
                 try:
                     await asyncio.wait_for(wiz_ai_explore(page, name, notes, state), WIZ_AI_BUDGET_S + 60)
                 except asyncio.TimeoutError:
@@ -6803,11 +6998,14 @@ WIZ_SUM_PROMPT = (
     "bilgiyi kullan, uydurma. Tam olarak şu formatta yaz (başlıkları koru):\n"
     "🎮 Uygulama: <ad> — <1 cümle ne olduğu>\n"
     "📌 Nasıl çalışıyor: <2-3 cümle: tap/farm/görev/puan/token mantığı>\n"
-    "✅ Bu turda yaptıklarım:\n- ...\n"
+    "✅ Bu turda yaptıklarım:\n- ... (SADECE İŞLEM LOGU'nda geçen eylemler; ekranda 'Completed/Done/✓' yazan "
+    "görevleri buraya YAZMA)\n"
+    "📋 Zaten yapılmış görünenler:\n- ... (ekranda tamamlandı yazanlar; yoksa '- yok')\n"
     "❗ Yapamadıklarım ve nedeni:\n- ... (yoksa '- yok')\n"
     "👉 Senin elle yapman gerekenler:\n- ... (yoksa '- yok')\n"
     "💰 Token / airdrop: <ekranda geçen bilgi, yoksa 'belirsiz'>\n"
     "⭐ Değerlendirme: <1 cümle: devam etmeye değer mi, dikkat edilecek risk>\n"
+    "Sayı azaldıysa (ör. 7.16 → 1.42) bunu kazanç diye yazma. Liste satırları tek '- ' ile başlasın.\n"
     "En fazla 1500 karakter.\n\n"
 )
 
@@ -6838,7 +7036,8 @@ async def wiz_make_summary(name: str, outcome: str, notes: list) -> str:
                                   {"role": "user", "content": prompt}], max_tokens=900)
     if not raw:
         return wiz_fallback_summary(name, outcome, notes)
-    return raw.strip()[:2200]
+    raw = re.sub(r"(?m)^(\s*)[-•*]\s*[-•*]\s+", r"\1- ", raw.strip())  # "- - yok" → "- yok"
+    return raw[:2200]
 
 
 async def wiz_ref_from_chat(name: str):
@@ -6885,7 +7084,16 @@ async def wiz_finish(name: str, outcome: str, notes: list, source: str):
     if mode == "kapali":
         send = False
     summary = prev.get("summary", "")
-    if send or not prev:
+    if not opened:
+        # açılamadıysa Groq kotası harcanmaz, nedeni kısaca yazılır
+        why = uni_problem_tr(notes) or "mini uygulama açılamadı"
+        detail = next((n for n in notes if n.startswith("Açılamadı:")), "")[:500]
+        summary = f"🎮 Uygulama: @{name}\n❗ Açılamadı: {why}"
+        if "mini uygulama değil" in why:
+            summary += "\n👉 Bu bir sohbet botu; otomatik yapılacak bir şey yok, istersen listeden çıkarabilirsin."
+        elif detail:
+            summary += "\n🔎 Ayrıntı: " + detail
+    elif send or not prev:
         summary = await wiz_make_summary(name, outcome, notes)
     WIZ_SUM[name] = {"t": time.time(), "outcome": outcome, "summary": summary[:2200],
                      "ref": final_ref or "", "ref_src": final_src or "", "problems": problems[:15]}
