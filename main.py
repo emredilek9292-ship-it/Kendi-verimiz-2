@@ -2268,25 +2268,15 @@ async def ref_finder(bot: str):
             for l, s in found[1:4]:
                 lines.append(f"Diğer aday: {l}")
         else:
-            lines += ["", "❌ Tam referans linkini bulamadım."]
-            if not url:
-                lines.append("Mini uygulama açılamadı: " + how[:300])
+            # Sessiz: ana görev başarılıysa kırmızı ref gürültüsü atma
+            lines = [f"🔗 @{bot}: referans bu turda bulunamadı — sonraki turda Davet sekmesi taranacak."]
+            await send_admin("\n".join(lines))
+            return
         if probe:
             if probe["codes"]:
-                lines += ["", "🔑 Referansa benzeyen alanlar:"] + [f"- {p} = {v}" for p, v in probe["codes"]]
+                lines += ["", "🔑 Referans alanları:"] + [f"- {p} = {v}" for p, v in probe["codes"][:6]]
             if probe["templates"]:
-                lines += ["", "🧩 Kodda geçen link kalıbı:"] + [f"- {t}" for t in probe["templates"]]
-            if probe["api"]:
-                lines += ["", "🌐 API'den okuduğum alanlar (değerler yazılmadı):"] + [f"- {a}" for a in probe["api"]]
-            else:
-                if probe.get("hosts"):
-                    lines += ["", "🖥 Uygulama kodunda bulduğum sunucu adresleri:"] + [f"- {h}" for h in probe["hosts"]]
-                if probe.get("paths"):
-                    lines += ["", "🧭 Kodda geçen yol adayları:"] + [f"- {p}" for p in probe["paths"][:20]]
-            for n in probe["notes"]:
-                lines.append(f"ℹ️ {n}")
-        if not found:
-            lines += ["", "Bir sonraki otopilot turunda Davet/Friends sekmesi tekrar taranacak (elle link gerekmez)."]
+                lines += ["", "🧩 Link kalıbı:"] + [f"- {t}" for t in probe["templates"][:3]]
         await send_admin("\n".join(lines))
     except Exception as e:
         print("[REF]", repr(e))
@@ -4435,13 +4425,33 @@ async def auto_link(name: str,short: str="",start: str=""):
 
 
 def _v8_notes_outcome(notes: list) -> str:
-    text = "\n".join(notes)
-    if "toplama doğrulandı" in text or "toplama dogrulandi" in text:
+    """ok=ödül/işlem görüldü · skip=yapılacak yok · err=hata."""
+    text = "\n".join(notes or [])
+    low = text.lower()
+    if any(x in text for x in (
+        "toplama doğrulandı", "toplama dogrulandi", "HOLDING arttı", "HOLDING artti",
+        "Evrensel sonuç: OK", "doğrulandı (HOLDING", "Günlük ödül doğrulandı",
+    )):
         return "ok"
-    if "claim atlandı" in text or "claim atlandi" in text or "Kasa zaten" in text:
+    # Ekranda sayı artışı (ATF: 0.43 → 0.44 / Balance: a → b)
+    if re.search(r":\s*[\d.]+\s*→\s*[\d.]+", text) or re.search(r":\s*[\d.]+\s*->\s*[\d.]+", text):
+        # artış var mı kabaca
+        for m in re.finditer(r"([\d.]+)\s*→\s*([\d.]+)", text):
+            try:
+                if float(m.group(2)) > float(m.group(1)):
+                    return "ok"
+            except ValueError:
+                pass
+    if "Evrensel sonuç: ATLANDI" in text or "Evrensel sonuç: BELIRSIZ" in text:
         return "skip"
-    if "toplandı kabul edilmedi" in text or "toplandi kabul edilmedi" in text:
+    if any(x in low for x in ("claim atlandı", "claim atlandi", "kasa zaten")):
         return "skip"
+    if any(x in low for x in ("toplandı kabul edilmedi", "toplandi kabul edilmedi")):
+        return "skip"
+    if any(x in low for x in ("hata:", "zaman aşımı", "timeout", "bulunamadı", "açılamadı", "acilamadi")):
+        return "err"
+    if "yapılan" in low and "işlem" in low and re.search(r"yapılan\s*[1-9]", low):
+        return "ok"  # en az bir tıklama yapıldı
     return "err"
 
 
@@ -5888,19 +5898,33 @@ async def v8_browser(name, url, state):
 
 
 def _v8_notes_outcome(notes: list) -> str:
-    text = "\n".join(notes)
-    if "toplama doğrulandı" in text or "toplama dogrulandi" in text or "HOLDING arttı" in text:
+    """ok=ödül/işlem görüldü · skip=yapılacak yok · err=hata."""
+    text = "\n".join(notes or [])
+    low = text.lower()
+    if any(x in text for x in (
+        "toplama doğrulandı", "toplama dogrulandi", "HOLDING arttı", "HOLDING artti",
+        "Evrensel sonuç: OK", "doğrulandı (HOLDING", "Günlük ödül doğrulandı",
+    )):
         return "ok"
-    if "Evrensel sonuç: OK" in text:
-        return "ok"
+    # Ekranda sayı artışı (ATF: 0.43 → 0.44 / Balance: a → b)
+    if re.search(r":\s*[\d.]+\s*→\s*[\d.]+", text) or re.search(r":\s*[\d.]+\s*->\s*[\d.]+", text):
+        # artış var mı kabaca
+        for m in re.finditer(r"([\d.]+)\s*→\s*([\d.]+)", text):
+            try:
+                if float(m.group(2)) > float(m.group(1)):
+                    return "ok"
+            except ValueError:
+                pass
     if "Evrensel sonuç: ATLANDI" in text or "Evrensel sonuç: BELIRSIZ" in text:
         return "skip"
-    if "toplama doğrulandı" in text or "toplama dogrulandi" in text or "doğrulandı" in text:
-        return "ok"
-    if "claim atlandı" in text or "claim atlandi" in text or "Kasa zaten" in text:
+    if any(x in low for x in ("claim atlandı", "claim atlandi", "kasa zaten")):
         return "skip"
-    if "toplandı kabul edilmedi" in text or "toplandi kabul edilmedi" in text:
+    if any(x in low for x in ("toplandı kabul edilmedi", "toplandi kabul edilmedi")):
         return "skip"
+    if any(x in low for x in ("hata:", "zaman aşımı", "timeout", "bulunamadı", "açılamadı", "acilamadi")):
+        return "err"
+    if "yapılan" in low and "işlem" in low and re.search(r"yapılan\s*[1-9]", low):
+        return "ok"  # en az bir tıklama yapıldı
     return "err"
 
 
@@ -6038,29 +6062,44 @@ def uni_short_line(bot: str, outcome: str, notes: list) -> str:
     text = "\n".join(notes or [])
     icon = {"ok": "✅", "skip": "➖", "err": "❌"}.get(outcome, "•")
     parts = []
-    if "toplama doğrulandı" in text or "HOLDING arttı" in text:
-        parts.append("ödül toplandı")
-    m = re.search(r"Yapılan (\d+) işlem", text)
+    if outcome == "ok":
+        parts.append("BAŞARILI")
+    # yapılan işlemler
+    m = re.search(r"Yapılan (\d+) işlem:\s*([^\n]+)", text)
     if m:
         parts.append(f"{m.group(1)} tıklama")
+        # ilk birkaç aksiyon
+        acts = m.group(2)[:120]
+        if acts:
+            parts.append(acts.split(" · ")[0][:40])
+    elif re.search(r"Yapılan (\d+) işlem", text):
+        parts.append(re.search(r"Yapılan (\d+) işlem", text).group(0))
     m = re.search(r"Görev kanalları: (\d+)/(\d+)", text)
-    if m:
+    if m and int(m.group(1)) > 0:
         parts.append(f"{m.group(1)} kanala katıldı")
     m = re.search(r"Ekrandaki değişim: ([^\n]+)", text)
     if m:
-        parts.append(m.group(1).split(" | ")[0][:50])
+        parts.append(m.group(1).split(" | ")[0][:60])
+    if "toplama doğrulandı" in text or "HOLDING arttı" in text:
+        parts.append("ödül toplandı")
+    if "Referans otomatik kaydedildi" in text or "Bulundu ve kaydedildi" in text:
+        parts.append("ref kaydedildi")
     if outcome == "skip":
         if "BELIRSIZ" in text:
-            parts.append("tıkladı ama sonuç görülmedi")
+            parts.append("tıkladı ama sonuç okunamadı")
         elif not parts:
-            parts.append("yapılacak bir şey yok (hepsi alınmış ya da süre dolmamış)")
+            parts.append("yapılacak bir şey yok")
     prob = uni_problem_tr(notes) if outcome != "ok" else ""
     if outcome == "err" and not prob:
         prob = "hata"
-    line = f"{icon} @{bot} — " + (", ".join(parts) if parts else ("tamam" if outcome == "ok" else ""))
+    head = f"{icon} @{bot}"
+    if outcome == "ok":
+        head = f"✅ @{bot}"
+    line = head + " — " + (", ".join(parts) if parts else ("tamam" if outcome == "ok" else ""))
     if prob:
         line = line.rstrip(" —,") + f" — sorun: {prob}"
     return line.rstrip(" —")
+
 
 
 async def uni_send_round_summary(lines: list, wait_s: int):
@@ -6117,7 +6156,17 @@ async def auto_link(name: str, short: str = "", start: str = ""):
         outcome, notes = await v8_run_and_track(name, short, start)
         uni_track(name, outcome)
         await persist_v8_ap()
-        await bot_app.bot.send_message(ADMIN_USER_ID, uni_short_line(name, outcome, notes) + f"\n(Tam log: detay {name})", disable_web_page_preview=True)
+        line = uni_short_line(name, outcome, notes)
+        if outcome == "ok":
+            msg = f"✅ İŞLEM TAMAM\n{line}\n\nNe yaptı: " + (
+                next((n for n in notes if n.startswith("Yapılan")), "ödül/görev işlendi")
+            )[:500]
+            msg += f"\n\n(Detay: detay {name})"
+        elif outcome == "skip":
+            msg = f"➖ BOŞ TUR\n{line}\n(Detay: detay {name})"
+        else:
+            msg = f"❌ HATA\n{line}\n(Detay: detay {name})"
+        await bot_app.bot.send_message(ADMIN_USER_ID, msg, disable_web_page_preview=True)
         if outcome == "ok" and name not in v8_ap_bots() and name not in (V8_AP.get("blocked") or []) and not UNI_BOT_NAME_RISK.search(name):
             # elle çalıştırılıp başarılı olan bot otopilota eklenir
             V8_AP["bots"] = v8_ap_bots() + [name]
