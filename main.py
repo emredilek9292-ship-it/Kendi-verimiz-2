@@ -72,7 +72,7 @@ RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 INSPECT = os.getenv("INSPECT", "1").strip() != "0"                 # yeni botu otomatik incele
 INSPECT_MIN_INTERVAL = int(os.getenv("INSPECT_MIN_INTERVAL", "120") or 120)  # iki inceleme arasi sn
 INSPECT_HOURLY_MAX = int(os.getenv("INSPECT_HOURLY_MAX", "10") or 10)
-INSPECT_WAIT = int(os.getenv("INSPECT_WAIT", "7") or 7)            # /start'tan sonra cevap bekleme sn
+INSPECT_WAIT = int(os.getenv("INSPECT_WAIT", "3") or 3)            # /start'tan sonra cevap bekleme sn
 JOIN_DAILY_MAX = int(os.getenv("JOIN_DAILY_MAX", "0") or 0)        # 24 saatte en fazla kanal katilimi (0 = sinirsiz)
 ROUTINES_ON = os.getenv("ROUTINES", "1").strip() != "0"
 
@@ -4578,7 +4578,8 @@ async def v8_autopilot_loop():
             round_lines = []
             dialog_names = await uni_dialog_usernames()
             for bot in bots:
-                if not V8_AP.get("on"):
+                if not V8_AP.get("on") or AUTO_STOP:
+                    round_lines.append("⏸ Otopilot: manuel istek var, tur ara verildi")
                     break
                 if uni_paused(bot):
                     round_lines.append(f"⏸ @{bot} — üst üste hata verdiği için bekletiliyor")
@@ -4588,9 +4589,22 @@ async def v8_autopilot_loop():
                     await uni_block_bot(bot)
                     round_lines.append(f"🗑 @{bot} — sohbeti silmişsin; listeden çıkarıldı, bir daha açılmayacak")
                     continue
-                busy = any(not t.done() for t in V8_TASKS.values())
-                if busy:
-                    await asyncio.sleep(20)
+                # Manuel @bot çalışıyorsa otopilot bekle
+                manual_busy = any(
+                    (not t.done()) and not str(k).startswith("ap:")
+                    for k, t in list(V8_TASKS.items())
+                )
+                if manual_busy or AUTO_STOP:
+                    round_lines.append("⏸ Manuel iş öncelikli — otopilot bekliyor")
+                    while manual_busy or AUTO_STOP:
+                        if not V8_AP.get("on"):
+                            break
+                        await asyncio.sleep(3)
+                        manual_busy = any(
+                            (not t.done()) and not str(k).startswith("ap:")
+                            for k, t in list(V8_TASKS.items())
+                        )
+                    continue
                 V8_AP["bot"] = bot
                 key = f"ap:{bot}"
                 task = asyncio.create_task(v8_run_and_track(bot))
@@ -4830,7 +4844,7 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 
 UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "80") or 80)      # bir turda en fazla tıklama
-UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "300") or 300)          # bir bot için tarayıcı süresi (sn)
+UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "420") or 420)          # bir bot için tarayıcı süresi (sn)
 UNI_TABS = int(os.getenv("UNI_TABS", "8") or 8)                      # gezilecek en fazla sekme
 UNI_TAPS = int(os.getenv("UNI_TAPS", "30") or 30)                    # tapper oyunlarında dokunma (0 = kapalı)
 UNI_JOIN = os.getenv("UNI_JOIN", "1").strip() != "0"                 # görev kanallarına katıl
@@ -4841,7 +4855,7 @@ UNI_FAIL_PAUSE = int(os.getenv("UNI_FAIL_PAUSE", "5") or 5)          # üst üst
 UNI_STATE_DIR = os.getenv("UNI_STATE_DIR", "/tmp/uni_state")
 UNI_AFTER_PROFILE = os.getenv("UNI_AFTER_PROFILE", "1").strip() != "0"  # MyAge/Pickaxe sonrası evrensel görevler
 V8_AP.setdefault("pxe_fb_t", 0)
-V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "600") or 600)
+V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "720") or 720)
 
 V8_AP.setdefault("auto_add", False)   # radar yeni mini app bulunca listeye eklesin mi
 V8_AP.setdefault("per", {})           # bot başına istatistik {bot: {ok,skip,err,fail,last}}
@@ -5858,7 +5872,14 @@ async def v8_browser(name, url, state):
             page.set_default_timeout(10000)
             state["stage"] = "sayfa_acilisi"
             try:
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                except Exception as e1:
+                    notes.append(f"İlk yükleme yavaş ({type(e1).__name__}); commit ile yeniden deneniyor.")
+                    try:
+                        response = await page.goto(url, wait_until="commit", timeout=90000)
+                    except Exception as e2:
+                        return notes + [f"Sayfa açılamadı: {type(e2).__name__} (uygulama çok yavaş veya Render kaynak yetmedi)."]
                 if response and response.status >= 400:
                     return [f"HTTP {response.status}; islem yapilmadi."]
             except PWTimeout:
@@ -6144,36 +6165,57 @@ async def uni_block_bot(name: str):
 
 
 async def auto_link(name: str, short: str = "", start: str = ""):
-    if name in V8_TASKS and not V8_TASKS[name].done():
-        await v8_report(name, "Zaten sirada veya calisiyor.")
+    """Manuel @bot: hemen öncelik. Otopilot turunu bekletmez / uzun kuyrukta 10 dk yatmaz."""
+    name = (name or "").lstrip("@").lower()
+    if not name:
         return
-    await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} çalıştırılıyor… (1–5 dk sürer, bitince kısa sonuç gelecek)")
+    if name in V8_TASKS and not V8_TASKS[name].done():
+        await bot_app.bot.send_message(ADMIN_USER_ID, f"⏳ @{name} zaten sırada/çalışıyor.")
+        return
 
     global AUTO_STOP
-    AUTO_STOP = False
+    # Otopilot bir botu uzun süredir eziyorsa kes; manuel iş öne alınsın
+    AUTO_STOP = True
+    await bot_app.bot.send_message(
+        ADMIN_USER_ID,
+        f"▶️ @{name} hemen başlıyor (manuel öncelik).\n"
+        f"Otopilot bu iş bitene kadar bekler; bitince kaldığı yerden devam eder.",
+    )
 
     async def job():
-        outcome, notes = await v8_run_and_track(name, short, start)
-        uni_track(name, outcome)
-        await persist_v8_ap()
-        line = uni_short_line(name, outcome, notes)
-        if outcome == "ok":
-            msg = f"✅ İŞLEM TAMAM\n{line}\n\nNe yaptı: " + (
-                next((n for n in notes if n.startswith("Yapılan")), "ödül/görev işlendi")
-            )[:500]
-            msg += f"\n\n(Detay: detay {name})"
-        elif outcome == "skip":
-            msg = f"➖ BOŞ TUR\n{line}\n(Detay: detay {name})"
-        else:
-            msg = f"❌ HATA\n{line}\n(Detay: detay {name})"
-        await bot_app.bot.send_message(ADMIN_USER_ID, msg, disable_web_page_preview=True)
-        if outcome == "ok" and name not in v8_ap_bots() and name not in (V8_AP.get("blocked") or []) and not UNI_BOT_NAME_RISK.search(name):
-            # elle çalıştırılıp başarılı olan bot otopilota eklenir
-            V8_AP["bots"] = v8_ap_bots() + [name]
+        global AUTO_STOP
+        try:
+            # Kısa bekleme: önceki tur AUTO_STOP görsün
+            await asyncio.sleep(1.5)
+            AUTO_STOP = False
+            # Kilit doluysa kullanıcıya söyle, sonsuz sessiz bekleme yok
+            if V8_LOCK and V8_LOCK.locked():
+                await bot_app.bot.send_message(
+                    ADMIN_USER_ID,
+                    f"⌛ @{name}: önceki mini app kapanıyor (en fazla ~60 sn)…",
+                )
+            t0 = time.time()
+            outcome, notes = await v8_run_and_track(name, short, start)
+            took = int(time.time() - t0)
+            uni_track(name, outcome)
             await persist_v8_ap()
-            await bot_app.bot.send_message(ADMIN_USER_ID, f"➕ @{name} başarılı çalıştı, otopilot listesine eklendi ({len(V8_AP['bots'])} bot). Çıkarmak için: otopilot sil {name}")
-        else:
-            await uni_auto_add(name, notes)
+            line = uni_short_line(name, outcome, notes)
+            if outcome == "ok":
+                msg = (
+                    f"✅ İŞLEM TAMAM ({took} sn)\n{line}\n\nNe yaptı: "
+                    + next((n for n in notes if n.startswith("Yapılan")), "ödül/görev işlendi")[:500]
+                    + f"\n\n(Detay: detay {name})"
+                )
+            elif outcome == "skip":
+                msg = f"➖ BOŞ TUR ({took} sn)\n{line}\n(Detay: detay {name})"
+            else:
+                msg = f"❌ HATA ({took} sn)\n{line}\n(Detay: detay {name})"
+            await bot_app.bot.send_message(ADMIN_USER_ID, msg, disable_web_page_preview=True)
+            # Manuel başarıda listeyi şişirme (otopilot ekle sen de)
+            if outcome == "ok" and V8_AP.get("auto_add"):
+                await uni_auto_add(name, notes)
+        finally:
+            AUTO_STOP = False
 
     V8_TASKS[name] = spawn(job())
 
