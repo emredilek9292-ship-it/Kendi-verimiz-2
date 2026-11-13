@@ -1,5 +1,5 @@
 """
-Airdrop / oyun bot radari (v3 + Groq + V8.31 evrensel mini app motoru — tüm görevler + profil sonrası görevler)
+Airdrop / oyun bot radari (v3 + Groq + V8.32 evrensel mini app motoru — tüm görevler + profil sonrası görevler)
 
 Otomatik olanlar:
   - Dinledigin gruplarda yeni oyun botu linki yakalar, Turkce rehber yazar, sana ozelden atar.
@@ -4737,6 +4737,13 @@ UNI_TASK_VERB_RE = re.compile(
     r"подпиш|вступ|перейд|канал|чат|смотр)\w*",
     re.I,
 )
+UNI_SOCIAL_RE = re.compile(
+    r"\b(?:join|subscribe|follow|telegram|channel|chat|group|community|twitter|youtube|tiktok|instagram|discord|"
+    r"kat[ıi]l|abone|takip|kanal|sohbet|grup|подпиш|вступ|канал|чат)\w*",
+    re.I,
+)
+UNI_MAIN_GO_RE = re.compile(r"^(?:start|ba[şs]la|начать)\b", re.I)
+UNI_TIMER_RE = re.compile(r"\d+\s*[dhms]\b|\d+\s*/\s*\d+|\d+:\d+|[⏳⌛🏆⚔💪]")
 UNI_AMOUNT_RE = re.compile(r"^\+?\s*[\d.,]+\s*[kKmMbB]?\s*[A-Za-z$]{0,8}\s*[→>›»]?$")
 UNI_DONE_RE = re.compile(r"\b(?:done|completed?|claimed|finished|received|tamamland[ıi]|al[ıi]nd[ıi]|выполнено|получено)\b|✓|✔|✅", re.I)
 UNI_JOIN_SKIP = {"share", "proxy", "socks", "addstickers", "addemoji", "addlist", "boost", "iv", "login",
@@ -5285,9 +5292,13 @@ async def uni_work_screen(page, name: str, run: dict, notes: list, deadline: flo
             order += [("reward", x) for x in fresh(pg(groups["reward"]), "reward")]
             if pending_check or run["join_ok"]:
                 order += [("check", x) for x in fresh(pg(groups["check"]), "check", limit=2)]
-            order += [("go", x) for x in fresh(pg(groups["go"]), "go")]
-            if label != "ana" or not groups["reward"]:
-                order += [("task", x) for x in fresh(groups["task"], "task") if sig_ok(x[1])]
+            gos = pg(groups["go"])
+            tasks = groups["task"]
+            if label == "ana":
+                gos = [c for c in gos if UNI_MAIN_GO_RE.match(c["text"]) or UNI_SOCIAL_RE.search(c["text"] + " " + c["ctx"][:120])]
+                tasks = [c for c in tasks if UNI_SOCIAL_RE.search(c["text"] + " " + c["ctx"][:120])]
+            order += [("go", x) for x in fresh(gos, "go")]
+            order += [("task", x) for x in fresh(tasks, "task") if sig_ok(x[1])]
             order += [("check", x) for x in fresh(pg(groups["check"]), "check", limit=1)]
             order += [("dismiss", x) for x in fresh(groups["dismiss"], "dismiss", limit=2)]
 
@@ -5416,12 +5427,22 @@ async def uni_flow(page, name, notes, state):
             if time.time() >= deadline or run["actions"] >= UNI_MAX_ACTIONS or AUTO_STOP:
                 break
             subs = []
-            for c in await uni_scan(page):
+            scan = await uni_scan(page)
+            for c in scan:
                 k = uni_classify(c)
-                if c.get("navbar") or k in ("risk", "skip"):
+                if c.get("navbar") or c.get("overlay") or k in ("risk", "skip"):
                     continue
-                if (c.get("tab") or k == "nav") and uni_norm(c["text"]) not in visited_tabs and c["text"] != "[ikon]":
-                    subs.append(c)
+                t = c["text"]
+                if t == "[ikon]" or len(t) > 18 or UNI_TIMER_RE.search(t) or uni_norm(t) in visited_tabs:
+                    continue
+                if not (c.get("tab") or k == "nav"):
+                    continue
+                # gerçek sekme şeridi: aynı hizada en az 2 kısa sekme benzeri öğe
+                peers = [o for o in scan if o is not c and abs(o["y"] - c["y"]) < 10 and abs(o["h"] - c["h"]) < 12
+                         and len(o["text"]) <= 18 and not o.get("navbar")]
+                if not peers:
+                    continue
+                subs.append(c)
             if not subs:
                 break
             subs.sort(key=lambda c: (c["y"], c["x"]))
