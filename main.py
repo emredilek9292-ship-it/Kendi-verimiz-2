@@ -594,6 +594,7 @@ BRAIN_RANK_PROMPT = (
     "- task: Join channel, Follow, Katıl, Check-in görevi, Share (sadece işaretle; cüzdan değil)\n"
     "- check: Check, Verify (görev doğrulama; cüzdan değil)\n"
     "- go: Start, Go, Open, Continue (güvenli)\n"
+    "- nav önceliği: Friends, Invite, Davet, Earn, Tasks, Daily önce; Wallet/Shop sonra\n"
     "- dismiss: Close, OK, Skip (sadece bilinen duyuru/kapat)\n"
     "- skip: wallet, connect, deposit, withdraw, buy, payment, stake, premium, seed, private key\n"
     "ASLA skip dışındaki kind ile cüzdan/ödeme/seed öner. En fazla 8 öğe. Uydurma buton yazma.\n\n"
@@ -2285,8 +2286,7 @@ async def ref_finder(bot: str):
             for n in probe["notes"]:
                 lines.append(f"ℹ️ {n}")
         if not found:
-            lines += ["", f"Uygulamada Davet sayfasındaki Kopyala ile linki alıp şunu yazarsan kaydederim:",
-                      f"/ref {bot} <link>"]
+            lines += ["", "Bir sonraki otopilot turunda Davet/Friends sekmesi tekrar taranacak (elle link gerekmez)."]
         await send_admin("\n".join(lines))
     except Exception as e:
         print("[REF]", repr(e))
@@ -5299,7 +5299,80 @@ async def uni_click(page, c: dict) -> bool:
         return False
 
 
+
+async def uni_auto_ref(page, name: str, notes: list) -> str:
+    """Mini app ekranından kişisel referans linkini otomatik çıkar ve kaydet. Elle /ref istemez."""
+    name = (name or "").lower().lstrip("@")
+    if not name:
+        return ""
+    # zaten varsa dokunma
+    if name in REFS and REFS[name].get("link"):
+        return REFS[name]["link"]
+    texts = []
+    try:
+        texts.append(await page.locator("body").inner_text(timeout=4000))
+    except Exception:
+        pass
+    try:
+        hrefs = await page.evaluate("""() => {
+          const out = [];
+          for (const a of document.querySelectorAll('a[href], [data-clipboard-text], input, textarea')) {
+            const h = a.getAttribute('href') || a.getAttribute('data-clipboard-text') || a.value || '';
+            if (h && h.length < 400) out.push(h);
+          }
+          // sayfa kaynak / script kırıntıları
+          const html = document.documentElement.innerHTML.slice(0, 200000);
+          const re = /https?:\\/\\/t\\.me\\/[A-Za-z0-9_/?=&%\\-.]{5,120}/g;
+          let m; let n = 0;
+          while ((m = re.exec(html)) && n < 30) { out.push(m[0]); n++; }
+          return out;
+        }""")
+        if hrefs:
+            texts.append("\n".join(hrefs))
+    except Exception:
+        pass
+    blob = "\n".join(texts)
+    # kişisel start / startapp parametreli t.me linkleri
+    pats = [
+        rf"(?:https?://)?t\.me/{re.escape(name)}(?:/[A-Za-z0-9_]*)?\?(?:start|startapp)=[A-Za-z0-9_\-%.]+",
+        rf"(?:https?://)?t\.me/{re.escape(name)}\?[^\s\"'<>]+",
+        r"(?:https?://)?t\.me/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]*)?\?(?:start|startapp)=(?:ref|invite|r)[A-Za-z0-9_\-%.]*",
+    ]
+    found = []
+    for p in pats:
+        for m in re.finditer(p, blob, re.I):
+            link = m.group(0)
+            if not link.startswith("http"):
+                link = "https://" + link
+            # botun düz start'sız ana linki değil
+            if "start=" not in link.lower() and "startapp=" not in link.lower():
+                continue
+            found.append(link)
+    # tekilleştir
+    uniq = []
+    seen = set()
+    for l in found:
+        k = l.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(l)
+    if not uniq:
+        return ""
+    link = uniq[0]
+    REFS[name] = {"link": link, "src": "mini app ekran", "t": time.time()}
+    try:
+        await persist_refs()
+    except Exception:
+        pass
+    notes.append(f"🔗 Referans otomatik kaydedildi (mini app): {link}")
+    return link
+
+
 async def uni_handle_links(page, name: str, run: dict, notes: list):
+    try:
+        await uni_auto_ref(page, name, notes)
+    except Exception as e:
+        print("[UNI REF]", repr(e), flush=True)
     d = await uni_drain(page)
     for b in d.get("blocked") or []:
         run["blocked"].add(b)
@@ -5623,7 +5696,15 @@ async def uni_flow(page, name, notes, state):
             navs = [c for k, c in kinds if k == "tabx" and c.get("navbar") and uni_norm(c["text"]) not in visited_tabs]
         if not navs:
             break
-        navs.sort(key=lambda c: (not c.get("bottom"), c["x"], c["y"]))
+        def _nav_prio(c):
+            t = (c.get("text") or "").lower()
+            boost = 0
+            if re.search(r"friend|invite|davet|refer|arkada[sş]|earn|task|görev|gorev|reward|daily|home|ana", t):
+                boost = -10  # önce bunlar
+            if re.search(r"wallet|shop|market|premium|skin", t):
+                boost = 20
+            return (boost, not c.get("bottom"), c["x"], c["y"])
+        navs.sort(key=_nav_prio)
         tab = navs[0]
         lab = tab["text"][:14]
         visited_tabs.add(uni_norm(tab["text"]))
@@ -5661,6 +5742,11 @@ async def uni_flow(page, name, notes, state):
     end_text = await uni_screen(page)
 
     # Kayıtlı referans (varsa alta)
+    # Son bir kez ekrandan ref çek (davet sekmesi gezildiyse burada görünür)
+    try:
+        await uni_auto_ref(page, name, notes)
+    except Exception:
+        pass
     ref_hit = None
     if name in REFS:
         ref_hit = REFS[name]["link"]
@@ -5674,7 +5760,7 @@ async def uni_flow(page, name, notes, state):
         notes.append(f"🔗 Senin referans linkin: {ref_hit}")
     else:
         notes.append("────────────")
-        notes.append("🔗 Referans yok — aranıyor (arka planda).")
+        notes.append("🔗 Referans bu turda ekranda yoktu; arka planda sohbet+mini app taranıyor.")
         try:
             spawn(ref_finder(name))
         except Exception:
