@@ -7401,6 +7401,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if low in {"dur", "durdur"}:
         await v8_stop()
         return
+    if await wiz_post_cmd(msg, text, low):
+        return
     if low in {"bellek", "ram", "hafiza"}:
         hv = {**(WIZ_JOURNAL.get("crash") or {}), **(WIZ_JOURNAL.get("heavy") or {}), **(WIZ_JOURNAL.get("lite") or {})}
         await msg.reply_text(
@@ -7522,7 +7524,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await wiz_send(raw or f"Cevap alınamadı ({model}).")
         return
     if low in {"komutlar", "yardim", "help"}:
-        await wiz_send(UNI_HELP_TEXT + "\n\n" + WIZ_HELP)
+        await wiz_send(UNI_HELP_TEXT + "\n\n" + WIZ_HELP + "\n" + WIZ_POST_HELP)
         return
     return await _wiz_on_text_base(update, context)
 
@@ -7854,6 +7856,424 @@ async def v8_browser(name, url, state, _retry: bool = False):
     else:
         notes = pre + list(notes or [])
     return notes
+
+
+
+# ------------------------------------------- kanal / grup paylaşımı (V9.5) ----
+# Her mini app için HALKA AÇIK bir tanıtım yazısı hazırlanır (kişisel bakiye/hata bilgisi olmadan):
+# "ne bu, nasıl kazanılır (adım adım), token bilgisi, dikkat" + altında SENİN referans linkin.
+# Her hedefin kendi stili/dili var: kanal → detaylı rehber, grup → kısa duyuru, istersen İngilizce.
+# Varsayılan mod ONAY: önce sana önizleme gelir, "Gönder"e basınca paylaşılır.
+
+WIZ_POST_KEY = "radar:wiz_post:v1"
+WIZ_POST_FILE = "/tmp/radar_wiz_post.json"
+WIZ_POST = {"targets": [], "mode": "onay", "posted": {}, "daily_max": 8, "day": "", "day_n": 0,
+            "repost_days": 7, "drafts": {}, "seq": 0, "sign": ""}
+WIZ_POST_STYLES = ("detay", "kisa", "liste")
+WIZ_POST_STYLE_TR = {"detay": "detaylı rehber", "kisa": "kısa duyuru", "liste": "madde madde"}
+
+WIZ_POST_PROMPT = {
+    "detay": ("Bir Telegram airdrop/kripto KANALI için TANITIM GÖNDERİSİ yaz. Okuyucu bu mini uygulamayı ilk kez "
+              "görüyor. Şu formatta:\n"
+              "1. satır: emoji + uygulama adı + kısa çarpıcı başlık\n"
+              "Boş satır, sonra 1-2 cümle: uygulama ne, nasıl kazandırıyor\n"
+              "'📝 Yapılması gerekenler:' başlığı altında 3-6 numaralı kısa adım (botu başlat, günlük ödül, görevler, "
+              "farm vb. — SADECE bilgide geçenler)\n"
+              "'💰 Ödül / Token:' 1 satır (bilgi yoksa 'henüz açıklanmadı')\n"
+              "'⚠️ Not:' 1 satır dikkat (cüzdan/ödeme isterse dikkat, yatırım tavsiyesi değildir)\n"
+              "En fazla 900 karakter."),
+    "kisa": ("Bir Telegram SOHBET GRUBU için KISA duyuru yaz: en fazla 4 satır, samimi dil. 1. satır emoji + uygulama "
+             "adı + ne olduğu, 2-3. satır en önemli 2-3 adım tek satırda, son satır kısa çağrı (ör. 'Hemen başla 👇'). "
+             "En fazla 350 karakter."),
+    "liste": ("Bir Telegram kanalı için MADDE MADDE gönderi yaz: başlık satırı (emoji + uygulama adı), sonra 4-6 "
+              "madde ('▫️' ile): ne olduğu, yapılacaklar, ödül. En fazla 600 karakter."),
+}
+WIZ_POST_RULES = (
+    "\nKURALLAR: SADECE verilen bilgiyi kullan, UYDURMA (tarih, miktar, borsa listesi uydurma). Kişisel bakiye, "
+    "hesap numarası, hata mesajı, 'botum yaptı', 'yapamadım' gibi İÇ bilgileri YAZMA — okuyucuya hitap et. "
+    "Linki YAZMA (link en alta otomatik eklenecek). Abartılı 'kesin kazanç' vaadi verme. Markdown/HTML kullanma, "
+    "düz metin + emoji. {lang}\n\nUYGULAMA: @{bot}\n\nBİLGİ (özet + ekran yazıları):\n{info}"
+)
+
+
+def _wiz_today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 3600))
+
+
+async def wiz_post_persist():
+    data = {k: v for k, v in WIZ_POST.items() if k != "drafts"}
+    data["drafts"] = dict(list(WIZ_POST["drafts"].items())[-20:])
+    try:
+        await asyncio.wait_for(save_json(WIZ_POST_KEY, WIZ_POST_FILE, data), 10)
+    except Exception as e:
+        print("[PAYLAŞIM] kayıt hatası", repr(e), flush=True)
+
+
+async def wiz_post_load():
+    try:
+        data = await load_json(WIZ_POST_KEY, WIZ_POST_FILE)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        for k in WIZ_POST:
+            if k in data:
+                WIZ_POST[k] = data[k]
+    print(f"[PAYLAŞIM] {len(WIZ_POST['targets'])} hedef · mod={WIZ_POST['mode']}", flush=True)
+
+
+_wiz_load_v8_ap_base3 = load_v8_ap
+
+
+async def load_v8_ap():
+    await _wiz_load_v8_ap_base3()
+    await wiz_post_load()
+
+
+def _wiz_post_info(bot: str) -> str:
+    s = WIZ_SUM.get(bot) or {}
+    info = (s.get("summary") or "")[:2200]
+    scr = "\n".join((WIZ_CUR.get("screens") or [])[:6])[:1800] if WIZ_CUR.get("bot") == bot else ""
+    return (info + ("\n\nEKRAN YAZILARI:\n" + scr if scr else "")).strip() or "(bilgi yok)"
+
+
+def _wiz_post_fallback(bot: str, style: str) -> str:
+    s = (WIZ_SUM.get(bot) or {}).get("summary") or ""
+    m = re.search(r"🎮 Uygulama:\s*([^\n]+)", s)
+    what = (m.group(1).split("—", 1)[-1].strip() if m else "Telegram mini uygulaması")[:160]
+    m = re.search(r"📌 Nasıl çalışıyor:\s*([^\n]+)", s)
+    how = (m.group(1).strip() if m else "")[:300]
+    if style == "kisa":
+        return f"🚀 @{bot} — {what}\nBotu başlat, günlük ödülünü al, görevleri yap.\nHemen başla 👇"
+    return (f"🚀 @{bot}\n\n{what}\n{how}\n\n📝 Yapılması gerekenler:\n1. Aşağıdaki linkten botu başlat\n"
+            f"2. Günlük ödülü ve görevleri yap\n3. Her gün girip toplamayı unutma\n\n"
+            f"⚠️ Not: Cüzdan/ödeme isteyen adımlara dikkat; yatırım tavsiyesi değildir.")
+
+
+async def wiz_post_text(bot: str, style: str, lang: str) -> str:
+    style = style if style in WIZ_POST_PROMPT else "detay"
+    lang_txt = "Dil: İNGİLİZCE yaz (English)." if lang == "en" else "Dil: TÜRKÇE yaz."
+    prompt = WIZ_POST_PROMPT[style] + WIZ_POST_RULES.format(lang=lang_txt, bot=bot, info=_wiz_post_info(bot))
+    raw, _ = await groq_chat([{"role": "system", "content": "Sen deneyimli bir Telegram kripto/airdrop kanal yöneticisisin. "
+                                                            "Dürüst, net ve okunaklı gönderiler yazarsın."},
+                              {"role": "user", "content": prompt}], max_tokens=700, temperature=0.6)
+    txt = (raw or "").strip() or _wiz_post_fallback(bot, style)
+    txt = re.sub(r"https?://\S+", "", txt)            # yapay zeka link eklediyse sil (link en altta tek)
+    txt = re.sub(r"[*_`#]{2,}", "", txt).strip()
+    return txt[:1200]
+
+
+def _wiz_post_full(text: str, ref: str, lang: str) -> str:
+    cta = "👉 Start here (my referral link):" if lang == "en" else "👉 Buradan başla (referans linkim):"
+    out = f"{text}\n{ref}" if text.rstrip().endswith("👇") else f"{text}\n\n{cta}\n{ref}"
+    if WIZ_POST.get("sign"):
+        out += f"\n\n{WIZ_POST['sign']}"
+    return out
+
+
+def _wiz_post_kb(bot: str, ref: str, lang: str):
+    lab = "🚀 Start" if lang == "en" else "🚀 Hemen Başla"
+    if ref.startswith("https://t.me/"):
+        return InlineKeyboardMarkup([[InlineKeyboardButton(lab, url=ref)]])
+    return None
+
+
+def _wiz_post_due(bot: str, chat: str) -> bool:
+    t = float(((WIZ_POST["posted"].get(bot) or {}).get(str(chat))) or 0)
+    return time.time() - t > float(WIZ_POST.get("repost_days", 7)) * 86400
+
+
+async def wiz_post_draft(bot: str, force: bool = False):
+    """Taslak hazırlar (her stil/dil için bir metin). (taslak_id | None, not)"""
+    ref = (REFS.get(bot) or {}).get("link") or (WIZ_SUM.get(bot) or {}).get("ref") or ""
+    if not WIZ_POST["targets"]:
+        return None, "Paylaşım hedefi yok. Önce: kanal ekle @kanaladi"
+    if not ref:
+        return None, f"@{bot} için referans linki yok. Önce: ref {bot} https://t.me/..."
+    if not WIZ_SUM.get(bot):
+        return None, f"@{bot} için özet yok. Önce botu çalıştır: @{bot}"
+    targets = [t for t in WIZ_POST["targets"] if force or _wiz_post_due(bot, t["chat"])]
+    if not targets:
+        return None, f"@{bot} tüm hedeflerde son {WIZ_POST.get('repost_days', 7)} gün içinde zaten paylaşıldı."
+    texts = {}
+    for t in targets:
+        k = f"{t.get('style', 'detay')}|{t.get('lang', 'tr')}"
+        if k not in texts:
+            texts[k] = await wiz_post_text(bot, t.get("style", "detay"), t.get("lang", "tr"))
+    WIZ_POST["seq"] = int(WIZ_POST.get("seq", 0)) + 1
+    did = str(WIZ_POST["seq"])
+    WIZ_POST["drafts"][did] = {"bot": bot, "ref": ref, "texts": texts, "chats": [str(t["chat"]) for t in targets],
+                               "t": time.time()}
+    await wiz_post_persist()
+    return did, ""
+
+
+async def wiz_post_preview(did: str):
+    d = WIZ_POST["drafts"].get(did)
+    if not d:
+        return
+    tmap = {str(t["chat"]): t for t in WIZ_POST["targets"]}
+    head = f"📣 PAYLAŞIM ÖNİZLEME — @{d['bot']} → {len(d['chats'])} hedef:\n" + "\n".join(
+        f"  • {tmap.get(c, {}).get('title', c)} ({WIZ_POST_STYLE_TR.get(tmap.get(c, {}).get('style', 'detay'), '')}, "
+        f"{tmap.get(c, {}).get('lang', 'tr')})" for c in d["chats"])
+    await bot_app.bot.send_message(ADMIN_USER_ID, head)
+    for k, txt in d["texts"].items():
+        st, lg = k.split("|")
+        await bot_app.bot.send_message(ADMIN_USER_ID, f"— {WIZ_POST_STYLE_TR.get(st, st)} / {lg} —\n\n" +
+                                       _wiz_post_full(txt, d["ref"], lg), disable_web_page_preview=True,
+                                       reply_markup=_wiz_post_kb(d["bot"], d["ref"], lg))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Gönder", callback_data=f"wp:ok:{did}"),
+                                InlineKeyboardButton("🔁 Yeniden yaz", callback_data=f"wp:re:{did}"),
+                                InlineKeyboardButton("❌ Vazgeç", callback_data=f"wp:no:{did}")]])
+    await bot_app.bot.send_message(ADMIN_USER_ID, "Paylaşayım mı?", reply_markup=kb)
+
+
+async def wiz_post_send(did: str) -> str:
+    d = WIZ_POST["drafts"].get(did)
+    if not d:
+        return "Taslak bulunamadı (eski olabilir)."
+    today = _wiz_today()
+    if WIZ_POST.get("day") != today:
+        WIZ_POST["day"], WIZ_POST["day_n"] = today, 0
+    tmap = {str(t["chat"]): t for t in WIZ_POST["targets"]}
+    ok, bad = [], []
+    for c in d["chats"]:
+        if WIZ_POST["day_n"] >= int(WIZ_POST.get("daily_max", 8)):
+            bad.append(f"{tmap.get(c, {}).get('title', c)}: günlük limit doldu ({WIZ_POST['daily_max']})")
+            continue
+        t = tmap.get(c)
+        if not t:
+            continue
+        txt = d["texts"].get(f"{t.get('style', 'detay')}|{t.get('lang', 'tr')}") or next(iter(d["texts"].values()))
+        try:
+            chat_id = int(c) if re.fullmatch(r"-?\d+", c) else c
+            await bot_app.bot.send_message(chat_id, _wiz_post_full(txt, d["ref"], t.get("lang", "tr")),
+                                           disable_web_page_preview=True,
+                                           reply_markup=_wiz_post_kb(d["bot"], d["ref"], t.get("lang", "tr")))
+            WIZ_POST["posted"].setdefault(d["bot"], {})[c] = time.time()
+            WIZ_POST["day_n"] += 1
+            ok.append(t.get("title", c))
+        except Exception as e:
+            bad.append(f"{t.get('title', c)}: {type(e).__name__} {str(e)[:80]} (bot orada yönetici mi?)")
+        await asyncio.sleep(3)   # hedefler arası bekleme (spam sayılmasın)
+    WIZ_POST["drafts"].pop(did, None)
+    await wiz_post_persist()
+    out = f"📣 @{d['bot']}: " + (f"✅ {len(ok)} hedefe paylaşıldı ({', '.join(ok)})" if ok else "hiçbir hedefe gönderilemedi")
+    if bad:
+        out += "\n❗ " + "\n❗ ".join(bad)
+    return out
+
+
+async def wiz_post_after_run(bot: str, outcome: str):
+    """Tur bittikten sonra: mod 'onay' → önizleme, 'oto' → direkt paylaş. Sadece ilk kez / süresi dolunca."""
+    mode = WIZ_POST.get("mode", "onay")
+    if mode == "kapali" or not WIZ_POST["targets"] or outcome == "err":
+        return
+    if not ((REFS.get(bot) or {}).get("link") or (WIZ_SUM.get(bot) or {}).get("ref")):
+        return
+    if not any(_wiz_post_due(bot, t["chat"]) for t in WIZ_POST["targets"]):
+        return
+    # aynı bot için bekleyen taslak varsa yenisini yapma
+    if any(d.get("bot") == bot for d in WIZ_POST["drafts"].values()):
+        return
+    did, err = await wiz_post_draft(bot)
+    if not did:
+        return
+    if mode == "oto":
+        await bot_app.bot.send_message(ADMIN_USER_ID, await wiz_post_send(did))
+    else:
+        await wiz_post_preview(did)
+
+
+_wiz_finish_base_post = wiz_finish
+
+
+async def wiz_finish(name: str, outcome: str, notes: list, source: str):
+    await _wiz_finish_base_post(name, outcome, notes, source)
+    try:
+        await asyncio.wait_for(wiz_post_after_run(name, outcome), 120)
+    except Exception as e:
+        print("[PAYLAŞIM]", repr(e), flush=True)
+
+
+async def wiz_post_add_target(arg: str) -> str:
+    parts = arg.split()
+    if not parts:
+        return "Kullanım: kanal ekle @kanaladi [detay|kisa|liste] [tr|en]"
+    raw = parts[0].strip()
+    raw = re.sub(r"^https?://t\.me/", "@", raw).rstrip("/")
+    style = next((p for p in parts[1:] if p in WIZ_POST_STYLES), "detay")
+    lang = next((p for p in parts[1:] if p in ("tr", "en")), "tr")
+    chat_ref = int(raw) if re.fullmatch(r"-?\d+", raw) else ("@" + raw.lstrip("@"))
+    try:
+        chat = await bot_app.bot.get_chat(chat_ref)
+        me = await bot_app.bot.get_me()
+        mem = await bot_app.bot.get_chat_member(chat.id, me.id)
+        st = getattr(mem, "status", "")
+        can = st in ("administrator", "creator") or (chat.type in ("group", "supergroup") and st == "member")
+        if chat.type == "channel" and st == "administrator" and getattr(mem, "can_post_messages", True) is False:
+            can = False
+    except Exception as e:
+        return (f"{raw} bulunamadı ya da bot orada değil ({type(e).__name__}).\n"
+                f"Önce botu (@{(await bot_app.bot.get_me()).username}) kanala YÖNETİCİ olarak ekle "
+                f"(gönderi paylaşma izni), gruba üye olarak ekle; sonra tekrar dene.")
+    if not can:
+        return f"Bot '{chat.title}' içinde mesaj atamıyor (durum: {st}). Kanala yönetici yap, 'Mesaj gönder' iznini ver."
+    cid = str(chat.id)
+    WIZ_POST["targets"] = [t for t in WIZ_POST["targets"] if str(t["chat"]) != cid]
+    WIZ_POST["targets"].append({"chat": cid, "title": chat.title or raw, "style": style, "lang": lang,
+                                "type": chat.type})
+    await wiz_post_persist()
+    return (f"✅ Hedef eklendi: {chat.title} ({'kanal' if chat.type == 'channel' else 'grup'}) — stil: "
+            f"{WIZ_POST_STYLE_TR[style]}, dil: {lang}\nPaylaşım modu: {WIZ_POST['mode']}  ·  Hedefler: kanallar")
+
+
+def wiz_post_targets_text() -> str:
+    if not WIZ_POST["targets"]:
+        tl = "(hedef yok)"
+    else:
+        tl = "\n".join(f"{i}. {t['title']} [{t['chat']}] — {WIZ_POST_STYLE_TR.get(t.get('style'), '')}, {t.get('lang', 'tr')}"
+                       for i, t in enumerate(WIZ_POST["targets"], 1))
+    today_n = WIZ_POST["day_n"] if WIZ_POST.get("day") == _wiz_today() else 0
+    return (f"📣 PAYLAŞIM HEDEFLERİ\n{tl}\n\nMod: {WIZ_POST['mode']} (onay = önce bana sor · oto = direkt paylaş · "
+            f"kapali)\nGünlük limit: {today_n}/{WIZ_POST['daily_max']} · Aynı bot tekrar: {WIZ_POST['repost_days']} gün sonra\n"
+            f"İmza: {WIZ_POST.get('sign') or '(yok)'}\nPaylaşılan bot sayısı: {len(WIZ_POST['posted'])}")
+
+
+WIZ_POST_HELP = (
+    "📣 KANAL / GRUP PAYLAŞIMI\n"
+    "• kanal ekle @kanal [detay|kisa|liste] [tr|en] — hedef ekle (bot orada yönetici olmalı)\n"
+    "• kanal sil @kanal  ·  kanallar — hedefler ve ayarlar\n"
+    "• paylaş botadi — o mini app için gönderi hazırla (önizleme gelir)\n"
+    "• paylaşım mod onay | oto | kapalı\n"
+    "• paylaşım limit 8  ·  paylaşım tekrar 7 (gün)  ·  imza @kanalim (her gönderinin altına)\n"
+    "• duyuru <metin> — tüm hedeflere serbest duyuru (önizlemeli)\n"
+)
+
+
+async def wiz_post_cmd(msg, text: str, low: str) -> bool:
+    """Paylaşım komutları. İşlendiyse True."""
+    if low.startswith("kanal ekle ") or low.startswith("grup ekle "):
+        await msg.reply_text(await wiz_post_add_target(text.split(None, 2)[2]))
+        return True
+    if low.startswith("kanal sil ") or low.startswith("grup sil "):
+        raw = re.sub(r"^https?://t\.me/", "", text.split(None, 2)[2].strip()).lstrip("@").lower()
+        before = len(WIZ_POST["targets"])
+        WIZ_POST["targets"] = [t for t in WIZ_POST["targets"] if raw not in (str(t["chat"]).lower(), (t.get("title") or "").lower())
+                               and str(t["chat"]).lstrip("@").lower() != raw]
+        if len(WIZ_POST["targets"]) == before:
+            try:
+                chat = await bot_app.bot.get_chat("@" + raw if not re.fullmatch(r"-?\d+", raw) else int(raw))
+                WIZ_POST["targets"] = [t for t in WIZ_POST["targets"] if str(t["chat"]) != str(chat.id)]
+            except Exception:
+                pass
+        await wiz_post_persist()
+        await msg.reply_text("Silindi." if len(WIZ_POST["targets"]) < before else "Bu hedef listede yok. Bak: kanallar")
+        return True
+    if low in {"kanallar", "gruplar", "hedefler", "paylasim"}:
+        await msg.reply_text(wiz_post_targets_text() + "\n\n" + WIZ_POST_HELP)
+        return True
+    if low.startswith("paylasim mod"):
+        m = {"onay": "onay", "oto": "oto", "otomatik": "oto", "kapali": "kapali", "kapat": "kapali"}.get(low.split()[-1])
+        if not m:
+            await msg.reply_text("Kullanım: paylaşım mod onay | oto | kapalı")
+            return True
+        WIZ_POST["mode"] = m
+        await wiz_post_persist()
+        await msg.reply_text(f"Paylaşım modu: {m}" + (" — her yeni mini app (ref linki varsa) DİREKT paylaşılacak, "
+                                                       "günlük limit: " + str(WIZ_POST['daily_max']) if m == "oto" else ""))
+        return True
+    if low.startswith("paylasim limit "):
+        n = re.findall(r"\d+", low)
+        if n:
+            WIZ_POST["daily_max"] = max(1, min(50, int(n[0])))
+            await wiz_post_persist()
+        await msg.reply_text(f"Günlük paylaşım limiti: {WIZ_POST['daily_max']}")
+        return True
+    if low.startswith("paylasim tekrar "):
+        n = re.findall(r"\d+", low)
+        if n:
+            WIZ_POST["repost_days"] = max(1, min(90, int(n[0])))
+            await wiz_post_persist()
+        await msg.reply_text(f"Aynı mini app {WIZ_POST['repost_days']} gün sonra tekrar paylaşılabilir.")
+        return True
+    if low.startswith("imza"):
+        WIZ_POST["sign"] = text.split(None, 1)[1].strip()[:120] if len(text.split()) > 1 else ""
+        await wiz_post_persist()
+        await msg.reply_text(f"İmza: {WIZ_POST['sign'] or '(kaldırıldı)'}")
+        return True
+    if low.startswith("paylas ") and not low.startswith("paylasim"):
+        bn = re.sub(r"^https?://t\.me/", "", text.split(None, 1)[1].strip()).lstrip("@").split("/")[0].split("?")[0].lower()
+        await msg.reply_text(f"📝 @{bn} için gönderi yazılıyor…")
+        did, err = await wiz_post_draft(bn, force=True)
+        if not did:
+            await msg.reply_text(err)
+        else:
+            await wiz_post_preview(did)
+        return True
+    if low.startswith("duyuru "):
+        body = text.split(None, 1)[1].strip()[:3000]
+        if not WIZ_POST["targets"]:
+            await msg.reply_text("Paylaşım hedefi yok. Önce: kanal ekle @kanaladi")
+            return True
+        WIZ_POST["seq"] = int(WIZ_POST.get("seq", 0)) + 1
+        did = str(WIZ_POST["seq"])
+        WIZ_POST["drafts"][did] = {"bot": "duyuru", "ref": "", "texts": {"serbest|tr": body},
+                                   "chats": [str(t["chat"]) for t in WIZ_POST["targets"]], "t": time.time(), "raw": True}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Gönder", callback_data=f"wp:ok:{did}"),
+                                    InlineKeyboardButton("❌ Vazgeç", callback_data=f"wp:no:{did}")]])
+        await msg.reply_text(f"📣 DUYURU ÖNİZLEME → {len(WIZ_POST['targets'])} hedef:\n\n{body}", reply_markup=kb)
+        return True
+    return False
+
+
+_wiz_post_full_base = _wiz_post_full
+
+
+def _wiz_post_full(text: str, ref: str, lang: str) -> str:
+    if not ref:   # serbest duyuru: link/CTA eklenmez
+        return text + (f"\n\n{WIZ_POST['sign']}" if WIZ_POST.get("sign") else "")
+    return _wiz_post_full_base(text, ref, lang)
+
+
+_wiz_on_callback_base = on_callback
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q and q.data and q.data.startswith("wp:"):
+        if not update.effective_user or update.effective_user.id != ADMIN_USER_ID:
+            await q.answer("Yetkin yok.")
+            return
+        _, act, did = (q.data.split(":") + ["", ""])[:3]
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        if act == "ok":
+            await bot_app.bot.send_message(ADMIN_USER_ID, "⏳ Paylaşılıyor…")
+            await bot_app.bot.send_message(ADMIN_USER_ID, await wiz_post_send(did))
+        elif act == "re":
+            d = WIZ_POST["drafts"].pop(did, None)
+            if d:
+                await bot_app.bot.send_message(ADMIN_USER_ID, f"🔁 @{d['bot']} yeniden yazılıyor…")
+                nd, err = await wiz_post_draft(d["bot"], force=True)
+                if nd:
+                    await wiz_post_preview(nd)
+                else:
+                    await bot_app.bot.send_message(ADMIN_USER_ID, err)
+        elif act == "no":
+            d = WIZ_POST["drafts"].pop(did, None)
+            if d and d.get("bot") != "duyuru":
+                # vazgeçilen bot bu süre boyunca tekrar sorulmaz
+                for c in d["chats"]:
+                    WIZ_POST["posted"].setdefault(d["bot"], {})[c] = time.time()
+            await wiz_post_persist()
+            await bot_app.bot.send_message(ADMIN_USER_ID, "Vazgeçildi." + (
+                f" @{d['bot']} {WIZ_POST['repost_days']} gün tekrar sorulmayacak (istersen: paylaş {d['bot']})."
+                if d and d.get("bot") != "duyuru" else ""))
+        return
+    return await _wiz_on_callback_base(update, context)
 
 
 
