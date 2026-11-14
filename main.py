@@ -1778,11 +1778,18 @@ REF_BTN_WORDS = tuple(fold(w) for w in (
     "davet", "invite", "referral", "referans", "arkadaş", "friends", "partner", "ortak", "affiliate",
     "реферал", "пригласи", "друзь", "партнер",
 ))
+# V9.6.1: referans kodu taraması genişletildi — refId/referral_id/promo_code gibi anahtar adları,
+# URL alt (sub) referans alanları (code/id/link/url) ve daha uzun kod değerleri artık TAM okunuyor.
 REF_KEY_RE = re.compile(
-    r"(^|[_\-.])(ref|referral|referer|invite|inviter|startapp|share)([_\-.]|$)"
-    r"|refcode|invitecode|referralcode|reflink|invitelink|referrallink|sharelink|refurl",
+    r"(^|[_\-.])(ref|refs|referral|referer|referrer|invite|inviter|startapp|share|partner|affiliate|promo)([_\-.]|$)"
+    r"|refcode|refid|invitecode|inviterid|referralcode|referralid|reflink|invitelink|referrallink"
+    r"|sharelink|shareurl|refurl|myref|promocode|affiliatecode|partnercode|referrer",
     re.I,
 )
+# Alt (sub) referans: "referral": {"code": ..., "id": ..., "link": ...} gibi iç içe nesnelerde
+# üst yol referansa benziyorsa bu alt anahtarlar da kişisel referans olarak yakalanır.
+REF_PATH_RE = re.compile(r"ref|invite|referral|friend|davet|partner|affiliate|share|promo", re.I)
+SUBREF_KEY_RE = re.compile(r"^(code|id|url|link|value|param|key)$|code|link|url", re.I)
 # GET ile bile cagirmayacagimiz, islem yapan yollar
 ACTION_PATH_RE = re.compile(
     r"claim|collect|start|play|spin|buy|purchase|shop|burn|forge|withdraw|deposit|transfer|swap|stake|"
@@ -1819,8 +1826,10 @@ async def load_refs():
 
 def find_ref_links(msgs, bot: str) -> list:
     """Mesaj metni, gomulu linkler ve butonlardaki 't.me/<bot>...?start|startapp=...' linkleri."""
+    # V9.6.1: + / : ~ ! * karakterli kodlar artık kesilmiyor; start/startapp linkin
+    # ortasındaki (başka parametrelerden sonraki) yerde de yakalanıyor.
     rx = re.compile(
-        r"(?:https?://)?t\.me/" + re.escape(bot) + r"(?:/[A-Za-z0-9_]+)?\?(?:start|startapp)=[A-Za-z0-9_\-%=.]+",
+        r"(?:https?://)?t\.me/" + re.escape(bot) + r"(?:/[A-Za-z0-9_]+)?\?(?:[^\s\"'&#]*&)?(?:start|startapp)=[A-Za-z0-9_\-%=.+~/:!*]{2,200}",
         re.I,
     )
     out = []
@@ -1926,24 +1935,28 @@ def find_token(data, depth: int = 0):
 
 
 def scan_json(obj, path, links, codes, keys, depth: int = 0):
-    """JSON icinde referans linki / kodu arar; alan adlarini (deger degil) toplar."""
-    if depth > 6:
+    """JSON icinde referans linki / kodu (ve alt/ici referans alanlarini) arar; alan adlarini toplar."""
+    # V9.6.1: derinlik 6->8, alan limiti 60->80, deger limiti 80->200;
+    # üst yolu referansa benzeyen nesnelerin alt alanlari (code/id/link/url) da okunuyor.
+    if depth > 8:
         return
     if isinstance(obj, dict):
-        for k, v in list(obj.items())[:60]:
+        for k, v in list(obj.items())[:80]:
             p = f"{path}.{k}" if path else str(k)
             if depth <= 2 and len(keys) < 25:
                 keys.append(p)
-            if isinstance(v, (str, int)) and not isinstance(v, bool) and REF_KEY_RE.search(str(k)):
+            if isinstance(v, (str, int)) and not isinstance(v, bool) and (
+                    REF_KEY_RE.search(str(k))
+                    or (REF_PATH_RE.search(path or "") and SUBREF_KEY_RE.search(str(k)))):
                 s = str(v)
-                if 0 < len(s) <= 80 and not s.startswith("eyJ"):
+                if 0 < len(s) <= 200 and not s.startswith("eyJ"):
                     codes.append((p, s))
             scan_json(v, p, links, codes, keys, depth + 1)
     elif isinstance(obj, list):
-        for v in obj[:3]:
+        for v in obj[:5]:
             scan_json(v, f"{path}[]", links, codes, keys, depth + 1)
     elif isinstance(obj, str):
-        if "t.me/" in obj and ("start=" in obj or "startapp=" in obj) and len(obj) < 300:
+        if "t.me/" in obj and ("start=" in obj or "startapp=" in obj) and len(obj) < 500:
             links.append(obj)
 
 
@@ -2115,11 +2128,12 @@ def analyze_ctx(ctx: dict) -> dict:
            "hosts": ctx["hosts"][:10], "paths": ctx["paths"][:25]}
 
     for t in ctx["blobs"]:
-        found_tpl = re.findall(r"""[A-Za-z0-9_./:?&%\-]{0,80}startapp=[^\s"'`]{0,60}""", t)[:3]
+        # V9.6.1: kalip uzunlugu 60->120 (uzun kodlar tam okunuyor)
+        found_tpl = re.findall(r"""[A-Za-z0-9_./:?&%=~\-]{0,120}startapp=[^\s"'`]{0,120}""", t)[:3]
         if not found_tpl:
-            found_tpl = re.findall(r".{0,70}startapp=.{0,90}", t)[:2]
+            found_tpl = re.findall(r".{0,100}startapp=.{0,150}", t)[:2]
         for s_ in found_tpl:
-            tpl = re.sub(r"\s+", " ", s_).strip()[:150]
+            tpl = re.sub(r"\s+", " ", s_).strip()[:250]
             if tpl and tpl not in res["templates"]:
                 res["templates"].append(tpl)
     res["templates"] = res["templates"][:3]
@@ -2131,8 +2145,8 @@ def analyze_ctx(ctx: dict) -> dict:
         res["codes"] += codes
         if keys:
             res["api"].append(f"GET {urlparse(u).path} → {', '.join(keys[:8])}")
-    res["links"] = list(dict.fromkeys(res["links"]))[:5]
-    res["codes"] = list(dict.fromkeys(res["codes"]))[:6]
+    res["links"] = list(dict.fromkeys(res["links"]))[:8]   # V9.6.1: 5->8
+    res["codes"] = list(dict.fromkeys(res["codes"]))[:12]  # V9.6.1: 6->12
     res["api"] = list(dict.fromkeys(res["api"]))[:8]
     if ctx["got"]:
         res["notes"].append(f"API yoklaması başarılı ({ctx['mode']} yöntemi, {len(ctx['got'])} yanıt).")
@@ -2581,7 +2595,7 @@ async def auto_link(name: str, short: str = "", start: str = ""):
             await persist_refs()
             out.append(f"🔗 Referans linkin kaydedildi: {res['links'][0]}")
         elif res["codes"]:
-            out.append("🔑 Referansa benzeyen alanlar: " + ", ".join(f"{p}={v}" for p, v in res["codes"][:3]))
+            out.append("🔑 Referansa benzeyen alanlar: " + ", ".join(f"{p}={v}" for p, v in res["codes"][:5]))
         else:
             out.append("🔗 Referans linkini bulamadım.")
 
@@ -6012,13 +6026,23 @@ WIZ_SYSTEM = (
 WIZ_RISK_INPUT_RE = re.compile(
     r"wallet|address|adres|e-?mail|phone|telefon|card|kart|password|şifre|sifre|seed|mnemonic|private|"
     r"amount|miktar|tutar|iban|\b0x|\bUQ|\bEQ|кошел|адрес|телефон|пароль", re.I)
+# V9.6.1: referans kodu TAM okunuyor — + / : ~ ! * karakterleri kesilmiyor, uzun kodlar (200)
+# destekleniyor ve start/startapp linkin ortasindaki yerde de yakalaniyor.
 WIZ_REF_RE = re.compile(
-    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})(?:/([A-Za-z0-9_]{1,64}))?/?\?(start|startapp)="
-    r"([A-Za-z0-9_\-%=.]{2,160})", re.I)
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})(?:/([A-Za-z0-9_]{1,64}))?/?\?(?:[^\s\"'&#]*&)?(start|startapp)="
+    r"([A-Za-z0-9_\-%=.+~/:!*]{2,200})", re.I)
+# V9.6.1: refId/referral_id/promo_code gibi anahtar adlari, JS atama bicimi (refCode = 'x')
+# ve tek tirnakli degerler de okunuyor.
 WIZ_CODE_RE = re.compile(
-    r'"(ref(?:erral)?_?code|invite_?code|refCode|inviteCode|referralCode|ref_?link|referral_?link|invite_?link|'
-    r'inviteLink|referralLink|refLink|ref_?url|invite_?url|share_?link|shareLink|startParam|start_param)"\s*:\s*"([^"]{2,200})"',
-    re.I)
+    r'[\'"]?(ref(?:erral)?_?id|ref(?:erral)?_?code|invite_?id|invite_?code|refCode|inviteCode|referralCode|'
+    r'ref_?link|referral_?link|invite_?link|inviteLink|referralLink|refLink|ref_?url|invite_?url|share_?link|'
+    r'shareLink|share_?url|startParam|start_param|my_?ref|promo_?code|promoCode|partner_?code|affiliate_?code|'
+    r'referral|inviter_?code)[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9_\-%=.+~/:!*]{2,200})', re.I)
+# Alt (sub) referans: "referral": {"code": "x", "id": 123, "link": "..."} gibi ic ice nesneler.
+WIZ_SUBOBJ_RE = re.compile(
+    r'(?:ref(?:erral)?|invite|friend|davet|partner|promo)[^{}]{0,40}\{([^{}]{0,500})\}', re.I)
+WIZ_SUBFIELD_RE = re.compile(
+    r'[\'"]?(code|id|link|url|value|param)[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9_\-%=.+~/:!*]{2,200})', re.I)
 WIZ_REF_NAV_RE = re.compile(
     r"friend|frens|fren\b|invite|refer|referral|affiliate|squad|team\b|партн|друз|приглас|реферал|davet|arkada[şs]|ekip|tak[ıi]m|ortakl",
     re.I)
@@ -6440,9 +6464,18 @@ def wiz_add_refs(blob: str, src: str):
         k, v = m.group(1), m.group(2)
         if "t.me/" in v:
             n += wiz_add_refs(v, src + "/api")
-        elif 2 <= len(v) <= 64 and not v.startswith("eyJ") and (k, v) not in WIZ_CUR["codes"] and len(WIZ_CUR["codes"]) < 8:
+        elif 2 <= len(v) <= 200 and not v.startswith("eyJ") and (k, v) not in WIZ_CUR["codes"] and len(WIZ_CUR["codes"]) < 12:
             if not (WIZ_CUR.get("start") and v == WIZ_CUR["start"]):
                 WIZ_CUR["codes"].append((k, v))
+    # V9.6.1: alt (sub) referans — "referral": {"code": "x", "id": 123, "link": "..."} ic ice nesneleri
+    for m in WIZ_SUBOBJ_RE.finditer(blob):
+        for sm in WIZ_SUBFIELD_RE.finditer(m.group(1)):
+            k, v = sm.group(1), sm.group(2)
+            if "t.me/" in v:
+                n += wiz_add_refs(v, src + "/api")
+            elif 2 <= len(v) <= 200 and not v.startswith("eyJ") and (k, v) not in WIZ_CUR["codes"] and len(WIZ_CUR["codes"]) < 12:
+                if not (WIZ_CUR.get("start") and v == WIZ_CUR["start"]):
+                    WIZ_CUR["codes"].append(("sub_" + k, v))
     return n
 
 
@@ -6541,7 +6574,7 @@ async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
     if link:
         notes.append(f"Referans linki bulundu ({WIZ_CUR['refs'][link][1]}).")
     elif WIZ_CUR["codes"]:
-        notes.append("Referans kodu benzeri alan bulundu: " + ", ".join(f"{k}={v}" for k, v in WIZ_CUR["codes"][:3]))
+        notes.append("Referans kodu benzeri alan bulundu: " + ", ".join(f"{k}={v}" for k, v in WIZ_CUR["codes"][:5]))
 
 
 # ------------------------------------------------- yapay zeka ile görev ----
