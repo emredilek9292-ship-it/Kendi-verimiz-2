@@ -5567,7 +5567,7 @@ async def v8_browser(name, url, state):
     notes = []
     async with async_playwright() as p:
         state["stage"] = "chromium_baslatma"
-        browser = await p.chromium.launch(headless=True, timeout=60000, args=["--disable-dev-shm-usage"])
+        browser = await p.chromium.launch(headless=True, timeout=60000, args=WIZ_CHROME_ARGS)
         context = None
         try:
             context = await uni_new_context(browser, name)
@@ -5888,7 +5888,8 @@ async def auto_link(name: str, short: str = "", start: str = ""):
             await _job()
         except asyncio.CancelledError:
             try:
-                await bot_app.bot.send_message(ADMIN_USER_ID, f"⏹ @{name} durduruldu.")
+                if not AUTO_STOP:  # 'dur' ile toplu durdurmada her bot için ayrı mesaj atılmaz
+                    await bot_app.bot.send_message(ADMIN_USER_ID, f"⏹ @{name} durduruldu.")
             except Exception:
                 pass
             raise
@@ -6720,6 +6721,10 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
 # Unity/Phaser gibi oyunlarda butonlar HTML değil, resim içinde. Bu modda ekran görüntüsü
 # Groq'un görüntü okuyabilen modeline gönderilir; model nereye dokunulacağını söyler.
 
+WIZ_CHROME_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--mute-audio",
+                   "--no-first-run", "--renderer-process-limit=2", "--disable-background-networking",
+                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "384") or "384")]
+
 WIZ_VISION_MODELS = [m.strip() for m in (os.getenv("WIZ_VISION_MODEL", "qwen/qwen3.8-27b") or "").split(",") if m.strip()]
 WIZ_CANVAS_STEPS = int(os.getenv("WIZ_CANVAS_STEPS", "8") or 8)
 WIZ_CANVAS_BUDGET_S = int(os.getenv("WIZ_CANVAS_BUDGET_S", "180") or 180)
@@ -6870,7 +6875,7 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
     retry_needed = False
     async with async_playwright() as p:
         state["stage"] = "chromium_baslatma"
-        browser = await p.chromium.launch(headless=True, timeout=60000, args=["--disable-dev-shm-usage"])
+        browser = await p.chromium.launch(headless=True, timeout=60000, args=WIZ_CHROME_ARGS)
         context = None
         try:
             context = await uni_new_context(browser, name)
@@ -7338,6 +7343,8 @@ WIZ_HELP = (
     "• sor <soru> — yapay zekaya özetlere bakarak soru sor\n"
     "• sıra — şu an hangi bot çalışıyor, hangi aşamada, sırada kimler var\n"
     "• iptal botadi — o botu sıradan çıkar / durdur\n"
+    "• devam — bot yeniden başladıysa sırada kalanları sürdür\n"
+    "• zorla botadi — sunucuyu çökerttiği için atlanan botu yine de dene\n"
     "• sihirbaz — durum  ·  sihirbaz aç / kapat\n"
     "• sihirbaz ai aç / kapat — yapay zekanın görev adımları\n"
     "• özet mod her | yeni | kapalı — otopilotta özet gönderimi\n"
@@ -7374,6 +7381,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _wiz_on_text_base(update, context)
     text = (msg.text or msg.caption or "").strip()
     low = text.lower().replace("ı", "i").replace("ö", "o").replace("ü", "u").replace("ş", "s").replace("ç", "c").replace("ğ", "g")
+    try:
+        age = time.time() - msg.date.timestamp()
+    except Exception:
+        age = 0
+    if age > WIZ_MSG_MAX_AGE:
+        print(f"[MSG] {int(age // 60)} dk eski mesaj yok sayıldı: {text[:40]}", flush=True)
+        return
+    if low in {"dur", "durdur"}:
+        await v8_stop()
+        return
+    if low in {"devam", "surdur"}:
+        await wiz_resume()
+        return
+    if low.startswith("zorla "):
+        bn = text.split(None, 1)[1].strip().lstrip("@").lower()
+        bn = re.sub(r"^https?://t\.me/", "", bn).split("/")[0].split("?")[0]
+        await wiz_force(bn)
+        return
     if low in {"sihirbaz", "sihirbaz durum", "wizard"}:
         await wiz_send(wiz_status_text())
         return
@@ -7498,6 +7523,169 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# ------------------------------------------- çökme koruması (V9.3) ----
+# Bot kapanırsa (bellek yetmedi / tarayıcı çöktü / sunucu yeniden başlattı) hangi botta
+# kapandığı ve sırada kimlerin kaldığı kaydedilir; açılışta sana yazılır, 'devam' ile sürer.
+
+WIZ_LIVE_KEY = "radar:wiz_live:v1"
+WIZ_LIVE_FILE = "/tmp/radar_wiz_live.json"
+WIZ_CRASH_SKIP = int(os.getenv("WIZ_CRASH_SKIP", "2") or 2)   # bu kadar çökertme → otomatik atla
+WIZ_MSG_MAX_AGE = int(os.getenv("WIZ_MSG_MAX_AGE", "1800") or 1800)  # bundan eski bekleyen mesajlar yok sayılır
+WIZ_JOURNAL = {"bot": "", "t0": 0, "queue": [], "crash": {}, "pending": []}
+
+
+async def wiz_journal_save():
+    try:
+        WIZ_JOURNAL["queue"] = [it["bot"] for it in WIZ_QUEUE][:60]
+        WIZ_JOURNAL["bot"] = WIZ_LIVE.get("bot", "") or ""
+        WIZ_JOURNAL["t0"] = WIZ_LIVE.get("t0", 0) or 0
+        await asyncio.wait_for(save_json(WIZ_LIVE_KEY, WIZ_LIVE_FILE, WIZ_JOURNAL), 10)
+    except Exception as e:
+        print("[CRASH-GUARD] kayıt hatası", repr(e), flush=True)
+
+
+async def wiz_journal_boot():
+    """Açılışta: önceki çalışma yarıda kaldıysa kaydı oku ve kullanıcıya bildir."""
+    try:
+        data = await load_json(WIZ_LIVE_KEY, WIZ_LIVE_FILE)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return
+    WIZ_JOURNAL["crash"] = dict(data.get("crash") or {})
+    dead = data.get("bot") or ""
+    queue = [b for b in (data.get("queue") or []) if b and b != dead]
+    WIZ_JOURNAL["pending"] = list(dict.fromkeys(queue))
+    if dead:
+        WIZ_JOURNAL["crash"][dead] = int(WIZ_JOURNAL["crash"].get(dead, 0)) + 1
+    WIZ_JOURNAL["bot"], WIZ_JOURNAL["queue"] = "", []
+    await asyncio.wait_for(save_json(WIZ_LIVE_KEY, WIZ_LIVE_FILE, WIZ_JOURNAL), 10)
+    if not dead and not queue:
+        return
+    lines = ["⚠️ Bot yeniden başladı (sunucu kapattı ya da çöktü)."]
+    if dead:
+        el = int(time.time() - float(data.get("t0") or time.time()))
+        n = WIZ_JOURNAL["crash"][dead]
+        lines.append(f"Kapanma @{dead} çalışırken oldu ({el // 60} dk sonra). En olası neden: bu mini app "
+                     f"sunucunun belleğini doldurdu (ağır oyun / tarayıcı çöktü). Bu bot {n} kez çökertti.")
+        if n >= WIZ_CRASH_SKIP:
+            lines.append(f"@{dead} artık otomatik ATLANACAK. Yine de denemek için: zorla {dead}")
+    if WIZ_JOURNAL["pending"]:
+        lines.append(f"Sırada kalan {len(WIZ_JOURNAL['pending'])} bot: " +
+                     ", ".join("@" + b for b in WIZ_JOURNAL["pending"][:20]))
+        lines.append("Kaldığı yerden sürdürmek için: devam")
+    lines.append("Kapalıyken yazdığın mesajlar artık kaybolmuyor; 30 dk'dan eski olanlar yok sayılır.")
+    try:
+        await bot_app.bot.send_message(ADMIN_USER_ID, "\n".join(lines))
+    except Exception as e:
+        print("[CRASH-GUARD] bildirim gönderilemedi", repr(e), flush=True)
+
+
+def wiz_crashy(name: str) -> bool:
+    return int((WIZ_JOURNAL.get("crash") or {}).get(name, 0)) >= WIZ_CRASH_SKIP
+
+
+_wiz_load_v8_ap_base2 = load_v8_ap
+
+
+async def load_v8_ap():
+    await _wiz_load_v8_ap_base2()
+    try:
+        await wiz_journal_boot()
+    except Exception as e:
+        print("[CRASH-GUARD] açılış kontrolü hatası", repr(e), flush=True)
+
+
+_wiz_track_base2 = v8_run_and_track
+
+
+async def v8_run_and_track(name="myageapp", short="", start="", source="manual", force=False):
+    if wiz_crashy(name) and not force:
+        n = WIZ_JOURNAL["crash"].get(name, 0)
+        return "skip", [f"Atlandı: bu mini app sunucuyu {n} kez çökertti (bellek). Denemek için: zorla {name}"]
+    task = asyncio.create_task(_wiz_track_base2(name, short, start, source))
+    # sıraya girdiği / başladığı / bittiği an kaydedilir
+    await asyncio.sleep(0)
+    await wiz_journal_save()
+    try:
+        res = await task
+        if (WIZ_JOURNAL.get("crash") or {}).get(name):
+            WIZ_JOURNAL["crash"].pop(name, None)   # sorunsuz bitti → çökme sayısı sıfırlanır
+        return res
+    finally:
+        if not task.done():
+            task.cancel()
+        await wiz_journal_save()
+
+
+_wiz_browser_base3 = v8_browser
+
+
+async def v8_browser(name, url, state, _retry: bool = False):
+    await wiz_journal_save()   # çalışan bot kaydı (çökerse açılışta bilinsin)
+    return await _wiz_browser_base3(name, url, state, _retry)
+
+
+async def v8_stop():
+    """DÜZELTME: 'dur' artık en fazla 20 sn bekler; takılan iş diğer mesajları kilitlemez."""
+    global AUTO_STOP
+    AUTO_STOP = True
+    was_on = bool(V8_AP.get("on"))
+    V8_AP["on"] = False
+    try:
+        await persist_v8_ap()
+    except Exception:
+        pass
+    tasks = [t for t in V8_TASKS.values() if t is not None and not t.done()]
+    n_q = len(WIZ_QUEUE)
+    try:
+        await bot_app.bot.send_message(ADMIN_USER_ID, f"⏹ Durduruluyor… ({len(tasks)} iş, sırada {n_q} bot)")
+    except Exception:
+        pass
+    for t in tasks:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    stuck = 0
+    if tasks:
+        _, pend = await asyncio.wait(tasks, timeout=20)
+        stuck = len(pend)
+    WIZ_QUEUE.clear()
+    WIZ_JOURNAL["pending"] = []
+    await wiz_journal_save()
+    msg = "V8 işleri durduruldu, sıra boşaltıldı."
+    if was_on:
+        msg += " Otopilot kapatıldı."
+    if stuck:
+        msg += f" ({stuck} iş kapanırken takıldı; arka planda kendiliğinden kapanacak.)"
+    msg += " Gönderilmiş işlemler geri alınamaz."
+    await bot_app.bot.send_message(ADMIN_USER_ID, msg)
+
+
+async def wiz_resume():
+    names = [b for b in (WIZ_JOURNAL.get("pending") or []) if not wiz_crashy(b)]
+    WIZ_JOURNAL["pending"] = []
+    await wiz_journal_save()
+    if not names:
+        await bot_app.bot.send_message(ADMIN_USER_ID, "Sürdürülecek bot yok.")
+        return
+    await bot_app.bot.send_message(ADMIN_USER_ID, f"▶️ {len(names)} bot yeniden sıraya alınıyor: " +
+                                   ", ".join("@" + b for b in names[:20]))
+    for b in names:
+        await auto_link(b)
+        await asyncio.sleep(0.3)
+
+
+async def wiz_force(name: str):
+    WIZ_JOURNAL.setdefault("crash", {}).pop(name, None)
+    await wiz_journal_save()
+    await bot_app.bot.send_message(ADMIN_USER_ID, f"@{name} çökme kaydı silindi, yeniden deneniyor "
+                                                  f"(yine çökertirse tekrar atlanır).")
+    await auto_link(name)
+
+
+
 async def main():
     global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK, APP_LOCK
 
@@ -7562,7 +7750,7 @@ async def main():
     await persist_sources()
     tg_client.add_event_handler(on_group_message, events.NewMessage(incoming=True))
 
-    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app = Application.builder().token(BOT_TOKEN).concurrent_updates(8).build()  # bir komut takılsa da diğerleri cevaplanır
     bot_app.add_handler(CommandHandler("start", cmd_start))
     bot_app.add_handler(CommandHandler("help", cmd_help))
     bot_app.add_handler(CommandHandler("yardim", cmd_help))
@@ -7587,7 +7775,7 @@ async def main():
 
     await bot_app.initialize()
     await bot_app.start()
-    await bot_app.updater.start_polling(drop_pending_updates=True)
+    await bot_app.updater.start_polling(drop_pending_updates=False)  # DÜZELTME: kapalıyken yazılanlar kaybolmaz
 
     spawn(keepalive_loop())
     await load_v8_ap()
@@ -7609,7 +7797,29 @@ async def main():
         print("[ADMIN MSG HATA]", repr(e))
 
     print("[HAZIR] Bot komutlari + Telethon + HTTP")
-    await tg_client.run_until_disconnected()
+    # DÜZELTME: Telethon bağlantısı koparsa program kapanmaz, yeniden bağlanır
+    fails = 0
+    while True:
+        try:
+            await tg_client.run_until_disconnected()
+        except Exception as e:
+            print("[TELETHON] bağlantı hatası:", repr(e), flush=True)
+            if "AuthKey" in type(e).__name__ or "Unauthorized" in type(e).__name__:
+                try:
+                    await bot_app.bot.send_message(ADMIN_USER_ID, "❌ Telegram hesabı oturumu geçersiz oldu (başka yerde açılmış olabilir). "
+                                                                  "TG_SESSION yenilenmeli.")
+                except Exception:
+                    pass
+                raise
+        fails += 1
+        print(f"[TELETHON] bağlantı koptu, yeniden bağlanılıyor ({fails})", flush=True)
+        await asyncio.sleep(min(60, 5 * fails))
+        try:
+            await tg_client.connect()
+            if await tg_client.is_user_authorized():
+                fails = 0
+        except Exception as e:
+            print("[TELETHON] yeniden bağlanma hatası:", repr(e), flush=True)
 
 
 try:
