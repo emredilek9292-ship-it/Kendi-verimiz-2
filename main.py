@@ -2179,9 +2179,14 @@ async def ref_finder(bot: str):
 
         found = [(l, "bot sohbeti") for l in chat_links]
         probe = None
+        extra = []  # V9.6.2: başka botların linkleri — asla kaydedilmez, sadece bilgi
         if url:
             probe = await probe_miniapp(bot, url, how)
-            found += [(l, "mini uygulama API") for l in probe["links"]]
+            for l in probe["links"]:
+                if re.search(r"t\.me/" + re.escape(bot) + r"(?:[/?#]|$)", l, re.I):
+                    found.append((l, "mini uygulama API"))
+                else:
+                    extra.append(l)
 
         lines = [f"🔗 REFERANS ARAMA: @{bot}"]
         if found:
@@ -2191,6 +2196,8 @@ async def ref_finder(bot: str):
             lines += ["", f"✅ Bulundu ve kaydedildi ({src}):", link]
             for l, s in found[1:4]:
                 lines.append(f"Diğer aday: {l}")
+            for l in extra[:3]:  # V9.6.2: yanlış kaydı önlemek için ayrı ve açıkça işaretli
+                lines.append(f"⚠️ Başka botun linki (senin referansın DEĞİL): {l}")
         else:
             lines += ["", "❌ Tam referans linkini bulamadım."]
             if not url:
@@ -2590,10 +2597,17 @@ async def auto_link(name: str, short: str = "", start: str = ""):
         out.append("📱 " + how)
         ctx = await app_context(url)
         res = analyze_ctx(ctx)
-        if res["links"]:
-            REFS[name] = {"link": res["links"][0], "src": "mini uygulama API", "t": time.time()}
+        # V9.6.2: yalnızca bu botun kendi linki kaydedilir; başka botların linkleri
+        # (partner görev/reklam) asla 'senin referansın' olarak kaydedilmez.
+        res_mine = [l for l in res["links"] if re.search(r"t\.me/" + re.escape(name) + r"(?:[/?#]|$)", l, re.I)]
+        res_extra = [l for l in res["links"] if l not in res_mine]
+        if res_mine:
+            REFS[name] = {"link": res_mine[0], "src": "mini uygulama API", "t": time.time()}
             await persist_refs()
-            out.append(f"🔗 Referans linkin kaydedildi: {res['links'][0]}")
+            out.append(f"🔗 Referans linkin kaydedildi: {res_mine[0]}")
+        elif res_extra:
+            out.append("⚠️ Başka botlara ait linkler buldum ama senin referans linkin değil: "
+                       + ", ".join(res_extra[:2]))
         elif res["codes"]:
             out.append("🔑 Referansa benzeyen alanlar: " + ", ".join(f"{p}={v}" for p, v in res["codes"][:5]))
         else:
@@ -6446,9 +6460,14 @@ def wiz_add_refs(blob: str, src: str):
         if re.fullmatch(r"[a-z]+(?:_[a-z]+)+", param):
             continue  # botun kendi eylem parametresi
         link = f"https://t.me/{bot_n}" + (f"/{short}" if short else "") + f"?{kind}={param}"
-        score = 1
-        if low == (WIZ_CUR.get("bot") or "").lower():
-            score += 3
+        cur = (WIZ_CUR.get("bot") or "").lower()
+        if low != cur:
+            # V9.6.2: BU botun linki degil (ör: uygulama icindeki partner/görev reklami).
+            # Baska bir botun linki ASLA 'senin referansin' olamaz: 0 puanla yalnizca
+            # bilgi amacli tutulur, esigi (3) gecemz.
+            WIZ_CUR["refs"].setdefault(link, (0, src + " (başka bot)"))
+            continue
+        score = 4  # V9.6.2: dogru botun linki taban 4 ile baslar
         me = WIZ_ME.get("id") or 0
         if me and str(me) in param:
             score += 4
@@ -6483,9 +6502,19 @@ WIZ_REF_MIN_SCORE = 3  # başka botların (partner görev) linkleri yanlışlık
 
 
 def wiz_best_ref():
+    """V9.6.2: yalnizca SU AN calisan botun kendi linki 'senin referansin' olabilir;
+    baska botlarin linkleri (partner görev/reklam) asla secilmez."""
     if not WIZ_CUR or not WIZ_CUR.get("refs"):
         return None, ""
-    link, (score, src) = max(WIZ_CUR["refs"].items(), key=lambda kv: kv[1][0])
+    cur = (WIZ_CUR.get("bot") or "").lower()
+    mine = {}
+    for l, v in WIZ_CUR["refs"].items():
+        m = re.search(r"t\.me/([^/?#]+)", l, re.I)
+        if m and m.group(1).lower() == cur:
+            mine[l] = v
+    if not mine:
+        return None, ""
+    link, (score, src) = max(mine.items(), key=lambda kv: kv[1][0])
     if score < WIZ_REF_MIN_SCORE:
         return None, ""
     return link, src
