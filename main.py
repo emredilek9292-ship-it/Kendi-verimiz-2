@@ -5771,6 +5771,8 @@ def uni_problem_tr(notes: list) -> str:
     m = re.search(r"Hata:\s*(\S+)", text)
     if m:
         err = m.group(1)
+    if "BELLEK SINIRI" in text:
+        return "mini app sunucu belleğini doldurdu (512 MB yetmedi), bot çökmesin diye tarayıcı kapatıldı"
     if "mini uygulama değil" in low or "MİNİ UYGULAMA DEĞİL" in text:
         return "bu bot mini uygulama değil (sadece sohbet botu), atlanabilir"
     if "açılış adresi alınamadı" in low or "acilis adresi alinamadi" in low:
@@ -6722,8 +6724,12 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
 # Groq'un görüntü okuyabilen modeline gönderilir; model nereye dokunulacağını söyler.
 
 WIZ_CHROME_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--mute-audio",
-                   "--no-first-run", "--renderer-process-limit=2", "--disable-background-networking",
-                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "384") or "384")]
+                   "--no-first-run", "--renderer-process-limit=1", "--disable-background-networking",
+                   "--disable-site-isolation-trials", "--disable-features=site-per-process,IsolateOrigins,Translate",
+                   "--disable-software-rasterizer", "--disable-breakpad", "--no-zygote",
+                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "256") or "256")]
+if os.getenv("WIZ_CHROME_SINGLE", "").strip() in ("1", "true", "evet"):
+    WIZ_CHROME_ARGS.append("--single-process")   # ~30 MB daha az bellek, biraz daha kararsız
 
 WIZ_VISION_MODELS = [m.strip() for m in (os.getenv("WIZ_VISION_MODEL", "qwen/qwen3.8-27b") or "").split(",") if m.strip()]
 WIZ_CANVAS_STEPS = int(os.getenv("WIZ_CANVAS_STEPS", "8") or 8)
@@ -6894,6 +6900,9 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
                         if WIZ_CUR:
                             wiz_add_refs(u, "yönlendirme")
                         await route.abort()
+                        return
+                    if WIZ_LITE.get("on") and (req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
+                        await route.abort()   # hafif mod: belleği dolduran dosyalar yüklenmez
                         return
                     if host not in cache:
                         cache[host] = await v8_public(u)
@@ -7074,7 +7083,7 @@ async def wiz_finish(name: str, outcome: str, notes: list, source: str):
     if not V8_AP.get("wiz_on"):
         return
     text_all = "\n".join(notes)
-    opened = "Sayfa açıldı" in text_all
+    opened = "Sayfa açıldı" in text_all or bool(WIZ_CUR.get("screens"))
     link, src = wiz_best_ref()
     if not link and opened:
         link = await wiz_ref_from_chat(name)
@@ -7344,6 +7353,7 @@ WIZ_HELP = (
     "• sıra — şu an hangi bot çalışıyor, hangi aşamada, sırada kimler var\n"
     "• iptal botadi — o botu sıradan çıkar / durdur\n"
     "• devam — bot yeniden başladıysa sırada kalanları sürdür\n"
+    "• bellek — sunucu bellek kullanımı ve ağır (hafif modda açılan) botlar\n"
     "• zorla botadi — sunucuyu çökerttiği için atlanan botu yine de dene\n"
     "• sihirbaz — durum  ·  sihirbaz aç / kapat\n"
     "• sihirbaz ai aç / kapat — yapay zekanın görev adımları\n"
@@ -7390,6 +7400,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if low in {"dur", "durdur"}:
         await v8_stop()
+        return
+    if low in {"bellek", "ram", "hafiza"}:
+        hv = {**(WIZ_JOURNAL.get("crash") or {}), **(WIZ_JOURNAL.get("heavy") or {}), **(WIZ_JOURNAL.get("lite") or {})}
+        await msg.reply_text(
+            f"🧠 Bellek: {wiz_mem_used_mb()} MB / {wiz_mem_limit_mb()} MB "
+            f"(tarayıcı {int(wiz_mem_limit_mb() * WIZ_MEM_KILL_PCT)} MB'ta kapatılır)\n"
+            f"Son mini app tepe kullanımı: {WIZ_MEM['peak']} MB\n"
+            "Ağır (hafif modda açılan) botlar: " + (", ".join(f"@{b}" for b in hv) or "yok"))
         return
     if low in {"devam", "surdur"}:
         await wiz_resume()
@@ -7553,6 +7571,8 @@ async def wiz_journal_boot():
     if not isinstance(data, dict):
         return
     WIZ_JOURNAL["crash"] = dict(data.get("crash") or {})
+    WIZ_JOURNAL["heavy"] = dict(data.get("heavy") or {})
+    WIZ_JOURNAL["lite"] = dict(data.get("lite") or {})
     dead = data.get("bot") or ""
     queue = [b for b in (data.get("queue") or []) if b and b != dead]
     WIZ_JOURNAL["pending"] = list(dict.fromkeys(queue))
@@ -7568,8 +7588,11 @@ async def wiz_journal_boot():
         n = WIZ_JOURNAL["crash"][dead]
         lines.append(f"Kapanma @{dead} çalışırken oldu ({el // 60} dk sonra). En olası neden: bu mini app "
                      f"sunucunun belleğini doldurdu (ağır oyun / tarayıcı çöktü). Bu bot {n} kez çökertti.")
-        if n >= WIZ_CRASH_SKIP:
+        if n >= WIZ_CRASH_SKIP + 1:
             lines.append(f"@{dead} artık otomatik ATLANACAK. Yine de denemek için: zorla {dead}")
+        else:
+            lines.append(f"Bir dahaki sefere @{dead} HAFİF MODDA açılacak (resim/oyun dosyası yüklenmez) ve "
+                         f"bellek bekçisi sınıra yaklaşınca sadece tarayıcıyı kapatacak.")
     if WIZ_JOURNAL["pending"]:
         lines.append(f"Sırada kalan {len(WIZ_JOURNAL['pending'])} bot: " +
                      ", ".join("@" + b for b in WIZ_JOURNAL["pending"][:20]))
@@ -7611,6 +7634,7 @@ async def v8_run_and_track(name="myageapp", short="", start="", source="manual",
         res = await task
         if (WIZ_JOURNAL.get("crash") or {}).get(name):
             WIZ_JOURNAL["crash"].pop(name, None)   # sorunsuz bitti → çökme sayısı sıfırlanır
+            WIZ_JOURNAL.setdefault("lite", {})[name] = 1   # ama hep hafif modda açılmaya devam eder
         return res
     finally:
         if not task.done():
@@ -7679,10 +7703,157 @@ async def wiz_resume():
 
 async def wiz_force(name: str):
     WIZ_JOURNAL.setdefault("crash", {}).pop(name, None)
+    WIZ_JOURNAL.setdefault("heavy", {}).pop(name, None)
+    WIZ_JOURNAL.setdefault("lite", {}).pop(name, None)
     await wiz_journal_save()
     await bot_app.bot.send_message(ADMIN_USER_ID, f"@{name} çökme kaydı silindi, yeniden deneniyor "
                                                   f"(yine çökertirse tekrar atlanır).")
     await auto_link(name)
+
+
+
+# ------------------------------------------- bellek bekçisi (V9.4) ----
+# Render ücretsiz plan 512 MB. Ağır mini app (Unity oyunu vb.) belleği doldurursa Render tüm botu
+# öldürüyordu. Artık bellek sınıra yaklaşınca SADECE tarayıcı kapatılır, bot çalışmaya devam eder.
+# O mini app "ağır" diye işaretlenir; sonraki turlarda HAFİF MODDA açılır (resim/ses/oyun dosyası yüklenmez).
+
+import signal as _wiz_signal
+
+WIZ_HEAVY_RE = re.compile(r"\.(?:wasm|data|unityweb|bundle|mem|br|mp4|webm|m4a|mp3|ogg|wav|glb|gltf|ktx2?|basis|atlas)(?:\.gz|\.br)?(?:[?#]|$)", re.I)
+WIZ_LITE = {"on": False}
+WIZ_MEM = {"killed": False, "peak": 0, "watching": False}
+
+
+def _wiz_read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def wiz_mem_limit_mb() -> int:
+    env = os.getenv("WIZ_MEM_LIMIT_MB", "").strip()
+    if env.isdigit():
+        return int(env)
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        v = _wiz_read(p)
+        if v.isdigit() and int(v) < (1 << 40):
+            return int(v) // (1024 * 1024)
+    return 512   # Render ücretsiz plan
+
+
+def wiz_mem_used_mb() -> int:
+    """Konteynerin gerçek bellek kullanımı (önbellek hariç)."""
+    cur = _wiz_read("/sys/fs/cgroup/memory.current")
+    stat_p = "/sys/fs/cgroup/memory.stat"
+    if not cur.isdigit():
+        cur = _wiz_read("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        stat_p = "/sys/fs/cgroup/memory/memory.stat"
+    if cur.isdigit():
+        used = int(cur)
+        for ln in _wiz_read(stat_p).splitlines():
+            k, _, v = ln.partition(" ")
+            if k in ("inactive_file", "total_inactive_file") and v.isdigit():
+                used -= int(v)
+        return max(0, used // (1024 * 1024))
+    total = 0   # cgroup okunamazsa: tüm süreçlerin PSS/RSS toplamı
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        txt = _wiz_read(f"/proc/{pid}/smaps_rollup") or _wiz_read(f"/proc/{pid}/status")
+        m = re.search(r"^(?:Pss|VmRSS):\s+(\d+)", txt, re.M)
+        if m:
+            total += int(m.group(1))
+    return total // 1024
+
+
+def wiz_kill_browsers() -> int:
+    n = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        cmd = _wiz_read(f"/proc/{pid}/cmdline").split("\0")[0].lower()
+        if "chrom" in cmd or "headless_shell" in cmd:
+            try:
+                os.kill(int(pid), _wiz_signal.SIGKILL)
+                n += 1
+            except Exception:
+                pass
+    return n
+
+
+WIZ_MEM_KILL_PCT = float(os.getenv("WIZ_MEM_KILL_PCT", "0.92") or 0.92)   # 512 MB → 471 MB'ta tarayıcı kapanır
+
+
+async def wiz_mem_watch(name: str):
+    limit = wiz_mem_limit_mb()
+    kill_at = int(limit * WIZ_MEM_KILL_PCT)
+    while True:
+        await asyncio.sleep(0.8)
+        try:
+            used = wiz_mem_used_mb()
+        except Exception:
+            continue
+        WIZ_MEM["peak"] = max(WIZ_MEM["peak"], used)
+        if used >= kill_at and not WIZ_MEM["killed"]:
+            WIZ_MEM["killed"] = True
+            k = wiz_kill_browsers()
+            print(f"[BELLEK] @{name} {used} MB / {limit} MB → tarayıcı kapatıldı ({k} süreç), bot çökmedi", flush=True)
+
+
+def wiz_heavy_level(name: str) -> int:
+    j = WIZ_JOURNAL
+    return (int((j.get("crash") or {}).get(name, 0)) + int((j.setdefault("heavy", {})).get(name, 0))
+            + int((j.setdefault("lite", {})).get(name, 0)))
+
+
+def wiz_crashy(name: str) -> bool:   # V9.3'ün yerine: ağır modda da sığmayan bot atlanır
+    return int((WIZ_JOURNAL.get("crash") or {}).get(name, 0)) >= WIZ_CRASH_SKIP + 1 or \
+        int((WIZ_JOURNAL.setdefault("heavy", {})).get(name, 0)) >= 3
+
+
+async def v8_browser(name, url, state, _retry: bool = False):
+    await wiz_journal_save()
+    if WIZ_MEM["watching"]:   # temiz oturumla tekrar denemede bekçi zaten çalışıyor
+        return await _wiz_browser_base3(name, url, state, _retry)
+    lite = wiz_heavy_level(name) > 0
+    WIZ_LITE["on"] = lite
+    WIZ_MEM.update({"killed": False, "peak": 0, "watching": True})
+    mon = asyncio.create_task(wiz_mem_watch(name))
+    pre = []
+    if lite:
+        pre.append("Hafif mod: bu mini app daha önce belleği doldurdu; resim/ses/oyun dosyaları yüklenmeden açıldı.")
+        if WIZ_CUR:
+            WIZ_CUR["fails"].append("Hafif modda açıldı (sunucu belleği 512 MB): oyunun grafik kısmı yüklenmedi")
+    try:
+        try:
+            notes = await _wiz_browser_base3(name, url, state, _retry)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if not WIZ_MEM["killed"]:
+                raise
+            notes = [f"Tarayıcı kapandı ({type(e).__name__})."]
+    finally:
+        mon.cancel()
+        WIZ_MEM["watching"] = False
+        WIZ_LITE["on"] = False
+    print(f"[BELLEK] @{name} tepe kullanım: {WIZ_MEM['peak']} MB / {wiz_mem_limit_mb()} MB"
+          + (" (hafif mod)" if lite else ""), flush=True)
+    if WIZ_MEM["killed"]:
+        hv = WIZ_JOURNAL.setdefault("heavy", {})
+        hv[name] = int(hv.get(name, 0)) + 1
+        await wiz_journal_save()
+        msg = (f"BELLEK SINIRI: mini app sunucu belleğini doldurdu ({WIZ_MEM['peak']} MB / {wiz_mem_limit_mb()} MB); "
+               f"bot çökmesin diye tarayıcı kapatıldı.")
+        msg += (" Hafif modda da sığmadı." if lite else " Bir dahaki sefere hafif modda açılacak.")
+        if WIZ_CUR:
+            WIZ_CUR["fails"].append(msg)
+        notes = pre + list(notes or []) + [msg]
+    else:
+        notes = pre + list(notes or [])
+    return notes
 
 
 
@@ -7796,6 +7967,7 @@ async def main():
     except Exception as e:
         print("[ADMIN MSG HATA]", repr(e))
 
+    print(f"[BELLEK] açılış: {wiz_mem_used_mb()} MB / {wiz_mem_limit_mb()} MB", flush=True)
     print("[HAZIR] Bot komutlari + Telethon + HTTP")
     # DÜZELTME: Telethon bağlantısı koparsa program kapanmaz, yeniden bağlanır
     fails = 0
