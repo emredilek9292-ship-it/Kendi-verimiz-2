@@ -4768,8 +4768,8 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
 #  - "otopilot tara": hesabındaki mini uygulamalı tüm botları bulup listeye ekler.
 # =====================================================================
 
-UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "120") or 120)    # bir turda en fazla tıklama
-UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "420") or 420)          # bir bot için tarayıcı süresi (sn)
+UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "60") or 60)      # bir turda en fazla tıklama
+UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "240") or 240)          # bir bot için tarayıcı süresi (sn) — bellek için kısa
 UNI_TABS = int(os.getenv("UNI_TABS", "12") or 12)                    # gezilecek en fazla sekme
 UNI_TAPS = int(os.getenv("UNI_TAPS", "30") or 30)                    # tapper oyunlarında dokunma (0 = kapalı)
 UNI_JOIN = os.getenv("UNI_JOIN", "1").strip() != "0"                 # görev kanallarına katıl (AÇIK)
@@ -5628,6 +5628,10 @@ async def v8_browser(name, url, state):
                         nav_links.append(u)
                         await route.abort()
                         return
+                    # Ağır dosyaları her zaman kes (Unity/wasm/video) — 512MB hayatta kalmak için
+                    if WIZ_HEAVY_RE.search(u) or any(x in u.lower() for x in (".wasm", ".unityweb", ".mp4", ".webm", ".mp3", ".ogg", ".wav", ".data", ".bundle")):
+                        await route.abort()
+                        return
                     if host not in cache:
                         cache[host] = await v8_public(u)
                     if cache[host] and urlparse(u).scheme == "https":
@@ -5677,11 +5681,20 @@ async def v8_browser(name, url, state):
             return notes
         finally:
             if context is not None:
-                await uni_save_state(context, name)
+                try:
+                    await uni_save_state(context, name)
+                except Exception:
+                    pass
             try:
-                await asyncio.wait_for(browser.close(), 15)
+                await asyncio.wait_for(browser.close(), 10)
             except Exception:
                 pass
+            # Zombie Chrome temizliği — sıradaki botlar için şart
+            try:
+                wiz_kill_browsers()
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
 
 
 def _v8_notes_outcome(notes: list) -> str:
@@ -6017,8 +6030,8 @@ from urllib.parse import unquote as _wiz_unquote
 if not os.getenv("V8_JOB_TIMEOUT"):
     V8_JOB_TIMEOUT = 720  # sihirbaz adımları (AI + referans) için ek süre; tek bot en fazla ~12 dk
 
-WIZ_AI_STEPS = int(os.getenv("WIZ_AI_STEPS", "18") or 18)          # bir botta en fazla AI kararı (AI merkezli)
-WIZ_AI_BUDGET_S = int(os.getenv("WIZ_AI_BUDGET_S", "260") or 260)  # AI keşif süresi (sn)
+WIZ_AI_STEPS = int(os.getenv("WIZ_AI_STEPS", "12") or 12)          # bir botta en fazla AI kararı
+WIZ_AI_BUDGET_S = int(os.getenv("WIZ_AI_BUDGET_S", "150") or 150)  # AI keşif süresi (sn) — bellek dostu
 WIZ_REF_BUDGET_S = int(os.getenv("WIZ_REF_BUDGET_S", "70") or 70)  # referans avı süresi (sn)
 WIZ_AI_GAP = float(os.getenv("WIZ_AI_GAP", "1.8") or 1.8)          # iki Groq isteği arası en az sn
 WIZ_AI_FIRST = os.getenv("WIZ_AI_FIRST", "1").strip() != "0"      # AI öncelikli
@@ -6787,13 +6800,22 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
 # Unity/Phaser gibi oyunlarda butonlar HTML değil, resim içinde. Bu modda ekran görüntüsü
 # Groq'un görüntü okuyabilen modeline gönderilir; model nereye dokunulacağını söyler.
 
-WIZ_CHROME_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--mute-audio",
-                   "--no-first-run", "--renderer-process-limit=1", "--disable-background-networking",
-                   "--disable-site-isolation-trials", "--disable-features=site-per-process,IsolateOrigins,Translate",
-                   "--disable-software-rasterizer", "--disable-breakpad", "--no-zygote",
-                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "256") or "256")]
-if os.getenv("WIZ_CHROME_SINGLE", "").strip() in ("1", "true", "evet"):
-    WIZ_CHROME_ARGS.append("--single-process")   # ~30 MB daha az bellek, biraz daha kararsız
+WIZ_CHROME_ARGS = [
+    "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--mute-audio",
+    "--no-first-run", "--renderer-process-limit=1", "--disable-background-networking",
+    "--disable-site-isolation-trials", "--disable-features=site-per-process,IsolateOrigins,Translate,BlinkGenPropertyTrees",
+    "--disable-software-rasterizer", "--disable-breakpad", "--no-zygote", "--no-sandbox",
+    "--disable-setuid-sandbox", "--disable-accelerated-2d-canvas", "--disable-notifications",
+    "--blink-settings=imagesEnabled=false",  # resimleri kapat → bellek ciddi düşer
+    "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "128") or "128"),
+]
+# 512 MB altı / Render ücretsiz: tek süreç (varsayılan AÇIK)
+_single = os.getenv("WIZ_CHROME_SINGLE", "1").strip().lower()
+if _single not in ("0", "false", "hayir", "hayır", "off"):
+    WIZ_CHROME_ARGS.append("--single-process")
+
+WIZ_HEAVY_RE = re.compile(
+    r"\.(?:wasm|data|unityweb|bundle|mem|br|mp4|webm|m4a|mp3|ogg|wav|glb|gltf|ktx2?|basis|atlas)(?:\.gz|\.br)?(?:[?#]|$)", re.I)
 
 WIZ_VISION_MODELS = [m.strip() for m in (os.getenv("WIZ_VISION_MODEL", "qwen/qwen3.8-27b") or "").split(",") if m.strip()]
 WIZ_CANVAS_STEPS = int(os.getenv("WIZ_CANVAS_STEPS", "8") or 8)
@@ -6968,6 +6990,10 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
                     if WIZ_LITE.get("on") and (req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
                         await route.abort()   # hafif mod: belleği dolduran dosyalar yüklenmez
                         return
+                    # Ağır dosyaları her zaman kes (Unity/wasm/video) — 512MB hayatta kalmak için
+                    if WIZ_HEAVY_RE.search(u) or any(x in u.lower() for x in (".wasm", ".unityweb", ".mp4", ".webm", ".mp3", ".ogg", ".wav", ".data", ".bundle")):
+                        await route.abort()
+                        return
                     if host not in cache:
                         cache[host] = await v8_public(u)
                     if cache[host] and urlparse(u).scheme == "https":
@@ -7069,7 +7095,12 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
             if context is not None and not retry_needed:
                 await uni_save_state(context, name)
             try:
-                await asyncio.wait_for(browser.close(), 15)
+                await asyncio.wait_for(browser.close(), 10)
+                try:
+                    wiz_kill_browsers()
+                except Exception:
+                    pass
+                await asyncio.sleep(1.2)
             except Exception:
                 pass
     return notes
@@ -7475,7 +7506,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🧠 Bellek: {wiz_mem_used_mb()} MB / {wiz_mem_limit_mb()} MB "
             f"(tarayıcı {int(wiz_mem_limit_mb() * WIZ_MEM_KILL_PCT)} MB'ta kapatılır)\n"
             f"Son mini app tepe kullanımı: {WIZ_MEM['peak']} MB\n"
-            "Ağır (hafif modda açılan) botlar: " + (", ".join(f"@{b}" for b in hv) or "yok"))
+            "Ağır/çökme işaretli: " + (", ".join(f"@{b}" for b in hv) or "yok") + "\n"
+            "Temizlemek için: bellek temizle   ·  Zorla aç: zorla botadi")
+        return
+    if low in {"bellek temizle", "ram temizle", "crash temizle", "temizle bellek"}:
+        WIZ_JOURNAL["crash"] = {}
+        WIZ_JOURNAL["heavy"] = {}
+        # lite kalsın — bir kez ağır olanlar dikkatli açılsın
+        try:
+            n = wiz_kill_browsers()
+        except Exception:
+            n = 0
+        await wiz_journal_save()
+        await msg.reply_text(
+            f"🧹 Tüm çökme/heavy kayıtları silindi. Zombie tarayıcı: {n} süreç öldürüldü.\n"
+            f"Şu an bellek: {wiz_mem_used_mb()} MB / {wiz_mem_limit_mb()} MB\n"
+            f"Günlük turu yeniden dene veya: zorla botadi")
         return
     if low in {"devam", "surdur"}:
         await wiz_resume()
@@ -7646,6 +7692,22 @@ async def wiz_journal_boot():
     WIZ_JOURNAL["pending"] = list(dict.fromkeys(queue))
     if dead:
         WIZ_JOURNAL["crash"][dead] = int(WIZ_JOURNAL["crash"].get(dead, 0)) + 1
+        # Otomatik: açılışta zombie chrome temizle, hafif moda al
+        try:
+            wiz_kill_browsers()
+        except Exception:
+            pass
+        WIZ_JOURNAL.setdefault("lite", {})[dead] = 1
+    # Eski ağır işaretleri otomatik yumuşat (kara liste olmasın)
+    for dname in ("crash", "heavy"):
+        d = WIZ_JOURNAL.setdefault(dname, {})
+        for b in list(d.keys()):
+            try:
+                d[b] = max(0, int(d[b]) - 1)
+                if d[b] <= 0:
+                    d.pop(b, None)
+            except Exception:
+                d.pop(b, None)
     WIZ_JOURNAL["bot"], WIZ_JOURNAL["queue"] = "", []
     await asyncio.wait_for(save_json(WIZ_LIVE_KEY, WIZ_LIVE_FILE, WIZ_JOURNAL), 10)
     if not dead and not queue:
@@ -7691,18 +7753,51 @@ _wiz_track_base2 = v8_run_and_track
 
 
 async def v8_run_and_track(name="myageapp", short="", start="", source="manual", force=False):
-    if wiz_crashy(name) and not force:
-        n = WIZ_JOURNAL["crash"].get(name, 0)
-        return "skip", [f"Atlandı: bu mini app sunucuyu {n} kez çökertti (bellek). Denemek için: zorla {name}"]
+    """force=True veya günlük tur: bellek kaydına rağmen HAFİF MODDA dener.
+    Sadece gerçekten çok kez çökerten botlar (crash yüksek) hard-skip olur."""
+    # Her bot öncesi otomatik temizlik (kullanıcı komut yazmaz)
+    try:
+        await wiz_auto_cleanup(f"önce:{name}")
+    except Exception as e:
+        print("[OTOMATİK-TEMİZLİK]", repr(e), flush=True)
+    crash_n = int((WIZ_JOURNAL.get("crash") or {}).get(name, 0))
+    heavy_n = int((WIZ_JOURNAL.get("heavy") or {}).get(name, 0))
+    # Hard skip: sadece crash gerçekten yüksekse ve force değilse
+    # Hard-skip neredeyse yok: sistem kendi temizleyip hafif modda dener.
+    # Sadece crash çok yüksek VE force değil VE günlük değilse atla.
+    hard = crash_n >= 8 and not force and source not in ("gunluk", "daily", "manual")
+    if hard:
+        # Yine de sayacı düşür — sonsuza kadar kilitlenmesin
+        WIZ_JOURNAL.setdefault("crash", {})[name] = max(0, crash_n - 2)
+        try:
+            await wiz_journal_save()
+        except Exception:
+            pass
+        return "skip", [
+            f"Atlandı: @{name} çok kez çökertti (crash={crash_n}). "
+            f"Kayıt otomatik düşürüldü; bir sonraki turda tekrar denenecek."
+        ]
+    # Ağır botlarda günlük/otopilot yine dener (lite mode açılır); sadece uyar
+    if (wiz_crashy(name) or heavy_n >= 2) and not force:
+        print(f"[BELLEK] @{name} riskli (crash={crash_n} heavy={heavy_n}) → hafif modda denenecek", flush=True)
+        WIZ_JOURNAL.setdefault("lite", {})[name] = 1
     task = asyncio.create_task(_wiz_track_base2(name, short, start, source))
-    # sıraya girdiği / başladığı / bittiği an kaydedilir
     await asyncio.sleep(0)
     await wiz_journal_save()
     try:
         res = await task
-        if (WIZ_JOURNAL.get("crash") or {}).get(name):
-            WIZ_JOURNAL["crash"].pop(name, None)   # sorunsuz bitti → çökme sayısı sıfırlanır
-            WIZ_JOURNAL.setdefault("lite", {})[name] = 1   # ama hep hafif modda açılmaya devam eder
+        outcome = res[0] if isinstance(res, tuple) else res
+        # Başarılı veya skip değilse crash sayacını yumuşat
+        if outcome in ("ok", "skip") or (isinstance(res, tuple) and res[0] != "err"):
+            if crash_n and outcome == "ok":
+                WIZ_JOURNAL.setdefault("crash", {}).pop(name, None)
+            # heavy'yi de yavaş yavaş düşür (her başarılı turda -1)
+            if outcome == "ok" and heavy_n:
+                hv = WIZ_JOURNAL.setdefault("heavy", {})
+                hv[name] = max(0, int(hv.get(name, 0)) - 1)
+                if hv[name] == 0:
+                    hv.pop(name, None)
+            WIZ_JOURNAL.setdefault("lite", {})[name] = 1  # bir kez ağır olduysa lite kalır
         return res
     finally:
         if not task.done():
@@ -7770,13 +7865,27 @@ async def wiz_resume():
 
 
 async def wiz_force(name: str):
+    """Bellek/çökme kaydını silip botu zorla açar (hafif mod kapalı ilk denemede)."""
     WIZ_JOURNAL.setdefault("crash", {}).pop(name, None)
     WIZ_JOURNAL.setdefault("heavy", {}).pop(name, None)
-    WIZ_JOURNAL.setdefault("lite", {}).pop(name, None)
+    # lite kaydı kalsın: bir kez bellek yiyen bot yine dikkatli açılsın
+    WIZ_JOURNAL.setdefault("lite", {})[name] = 1
     await wiz_journal_save()
-    await bot_app.bot.send_message(ADMIN_USER_ID, f"@{name} çökme kaydı silindi, yeniden deneniyor "
-                                                  f"(yine çökertirse tekrar atlanır).")
-    await auto_link(name)
+    await bot_app.bot.send_message(
+        ADMIN_USER_ID,
+        f"@{name} çökme/heavy kaydı silindi. Hafif modda yeniden deneniyor.\n"
+        f"Hâlâ sorun olursa: bellek  komutuyla durumu gör. Kalıcı çıkarmak: günlük sil {name}"
+    )
+    # force=True ile hard-skip'i bypass et
+    try:
+        res = await v8_run_and_track(name, source="manual", force=True)
+        outcome, notes = res if isinstance(res, tuple) else ("err", [str(res)])
+        await bot_app.bot.send_message(
+            ADMIN_USER_ID,
+            f"@{name} zorla sonuç: {outcome}\n" + "\n".join((notes or [])[:8])[:1500]
+        )
+    except Exception as e:
+        await bot_app.bot.send_message(ADMIN_USER_ID, f"@{name} zorla hata: {type(e).__name__}: {e}")
 
 
 
@@ -7851,7 +7960,59 @@ def wiz_kill_browsers() -> int:
     return n
 
 
-WIZ_MEM_KILL_PCT = float(os.getenv("WIZ_MEM_KILL_PCT", "0.92") or 0.92)   # 512 MB → 471 MB'ta tarayıcı kapanır
+async def wiz_auto_cleanup(reason: str = ""):
+    """Otomatik temizlik: zombie Chrome + yüksek bellek + eski çökme kayıtları.
+    Kullanıcıya komut yazdırmaz; sistem kendi halleder."""
+    try:
+        killed = wiz_kill_browsers()
+    except Exception:
+        killed = 0
+    try:
+        used = wiz_mem_used_mb()
+        limit = wiz_mem_limit_mb()
+    except Exception:
+        used, limit = 0, 512
+    # Çökme/heavy kayıtlarını yumuşat: 24 saatten eski veya aşırı işaretleri sil
+    now = time.time()
+    crash = WIZ_JOURNAL.setdefault("crash", {})
+    heavy = WIZ_JOURNAL.setdefault("heavy", {})
+    # Sayıları yarıya indir / düşük olanları sil (kalıcı kara liste olmasın)
+    for d in (crash, heavy):
+        for b in list(d.keys()):
+            try:
+                v = int(d[b])
+            except Exception:
+                d.pop(b, None)
+                continue
+            if v <= 1:
+                d.pop(b, None)
+            elif v >= 2:
+                d[b] = max(1, v - 1)
+    # Bellek çok yüksekse kısa bekle (GC + OS reclamation)
+    waited = 0
+    if limit and used >= int(limit * 0.75):
+        for _ in range(6):
+            await asyncio.sleep(2)
+            waited += 2
+            try:
+                wiz_kill_browsers()
+                used = wiz_mem_used_mb()
+            except Exception:
+                break
+            if used < int(limit * 0.65):
+                break
+    try:
+        await wiz_journal_save()
+    except Exception:
+        pass
+    if killed or waited:
+        print(f"[OTOMATİK-TEMİZLİK] {reason or '-'} · chrome_öldü={killed} · "
+              f"beklenen={waited}s · bellek={used}/{limit} MB · "
+              f"crash={len(crash)} heavy={len(heavy)}", flush=True)
+    return {"killed": killed, "used": used, "limit": limit, "waited": waited}
+
+
+WIZ_MEM_KILL_PCT = float(os.getenv("WIZ_MEM_KILL_PCT", "0.85") or 0.85)   # 512 MB → ~435 MB'ta tarayıcı kapanır (OOM öncesi)
 
 
 async def wiz_mem_watch(name: str):
@@ -7876,9 +8037,13 @@ def wiz_heavy_level(name: str) -> int:
             + int((j.setdefault("lite", {})).get(name, 0)))
 
 
-def wiz_crashy(name: str) -> bool:   # V9.3'ün yerine: ağır modda da sığmayan bot atlanır
-    return int((WIZ_JOURNAL.get("crash") or {}).get(name, 0)) >= WIZ_CRASH_SKIP + 1 or \
-        int((WIZ_JOURNAL.setdefault("heavy", {})).get(name, 0)) >= 3
+def wiz_crashy(name: str) -> bool:
+    """True = riskli bot (hafif mod + dikkat). Hard-skip ayrı karardır."""
+    crash_n = int((WIZ_JOURNAL.get("crash") or {}).get(name, 0))
+    heavy_n = int((WIZ_JOURNAL.setdefault("heavy", {})).get(name, 0))
+    # Eski davranış çok agresifti: heavy>=3 ile tamamen atlıyordu.
+    # Artık sadece bilgilendirme; asıl hard-skip v8_run_and_track içinde.
+    return crash_n >= WIZ_CRASH_SKIP or heavy_n >= 5
 
 
 async def v8_browser(name, url, state, _retry: bool = False):
@@ -8354,7 +8519,7 @@ WD_FILE = os.getenv("WIZ_DAY_FILE", "/tmp/radar_wiz_daily.json")
 WD_TZ_H = int(os.getenv("WIZ_TZ_OFFSET_H", "3") or 3)              # İstanbul = UTC+3
 WD_DEFAULT_H = float(os.getenv("WIZ_DAY_DEFAULT_H", "6") or 6)       # sayaç okunamazsa kaç saatte bir
 WD_MIN_GAP_MIN = int(os.getenv("WIZ_DAY_MIN_GAP_MIN", "20") or 20)   # aynı bota en az bu kadar dk arayla
-WD_AI_STEPS = int(os.getenv("WIZ_DAY_AI_STEPS", "20") or 20)         # günlük AI adım (otomatik görev+claim)
+WD_AI_STEPS = int(os.getenv("WIZ_DAY_AI_STEPS", "12") or 12)         # günlük AI adım — bellek dostu
 WD_CLAIM_STEPS = ["oto", 2, 4, 6, 8, 12, 24]
 WD_TASK_STEPS = [3, 5, 10, 20]
 WIZ_DAY = {"on": True, "bots": {}, "report": "ozet", "night": [], "saat": 3, "digest_h": 21,
@@ -9180,19 +9345,38 @@ async def wd_tick():
     if not due:
         return
     bot, why = due[0]
-    spawn(wd_run(bot, why))
+    # Günlük tur öncesi otomatik temizlik + bellek kontrolü
+    async def _wd_start(b=bot, w=why):
+        try:
+            await wiz_auto_cleanup(f"günlük:{b}")
+        except Exception:
+            pass
+        await wd_run(b, w)
+    spawn(_wd_start())
 
 
 async def wd_loop():
-    await asyncio.sleep(120)
-    print("[GÜNLÜK] planlayıcı çalışıyor", flush=True)
+    await asyncio.sleep(90)
+    print("[GÜNLÜK] planlayıcı çalışıyor (otomatik bellek temizliği açık)", flush=True)
+    n = 0
     while True:
         try:
+            n += 1
+            # Her ~5 dk bir hafif temizlik
+            if n % 7 == 0:
+                try:
+                    await wiz_auto_cleanup("periyodik")
+                except Exception as e:
+                    print("[GÜNLÜK TEMİZLİK]", repr(e), flush=True)
             await wd_tick()
         except asyncio.CancelledError:
             raise
         except Exception as e:
             print("[GÜNLÜK LOOP]", repr(e), flush=True)
+            try:
+                await wiz_auto_cleanup("hata-sonrası")
+            except Exception:
+                pass
         await asyncio.sleep(45)
 
 
