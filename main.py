@@ -6464,7 +6464,64 @@ async def uni_click(page, c: dict) -> bool:
             "}"
         )
         if blocked:
-            # 3) butonun üstü KAPALI — koordinat tıklaması örtüye gider; zincri butona gönder
+            # 3) V9.6.6: butonun üstü KAPALI — önce ÖRTÜYÜ GÜVENLE KAPATMAYI dene
+            # (sadece güvenli kapat/skip/later/x/kapat tuşları; onay isteyen tuşlar ASLA)
+            try:
+                closed = await page.evaluate(
+                    "(o) => {"
+                    "  const el = document.querySelector('[data-uni=' + JSON.stringify(o.id) + ']');"
+                    "  if (!el) return false;"
+                    "  const t = document.elementFromPoint(o.xy[0], o.xy[1]);"
+                    "  if (!t) return false;"
+                    "  let root = t;"
+                    "  for (let i = 0; root.parentElement && i < 12; i++, root = root.parentElement) {"
+                    "    const st = getComputedStyle(root);"
+                    "    if (st.position === 'fixed' || st.position === 'absolute') break;"
+                    "  }"
+                    "  const SAFE = /^(?:close|skip|later|not now|maybe later|\u00d7|\u2715|\u2716|x|kapat|ge\u00e7|atla|kapat|gec|tamam|ok|got it|okay|devam|continue|next|anlad\u0131m|anladim|закрыть|пропустить|понятно|далее)$/i;"
+                    "  const cands = [];"
+                    "  for (const e of root.querySelectorAll('button, a, [role=button], [onclick], div, span, svg, img')) {"
+                    "    const r = e.getBoundingClientRect();"
+                    "    if (r.width < 4 || r.height < 4 || r.width > 200) continue;"
+                    "    const txt = ((e.innerText || '') + ' ' + (e.getAttribute('aria-label') || '')).replace(/\\s+/g, ' ').trim();"
+                    "    const cls = String(e.className && e.className.baseVal !== undefined ? e.className.baseVal : e.className || '');"
+                    "    if (SAFE.test(txt) || /(?:^|[\\s_-])(?:close|dismiss)(?:[\\s_-]|$)/i.test(cls)) {"
+                    "      cands.push(e);"
+                    "      if (cands.length >= 3) break;"
+                    "    }"
+                    "  }"
+                    "  if (!cands.length) return false;"
+                    "  const pick = cands[0];"
+                    "  pick.click();"
+                    "  return true;"
+                    "}", {"xy": [x, y], "id": c["id"]})
+                if closed:
+                    await page.wait_for_timeout(900)
+                    # örtü kapanınca buton artık açıksa NORMAL tıkla (en sağlıklısı)
+                    try:
+                        box2 = await loc.first.bounding_box()
+                        if box2 and box2["width"] > 0:
+                            x2, y2 = box2["x"] + box2["width"] / 2, box2["y"] + box2["height"] / 2
+                            top2 = await page.evaluate(
+                                "(o) => {"
+                                "  const el = document.querySelector('[data-uni=' + JSON.stringify(o.id) + ']');"
+                                "  const t = document.elementFromPoint(o.xy[0], o.xy[1]);"
+                                "  if (!t) return 'none';"
+                                "  let n = t;"
+                                "  while (n) { if (n === el) return 'ok'; n = n.parentElement; }"
+                                "  return 'blocked';"
+                                "}", {"xy": [x2, y2], "id": c["id"]})
+                            if top2 == "ok":
+                                try:
+                                    await page.touchscreen.tap(x2, y2)
+                                except Exception:
+                                    await page.mouse.click(x2, y2)
+                                return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # 3b) örtü kapanmadıysa: zincri DOĞRUDAN butona gönder (örtüye rağmen çalışır)
             try:
                 if await page.evaluate(ptr_js, c["id"]):
                     return True
