@@ -4870,6 +4870,9 @@ UNI_SHIM_JS = r"""
     U.events.push({ type: type, t: Date.now() });
     switch (type) {
       case 'web_app_open_tg_link': link('https://t.me' + (d.path_full || ''), 'tg_link'); break;
+      // V9.6.3: 'Arkadaş davet et' butonu shareURL çağırınca gelen olay — link yakalanır,
+      // paylaşımla ilgili HİÇBİR şey açılmaz/gönderilmez (yalnızca okunur).
+      case 'web_app_share_url': link(d.url || '', 'share_url'); break;
       case 'web_app_open_link': link(d.url || '', 'open_link'); break;
       case 'web_app_open_invoice': U.blocked.push('invoice'); respond('invoice_closed', { slug: d.slug, status: 'cancelled' }); break;
       case 'web_app_request_phone': U.blocked.push('phone'); respond('phone_requested', { status: 'cancelled' }); break;
@@ -6444,11 +6447,17 @@ def wiz_add_refs(blob: str, src: str):
         return 0
     blob = blob.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
     n = 0
-    # paylaş linkleri: t.me/share/url?url=<kodlu ref>
+    # V9.6.3: paylaş linkleri: t.me/share/url?url=<kodlu ref> — eskiden parse_qs ÇİFT çözüyordu
+    # ve '+' karakterini boşluğa çeviriyordu (base64 kodlar bozuluyordu, link çıkamıyordu).
+    # Artık tek çözüm yapılır: unquote '+'ya dokunmaz, kod bozulmadan TAM okunur.
     for m in re.finditer(r"(?:t\.me|telegram\.me)/share/url\?([^\s\"'<>]+)", blob, re.I):
-        qs = parse_qs(m.group(1))
-        for v in (qs.get("url") or []) + (qs.get("text") or []):
-            n += wiz_add_refs(_wiz_unquote(v), src + "/paylaş")
+        qs_raw = m.group(1)
+        vm = re.search(r"(?:^|[?&])url=([^&]*)", qs_raw)
+        if vm:
+            n += wiz_add_refs(_wiz_unquote(vm.group(1)), src + "/paylaş")
+        tm = re.search(r"(?:^|[?&])text=([^&]*)", qs_raw)
+        if tm:
+            n += wiz_add_refs(_wiz_unquote(tm.group(1)), src + "/paylaş/metin")
     for m in WIZ_REF_RE.finditer(blob):
         bot_n, short, kind, param = m.group(1), m.group(2) or "", m.group(3), m.group(4)
         low = bot_n.lower()
@@ -6583,7 +6592,11 @@ async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
             if time.time() > deadline:
                 break
             if await uni_click(page, c):
-                await page.wait_for_timeout(1200)
+                # V9.6.3: kod çoğu uygulamada buton tıklamasından SONRA API'den geliyor;
+                # iki kez toplanıyor (geç gelen pano yazmaları da yakalanır).
+                await page.wait_for_timeout(1500)
+                await wiz_collect_dom(page, "pano (kopyala)")
+                await page.wait_for_timeout(1000)
                 await wiz_collect_dom(page, "pano (kopyala)")
         link, _ = wiz_best_ref()
         if link:
@@ -6595,7 +6608,11 @@ async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
             if time.time() > deadline:
                 break
             if await uni_click(page, c):
-                await page.wait_for_timeout(1500)
+                # V9.6.3: 'Arkadaş davet et' tıklaması önce API'den kodu çeker, sonra paylaşır;
+                # iki kez toplanıyor (geç gelen paylaşım olayı da yakalanır).
+                await page.wait_for_timeout(2000)
+                await wiz_collect_dom(page, "davet butonu (paylaşılmadı)")
+                await page.wait_for_timeout(1200)
                 await wiz_collect_dom(page, "davet butonu (paylaşılmadı)")
         link, _ = wiz_best_ref()
         if link:
