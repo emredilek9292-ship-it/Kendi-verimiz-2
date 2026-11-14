@@ -7401,6 +7401,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if low in {"dur", "durdur"}:
         await v8_stop()
         return
+    if await wiz_day_cmd(msg, text, low):
+        return
     if await wiz_post_cmd(msg, text, low):
         return
     if low in {"bellek", "ram", "hafiza"}:
@@ -7524,7 +7526,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await wiz_send(raw or f"Cevap alınamadı ({model}).")
         return
     if low in {"komutlar", "yardim", "help"}:
-        await wiz_send(UNI_HELP_TEXT + "\n\n" + WIZ_HELP + "\n" + WIZ_POST_HELP)
+        await wiz_send(UNI_HELP_TEXT + "\n\n" + WIZ_HELP + "\n" + WIZ_POST_HELP + "\n\n" + WD_HELP)
         return
     return await _wiz_on_text_base(update, context)
 
@@ -8277,6 +8279,875 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+# ------------------------------------------------ günlük rutin planlayıcı (V9.6) ----
+# Her mini app için ayrı ayar: günlük ödül / check-in, claim (farm/mining) aralığı, görev yapma.
+# Bot, ekrandaki sayacı ("Claim in 03:12:45", "3h 12m", "2 saat sonra") okur ve bir sonraki
+# toplamayı tam o saate kurar. Gün dönünce günlük ödül turu atar. Akşam tek mesajla gün raporu gelir.
+
+WD_KEY = os.getenv("WIZ_DAY_KEY", "radar:wiz_daily:v1").strip()
+WD_FILE = os.getenv("WIZ_DAY_FILE", "/tmp/radar_wiz_daily.json")
+WD_TZ_H = int(os.getenv("WIZ_TZ_OFFSET_H", "3") or 3)              # İstanbul = UTC+3
+WD_DEFAULT_H = float(os.getenv("WIZ_DAY_DEFAULT_H", "6") or 6)       # sayaç okunamazsa kaç saatte bir
+WD_MIN_GAP_MIN = int(os.getenv("WIZ_DAY_MIN_GAP_MIN", "20") or 20)   # aynı bota en az bu kadar dk arayla
+WD_AI_STEPS = int(os.getenv("WIZ_DAY_AI_STEPS", "14") or 14)
+WD_CLAIM_STEPS = ["oto", 2, 4, 6, 8, 12, 24]
+WD_TASK_STEPS = [3, 5, 10, 20]
+WIZ_DAY = {"on": True, "bots": {}, "report": "ozet", "night": [], "saat": 3, "digest_h": 21,
+           "digest_day": "", "auto_add": True}
+WD_RUN: dict = {}
+WD_STARTED = {"on": False}
+
+WD_DAILY_RE = re.compile(
+    r"daily|check[- ]?in|sign[- ]?in|login (?:reward|bonus)|streak|\bday\s*\d|g[üu]nl[üu]k|g[üu]n\s*\d|seri|"
+    r"ежедн|ежеднев|bonus|бонус|calendar|takvim", re.I)
+WD_CLAIM_RE = re.compile(
+    r"claim|collect|harvest|farm|mining|\bmine\b|topla|[öo]d[üu]l[üu]? al|\bal\b|получить|забрать|собрать|фарм|"
+    r"start farming|start mining|madencil", re.I)
+WD_DONE_RE = re.compile(
+    r"already|claimed|come back|tomorrow|next (?:reward|claim|day)|zaten|yar[ıi]n|al[ıi]nd[ıi]|завтра|уже", re.I)
+WD_KEYLINE_RE = re.compile(
+    r"claim|farm|mine|mining|next|available|ready|until|left|remain|refresh|reset|daily|collect|harvest|storage|"
+    r"full|in\s+\d|kalan|sonra|haz[ıi]r|dolu|g[üu]nl[üu]k|через|осталось|⏳|⌛|🕒|⏱", re.I)
+
+
+def wd_now_local():
+    return time.gmtime(time.time() + WD_TZ_H * 3600)
+
+
+def wd_day_key(ts: float = None) -> str:
+    """Günlük ödül günü: yerel saatten 'saat' kadar geri kaydırılmış tarih (varsayılan 03:00 = 00:00 UTC)."""
+    ts = time.time() if ts is None else ts
+    return time.strftime("%Y-%m-%d", time.gmtime(ts + WD_TZ_H * 3600 - int(WIZ_DAY.get("saat") or 0) * 3600))
+
+
+def wd_fmt_dur(sec: float) -> str:
+    sec = max(0, int(sec))
+    h, m = sec // 3600, (sec % 3600) // 60
+    if h and m:
+        return f"{h} sa {m} dk"
+    return f"{h} sa" if h else f"{max(1, m)} dk"
+
+
+def wd_fmt_clock(ts: float) -> str:
+    return time.strftime("%H:%M", time.gmtime(ts + WD_TZ_H * 3600))
+
+
+def wd_parse_wait(text: str):
+    """Ekrandaki geri sayımı saniyeye çevirir. Bulamazsa None. (5 dk – 26 saat arası kabul edilir)"""
+    if not text:
+        return None
+    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    if len(lines) <= 1:
+        lines = [p.strip() for p in re.split(r"\s*\|\s*", str(text)) if p.strip()]
+    vals = []
+    for i, ln in enumerate(lines):
+        near = ln + " " + (lines[i - 1] if i else "")
+        for m in re.finditer(r"(?<![\d:.])(\d{1,2}):([0-5]\d):([0-5]\d)(?![\d:])", ln):
+            vals.append(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)))
+        if not WD_KEYLINE_RE.search(near):
+            continue
+        rest = ln
+        for m in re.finditer(r"(\d{1,2})\s*(?:hours?|hrs|hr|h|saat|sa|час\w*|ч)(?![a-zçğıöşü])\.?\s*"
+                             r"(?:(\d{1,2})\s*(?:minutes?|mins|min|m|dakika|dk|мин\w*))?", ln, re.I):
+            vals.append(int(m.group(1)) * 3600 + int(m.group(2) or 0) * 60)
+            rest = rest.replace(m.group(0), " ")
+        for m in re.finditer(r"(?<![\d:])(\d{1,3})\s*(?:minutes?|mins|min|m|dakika|dk|мин\w*)(?![a-zа-я])", rest, re.I):
+            vals.append(int(m.group(1)) * 60)
+        for m in re.finditer(r"(?<![\d:])(\d{1,2}):([0-5]\d)(?![\d:])", rest):
+            # '03:12' bir sayaç satırında → saat:dakika say (saat değil, kalan süre)
+            if re.search(r"in\s|left|kalan|sonra|через|осталось|until|⏳|⌛", near, re.I):
+                vals.append(int(m.group(1)) * 3600 + int(m.group(2)) * 60)
+    vals = [v for v in vals if 300 <= v <= 26 * 3600]
+    return min(vals) if vals else None
+
+
+def wd_cfg(bot: str, create: bool = False) -> dict:
+    bot = bot.lower().lstrip("@")
+    c = WIZ_DAY["bots"].get(bot)
+    if c is None and create:
+        c = {"on": True, "claim": "oto", "daily": True, "tasks": True, "task_max": 5, "next": 0, "last": 0,
+             "daily_day": "", "streak": 0, "fails": 0, "added": time.time(), "today": {}, "hist": [],
+             "offset": random.randint(10, 90)}
+        WIZ_DAY["bots"][bot] = c
+    return c
+
+
+async def wd_persist():
+    await save_json(WD_KEY, WD_FILE, WIZ_DAY)
+
+
+async def wd_load():
+    try:
+        data = await load_json(WD_KEY, WD_FILE)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        for k, v in data.items():
+            WIZ_DAY[k] = v
+    WIZ_DAY.setdefault("bots", {})
+    print(f"[GÜNLÜK] {len(WIZ_DAY['bots'])} bot, {'açık' if WIZ_DAY.get('on') else 'kapalı'}", flush=True)
+
+
+def wd_in_night() -> bool:
+    n = WIZ_DAY.get("night") or []
+    if len(n) != 2:
+        return False
+    h = wd_now_local().tm_hour
+    a, b = int(n[0]), int(n[1])
+    return a <= h < b if a < b else (h >= a or h < b)
+
+
+def wd_due(bot: str, c: dict, now: float):
+    """(neden, öncelik) ya da None."""
+    if not c.get("on", True):
+        return None
+    if now - float(c.get("last") or 0) < WD_MIN_GAP_MIN * 60:
+        return None
+    if c.get("now"):
+        return ("elle", -1)
+    if uni_paused(bot):
+        return None
+    if int(c.get("fails") or 0) and now < float(c.get("next") or 0):
+        return None   # son tur açılamadı → bekleme süresi dolmadan tekrar denenmez
+    day = wd_day_key(now)
+    lt = time.gmtime(now + WD_TZ_H * 3600)
+    minute_of_day = ((lt.tm_hour - int(WIZ_DAY.get("saat") or 0)) % 24) * 60 + lt.tm_min
+    if c.get("daily", True) and c.get("daily_day") != day and minute_of_day >= int(c.get("offset") or 30):
+        return ("günlük", 0)
+    if c.get("claim") != 0 and now >= float(c.get("next") or 0):
+        return ("claim", 1)
+    return None
+
+
+def wd_due_list(now: float = None) -> list:
+    now = time.time() if now is None else now
+    out = []
+    for bot, c in WIZ_DAY.get("bots", {}).items():
+        d = wd_due(bot, c, now)
+        if d:
+            out.append((d[1], float(c.get("next") or 0), bot, d[0]))
+    out.sort()
+    return [(b, why) for _, _, b, why in out]
+
+
+# ---- tur içi ayarlar: sadece günlük turda geçerli, tur bitince eski haline döner ----
+
+WD_PROMPT_HEAD = (
+    "Bir Telegram mini uygulamasının içindesin. Bu bir GÜNLÜK RUTİN turu: amaç bugünün ödüllerini kaçırmamak.\n"
+    "Aşağıda ekranın yazısı, tıklanabilir öğeler (id [tür] yazı — bağlam) ve yazı kutuları var.\n"
+    "Ekrandaki cümleleri OKU ve SIRADAKİ TEK güvenli adımı seç. Sıra şöyle:\n"
+    "1) açık pencereyi kapat/onayla (OK, Close, Continue, Got it)\n"
+    "2) GÜNLÜK ÖDÜL: Daily reward / Daily bonus / Check-in / Streak / Day N / Login bonus / Günlük ödül — al. "
+    "Takvim (Day 1..7) varsa bugünkü günü seç ve Claim'e bas. Gerekirse ilgili sekmeye (Daily, Rewards, Bonus, Earn) git.\n"
+    "3) FARM/MINING: Claim / Collect / Harvest'e bas, sonra yeniden 'Start farming / Start mining / Başlat' ile başlat.\n"
+    "4) ücretsiz günlük çark / kutu / hediye (Free spin, Free box, Gift) — sadece ÜCRETSİZ olanlar.\n"
+)
+WD_PROMPT_TASKS_ON = (
+    "5) GÖREVLER: önce günlük görevler (Daily tasks), sonra diğerleri: başlat (Join/Visit/Watch/Play) → "
+    "doğrula (Check/Verify/Claim). Bu turda en fazla {n} görev. Gizli kod istiyorsa ve kod ekranda açıkça "
+    "yazıyorsa 'yaz' ile yaz, TAHMİN ETME.\n"
+)
+WD_PROMPT_TASKS_OFF = (
+    "5) GÖREV YAPMA: Join / Subscribe / Visit / Follow / Check görevlerine BASMA. Sadece ödül topla.\n"
+)
+WD_PROMPT_TAIL = (
+    "Ödül butonu yerine bir geri sayım görüyorsan (ör. 'Claim in 03:12:45', '3h 12m', '2 saat sonra') "
+    "o ödül hazır değildir: üstüne basma, 'sayac' alanına yaz, sıradakine geç.\n"
+    "YASAK: cüzdan, ödeme, Stars, TON, satın alma, ücretli yükseltme, davet/arkadaş, paylaş/hikaye, telefon, e-posta. "
+    "'Denendi' listesindeki işe yaramamış öğeleri tekrar seçme.\n"
+    "Yapacak güvenli bir şey kalmadıysa eylem='bitir'. Yapamadığın bir şey varsa 'sorun' alanına Türkçe nedenini yaz.\n"
+    "SADECE şu JSON'u döndür:\n"
+    '{"ekran":"ekranın 1 cümle Türkçe özeti","eylem":"tikla|yaz|kaydir|geri|bitir",'
+    '"id":"u12 veya w1","metin":"yaz eylemi için","neden":"kısa","sorun":"",'
+    '"sayac":"bir sonraki ödüle/claim\'e kalan süre ekranda yazıyorsa (ör. 03:12:45 veya 3h 12m), yoksa boş",'
+    '"gunluk":"alindi|zaten|yok|bilinmiyor (günlük ödül durumu)"}\n\n'
+)
+WD_CANVAS_HEAD = (
+    "GÜNLÜK RUTİN TURU: önce günlük ödül / check-in / daily bonus, sonra farm-mining Claim ve yeniden Start, "
+    "sonra ücretsiz günlük çark/kutu. Geri sayım varsa o ödül hazır değildir, basma.\n"
+)
+
+
+def wd_prompt(c: dict) -> str:
+    tasks = WD_PROMPT_TASKS_ON.format(n=int(c.get("task_max") or 5)) if c.get("tasks", True) else WD_PROMPT_TASKS_OFF
+    return WD_PROMPT_HEAD + tasks + WD_PROMPT_TAIL
+
+
+def wd_active() -> bool:
+    return bool(WD_RUN.get("bot")) and WIZ_LIVE.get("source") == "gunluk"
+
+
+_wd_browser_base = v8_browser
+
+
+async def v8_browser(name, url, state, _retry: bool = False):
+    if not (wd_active() and WD_RUN.get("bot") == name):
+        return await _wd_browser_base(name, url, state, _retry)
+    c = WD_RUN.get("cfg") or {}
+    g = globals()
+    keys = ["WIZ_STEP_PROMPT", "WIZ_AI_STEPS", "WIZ_CANVAS_PROMPT", "UNI_JOIN", "UNI_JOIN_MAX", "UNI_TAB_MAX", "UNI_BUDGET_S"]
+    saved = {k: g.get(k) for k in keys}
+    try:
+        g["WIZ_STEP_PROMPT"] = wd_prompt(c)
+        g["WIZ_AI_STEPS"] = WD_AI_STEPS
+        if not str(saved["WIZ_CANVAS_PROMPT"]).startswith("GÜNLÜK"):
+            g["WIZ_CANVAS_PROMPT"] = WD_CANVAS_HEAD + saved["WIZ_CANVAS_PROMPT"]
+        if c.get("tasks", True):
+            g["UNI_JOIN_MAX"] = min(int(saved["UNI_JOIN_MAX"] or 12), int(c.get("task_max") or 5))
+        else:
+            g["UNI_JOIN"] = False
+            g["UNI_TAB_MAX"] = min(int(saved["UNI_TAB_MAX"] or 40), 8)
+        g["UNI_BUDGET_S"] = min(int(saved["UNI_BUDGET_S"] or 300), 240)
+        return await _wd_browser_base(name, url, state, _retry)
+    finally:
+        for k, v in saved.items():
+            g[k] = v
+
+
+_wd_click_base = uni_click
+
+
+async def uni_click(page, c: dict) -> bool:
+    ok = await _wd_click_base(page, c)
+    if ok and wd_active():
+        WD_RUN.setdefault("clicks", []).append(((c.get("text") or "")[:40], (c.get("ctx") or "")[:140]))
+    return ok
+
+
+_wd_classify_base = uni_classify
+
+
+def uni_classify(c: dict) -> str:
+    k = _wd_classify_base(c)
+    if k in ("go", "task") and wd_active() and not (WD_RUN.get("cfg") or {}).get("tasks", True):
+        t = (c.get("text") or "") + " " + (c.get("ctx") or "")[:80]
+        if not WD_DAILY_RE.search(t):
+            return "skip"   # görevler kapalı: sadece ödül / günlük / claim
+    return k
+
+
+_wd_json_base = wiz_json
+
+
+def wiz_json(text: str):
+    d = _wd_json_base(text)
+    if isinstance(d, dict) and wd_active():
+        s = str(d.get("sayac") or "").strip()
+        if s:
+            WD_RUN.setdefault("sayac", []).append(s[:40])
+        g = str(d.get("gunluk") or "").strip().lower()
+        if g in ("alindi", "alındı", "zaten", "yok"):
+            WD_RUN["gunluk_ai"] = g.replace("ı", "i")
+        y = str(d.get("yazilar") or "")
+        if y:
+            WD_RUN.setdefault("yazilar", []).append(y[:300])
+    return d
+
+
+_wd_ai_base = wiz_ai_explore
+
+
+async def wiz_ai_explore(page, name: str, notes: list, state: dict):
+    try:
+        return await _wd_ai_base(page, name, notes, state)
+    finally:
+        if wd_active():
+            try:
+                WD_RUN["end"] = await uni_screen(page)
+            except Exception:
+                pass
+
+
+_wd_ref_base = wiz_ref_hunt
+
+
+async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
+    if wd_active():
+        try:
+            WD_RUN["end"] = await uni_screen(page)
+        except Exception:
+            pass
+        if (REFS.get(name) or {}).get("link"):
+            return   # günlük turda referans zaten biliniyorsa vakit harcanmaz
+    return await _wd_ref_base(page, name, notes, state)
+
+
+def wd_analyze(name: str, outcome: str, notes: list) -> dict:
+    st = (WIZ_LIVE.get("state") or {}) if isinstance(WIZ_LIVE.get("state"), dict) else {}
+    run = st.get("uni_run") or {}
+    acts = list(run.get("log") or []) + list((WIZ_CUR or {}).get("ai_log") or [])
+    gains = list(run.get("gains") or []) + list((WIZ_CUR or {}).get("ai_gain") or [])
+    text_all = "\n".join(notes)
+    opened = "Sayfa açıldı" in text_all or bool((WIZ_CUR or {}).get("screens"))
+    good = "Evrensel sonuç: OK" in text_all or bool(gains)
+    end = WD_RUN.get("end") or next((n for n in notes if n.startswith("Ekran özeti:")), "")
+    clicks = WD_RUN.get("clicks") or []
+    daily_acts = [t for t, cx in clicks if WD_DAILY_RE.search(t) or (WD_CLAIM_RE.search(t) and WD_DAILY_RE.search(cx))]
+    claim_acts = [t for t, cx in clicks if WD_CLAIM_RE.search(t) and t not in daily_acts]
+    if not clicks:   # tıklama kaydı yoksa (eski yol) günlük metinden tahmin
+        daily_acts = [a for a in acts if WD_DAILY_RE.search(a.split(":", 1)[-1])]
+        claim_acts = [a for a in acts if WD_CLAIM_RE.search(a.split(":", 1)[-1]) and a not in daily_acts]
+    task_acts = [a for a in acts if re.search(r"/(?:go|task|check):", a)]
+    ai_daily = WD_RUN.get("gunluk_ai") or ""
+    if ai_daily == "alindi" or (daily_acts and good):
+        daily = "alındı"
+    elif daily_acts and WD_DONE_RE.search(end or ""):
+        daily = "alındı"   # bastı ve ekran 'claimed / come back tomorrow' diyor
+    elif ai_daily == "zaten" or (WD_DONE_RE.search(end or "") and not daily_acts):
+        daily = "zaten"
+    elif daily_acts:
+        daily = "basıldı"
+    else:
+        daily = "yok"
+    wait = None
+    for s in (WD_RUN.get("sayac") or [])[::-1]:
+        wait = wd_parse_wait("next claim in " + s)
+        if wait:
+            break
+    if not wait:
+        wait = wd_parse_wait(end) or wd_parse_wait("\n".join(WD_RUN.get("yazilar") or []))
+    problems = sorted(set(((WIZ_CUR or {}).get("fails") or []) + ((WIZ_CUR or {}).get("ai_issues") or [])))
+    return {"opened": opened, "good": good, "daily": daily, "claims": len(claim_acts), "tasks": len(task_acts),
+            "joins": int(run.get("join_ok") or 0), "gains": gains[:6], "wait": wait, "problems": problems[:6],
+            "why": "" if opened else (uni_problem_tr(notes) or "mini uygulama açılamadı"), "outcome": outcome}
+
+
+def wd_schedule(c: dict, r: dict) -> tuple:
+    now = time.time()
+    if not r["opened"] or r["outcome"] == "err":
+        c["fails"] = int(c.get("fails") or 0) + 1
+        sec = min(6, c["fails"]) * 3600
+        return now + sec, f"hata — {wd_fmt_dur(sec)} sonra tekrar"
+    c["fails"] = 0
+    if c.get("claim") == "oto" and r.get("wait"):
+        sec = int(r["wait"]) + random.randint(120, 600)
+        return now + sec, "ekrandaki sayaca göre"
+    if isinstance(c.get("claim"), (int, float)) and c["claim"] > 0:
+        sec = float(c["claim"]) * 3600 * random.uniform(0.97, 1.05)
+        return now + sec, f"her {c['claim']} saatte bir"
+    sec = WD_DEFAULT_H * 3600 * random.uniform(0.95, 1.1)
+    return now + sec, "sayaç okunamadı, varsayılan aralık"
+
+
+def wd_report_text(name: str, r: dict, c: dict, how: str) -> str:
+    if not r["opened"]:
+        return (f"🌅 GÜNLÜK — @{name}\n❌ Açılamadı: {r['why']}\n"
+                f"⏰ Tekrar: {wd_fmt_clock(c['next'])} ({how})")
+    d = {"alındı": f"✅ alındı (seri {c.get('streak', 1)} gün)", "zaten": "☑️ bugün zaten alınmış",
+         "basıldı": "🟡 butona basıldı, ekranda değişim okunamadı", "yok": "— bu uygulamada bulunamadı"}[r["daily"]]
+    lines = [f"🌅 GÜNLÜK — @{name}", f"📅 Günlük ödül / check-in: {d}"]
+    lines.append(f"🌾 Claim / farm: {r['claims']} kez toplandı" if r["claims"] else
+                 ("🌾 Claim / farm: henüz hazır değil (sayaç çalışıyor)" if r.get("wait") else "🌾 Claim / farm: hazır değildi ya da yok"))
+    if r["gains"]:
+        lines.append("💰 Kazanç: " + ", ".join(r["gains"][:3]))
+    if c.get("tasks", True):
+        lines.append(f"📋 Görev: {r['tasks']} işlem" + (f", {r['joins']} kanal katılımı" if r["joins"] else ""))
+    else:
+        lines.append("📋 Görev: kapalı (sadece ödül toplandı)")
+    if r["problems"]:
+        lines.append("⚠️ Yapamadıkları: " + " · ".join(p[:80] for p in r["problems"][:3]))
+    lines.append(f"⏰ Sonraki tur: {wd_fmt_clock(c['next'])} ({wd_fmt_dur(c['next'] - time.time())} sonra, {how})")
+    return "\n".join(lines)
+
+
+async def wd_apply_result(name: str, r: dict):
+    c = wd_cfg(name, create=True)
+    now = time.time()
+    day = wd_day_key(now)
+    if r["daily"] in ("alındı", "zaten"):
+        if c.get("daily_day") != day:
+            yday = wd_day_key(now - 86400)
+            if r["daily"] == "alındı":
+                c["streak"] = int(c.get("streak") or 0) + 1 if c.get("daily_day") == yday else 1
+            c["daily_day"] = day
+    elif r["opened"] and WD_RUN.get("why") == "günlük":
+        # günlük ödül bulunamadı: bugün bir kez denendi say, claim turlarında yine aranır
+        c["daily_day"] = day
+    c["next"], how = wd_schedule(c, r)
+    c["last"] = now
+    t = c.get("today") or {}
+    if t.get("day") != day:
+        t = {"day": day, "runs": 0, "claims": 0, "tasks": 0, "gains": [], "daily": "", "err": 0}
+    t["runs"] += 1
+    t["claims"] += r["claims"]
+    t["tasks"] += r["tasks"]
+    t["gains"] = (t.get("gains", []) + r["gains"])[-6:]
+    if r["daily"] in ("alındı", "zaten"):
+        t["daily"] = r["daily"]
+    if not r["opened"]:
+        t["err"] = int(t.get("err") or 0) + 1
+    c["today"] = t
+    c["hist"] = (c.get("hist", []) + [{"t": now, "d": r["daily"], "c": r["claims"], "k": r["tasks"],
+                                        "ok": r["opened"], "w": int(r["wait"] or 0)}])[-12:]
+    paused = False
+    if int(c.get("fails") or 0) >= 5:
+        c["on"] = False
+        paused = True
+    await wd_persist()
+    mode = WIZ_DAY.get("report", "ozet")
+    text = wd_report_text(name, r, c, how)
+    if paused:
+        text += "\n⏸ Üst üste 5 kez açılamadı, bu bot günlük listede durduruldu. Açmak için: günlük " + name + " devam"
+    important = r["daily"] == "alındı" or r["claims"] or r["gains"] or not r["opened"] or paused
+    if mode == "detay" or (mode == "ozet" and important) or (WD_RUN.get("manual")):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Ayarlar", callback_data=f"gd:s:{name}"[:64]),
+                                    InlineKeyboardButton("▶️ Şimdi tekrar", callback_data=f"gd:r:{name}"[:64])]])
+        try:
+            await bot_app.bot.send_message(ADMIN_USER_ID, text, reply_markup=kb, disable_web_page_preview=True)
+        except Exception as e:
+            print("[GÜNLÜK RAPOR]", repr(e), flush=True)
+
+
+_wd_finish_base = wiz_finish
+
+
+async def wiz_finish(name: str, outcome: str, notes: list, source: str):
+    if source == "gunluk":
+        r = wd_analyze(name, outcome, notes)
+        WD_RUN["done"] = True
+        link, _src = wiz_best_ref() if WIZ_CUR else ("", "")
+        if link and not (REFS.get(name) or {}).get("link"):
+            REFS[name] = {"link": link, "src": "sihirbaz/günlük", "t": time.time()}
+            await persist_refs()
+        await wd_apply_result(name, r)
+        return
+    await _wd_finish_base(name, outcome, notes, source)
+    # sihirbazın açabildiği her yeni mini app günlük listeye eklenir (istersen: günlük oto kapalı)
+    try:
+        text_all = "\n".join(notes)
+        opened = "Sayfa açıldı" in text_all
+        if WIZ_DAY.get("auto_add", True) and opened and outcome != "err" and not wd_cfg(name):
+            c = wd_cfg(name, create=True)
+            r = wd_analyze(name, outcome, notes)
+            c["next"] = time.time() + (r["wait"] + random.randint(120, 600) if r.get("wait") else WD_DEFAULT_H * 3600)
+            c["last"] = time.time()
+            await wd_persist()
+            await bot_app.bot.send_message(
+                ADMIN_USER_ID, f"🌅 @{name} günlük rutine eklendi: günlük ödül + claim takibi. "
+                               f"İlk claim turu {wd_fmt_clock(c['next'])}. Ayar: günlük {name}")
+    except Exception as e:
+        print("[GÜNLÜK OTO EKLE]", repr(e), flush=True)
+
+
+async def wd_run(bot: str, why: str = "claim", manual: bool = False):
+    c = wd_cfg(bot, create=True)
+    WD_RUN.clear()
+    c.pop("now", None)
+    WD_RUN.update({"bot": bot, "t0": time.time(), "cfg": dict(c), "why": why, "manual": manual or why == "elle"})
+    try:
+        res = await asyncio.wait_for(v8_run_and_track(bot, source="gunluk"), V8_JOB_TIMEOUT + 300)
+        outcome, notes = res if isinstance(res, tuple) else ("err", ["sonuç yok"])
+    except asyncio.CancelledError:
+        WD_RUN.clear()
+        raise
+    except Exception as e:
+        outcome, notes = "err", [f"Hata: {type(e).__name__}"]
+    try:
+        if not WD_RUN.get("done"):
+            # tarayıcıya hiç girilmedi (atlandı / hata) → yine de sonraki tur kurulur
+            await wd_apply_result(bot, {"opened": False, "good": False, "daily": "yok", "claims": 0, "tasks": 0,
+                                        "joins": 0, "gains": [], "wait": None, "problems": [],
+                                        "why": (uni_problem_tr(notes) or (notes[0] if notes else "hata"))[:160],
+                                        "outcome": "err"})
+    finally:
+        WD_RUN.clear()
+    return outcome, notes
+
+
+def wd_digest_text() -> str:
+    day = wd_day_key()
+    bots = WIZ_DAY.get("bots", {})
+    if not bots:
+        return "🌅 Günlük listede bot yok. Eklemek için: günlük ekle botadi  (ya da: günlük ekle hepsi)"
+    lines = [f"📅 GÜNLÜK RAPOR — {day}", ""]
+    n_daily = n_claim = n_err = 0
+    for b, c in sorted(bots.items()):
+        t = c.get("today") or {}
+        if t.get("day") != day:
+            t = {}
+        dly = t.get("daily") or ""
+        n_daily += dly in ("alındı", "zaten")
+        n_claim += int(t.get("claims") or 0)
+        n_err += 1 if t.get("err") else 0
+        icon = "⏸" if not c.get("on", True) else ("✅" if dly else ("❌" if t.get("err") else "⏳"))
+        part = [f"günlük: {dly or ('kapalı' if not c.get('daily', True) else 'henüz yok')}"]
+        if t.get("claims"):
+            part.append(f"claim {t['claims']}")
+        if t.get("tasks"):
+            part.append(f"görev {t['tasks']}")
+        if c.get("streak"):
+            part.append(f"seri {c['streak']}")
+        if t.get("gains"):
+            part.append(", ".join(t["gains"][-2:]))
+        if c.get("on", True) and c.get("next"):
+            part.append(f"sonraki {wd_fmt_clock(c['next'])}")
+        lines.append(f"{icon} @{b} — " + " · ".join(part))
+    lines += ["", f"Toplam: {n_daily}/{len(bots)} günlük ödül · {n_claim} claim · {n_err} açılamayan"]
+    return "\n".join(lines)[:3900]
+
+
+def wd_card(bot: str):
+    c = wd_cfg(bot)
+    if not c:
+        return f"@{bot} günlük listede yok. Eklemek için: günlük ekle {bot}", None
+    claim = "oto (ekrandaki sayaca göre)" if c.get("claim") == "oto" else f"her {c.get('claim')} saatte bir"
+    last = c.get("hist", [])[-1:] or [{}]
+    h = last[0]
+    lines = [f"⚙️ @{bot} — günlük rutin ayarları",
+             f"Durum: {'açık' if c.get('on', True) else 'DURDURULDU'}",
+             f"⏱ Claim / farm: {claim}",
+             f"📅 Günlük ödül / check-in: {'açık' if c.get('daily', True) else 'kapalı'}"
+             + (f" · bugün: {c['today'].get('daily')}" if (c.get('today') or {}).get('day') == wd_day_key()
+                and c['today'].get('daily') else ""),
+             f"📋 Görev yapma: {'açık, turda en fazla ' + str(c.get('task_max', 5)) if c.get('tasks', True) else 'kapalı'}",
+             f"🔥 Seri: {c.get('streak', 0)} gün"]
+    if h:
+        lines.append(f"Son tur: {wd_fmt_dur(time.time() - h['t'])} önce — "
+                     + ("açılamadı" if not h.get("ok") else f"günlük {h.get('d')}, claim {h.get('c')}, görev {h.get('k')}"))
+    if c.get("on", True) and c.get("next"):
+        lines.append(f"Sonraki: {wd_fmt_clock(c['next'])} ({wd_fmt_dur(c['next'] - time.time())} sonra)")
+    b = bot[:40]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⏱ Claim: {c.get('claim')}" + ("" if c.get("claim") == "oto" else " sa"), callback_data=f"gd:c:{b}"),
+         InlineKeyboardButton(f"📅 Günlük: {'açık' if c.get('daily', True) else 'kapalı'}", callback_data=f"gd:d:{b}")],
+        [InlineKeyboardButton(f"📋 Görev: {'açık' if c.get('tasks', True) else 'kapalı'}", callback_data=f"gd:t:{b}"),
+         InlineKeyboardButton(f"🔢 Görev limiti: {c.get('task_max', 5)}", callback_data=f"gd:n:{b}")],
+        [InlineKeyboardButton("▶️ Şimdi çalıştır", callback_data=f"gd:r:{b}"),
+         InlineKeyboardButton("⏸ Durdur" if c.get("on", True) else "▶️ Devam", callback_data=f"gd:p:{b}"),
+         InlineKeyboardButton("🗑 Çıkar", callback_data=f"gd:x:{b}")],
+    ])
+    return "\n".join(lines), kb
+
+
+def wd_list():
+    bots = WIZ_DAY.get("bots", {})
+    head = (f"🌅 GÜNLÜK RUTİN: {'AÇIK' if WIZ_DAY.get('on') else 'KAPALI'} · rapor: {WIZ_DAY.get('report')}"
+            + (f" · gece {WIZ_DAY['night'][0]}-{WIZ_DAY['night'][1]} arası çalışmaz" if len(WIZ_DAY.get('night') or []) == 2 else "")
+            + f" · yeni mini app'ler otomatik eklenir: {'evet' if WIZ_DAY.get('auto_add', True) else 'hayır'}")
+    if WD_RUN.get("bot"):
+        head += f"\n▶️ Şu an çalışıyor: @{WD_RUN['bot']} ({WD_RUN.get('why')})"
+    if not bots:
+        return head + "\n\nListe boş. Eklemek için: günlük ekle botadi  ya da  günlük ekle hepsi\n\n" + WD_HELP, None
+    lines = [head, ""]
+    rows = []
+    items = sorted(bots.items(), key=lambda kv: float(kv[1].get("next") or 0))
+    for b, c in items:
+        t = c.get("today") or {}
+        dly = t.get("daily") if t.get("day") == wd_day_key() else ""
+        st = "⏸" if not c.get("on", True) else ("✅" if dly else "⏳")
+        nx = f"{wd_fmt_clock(c['next'])}" if c.get("next") and c.get("on", True) else "-"
+        lines.append(f"{st} @{b} · claim {c.get('claim')}{'' if c.get('claim') == 'oto' else ' sa'} · "
+                     f"görev {'açık' if c.get('tasks', True) else 'kapalı'} · sonraki {nx}")
+        if len(rows) < 24:
+            rows.append(InlineKeyboardButton(f"⚙️ {b}"[:30], callback_data=f"gd:s:{b[:40]}"))
+    kb = InlineKeyboardMarkup([rows[i:i + 2] for i in range(0, len(rows), 2)]) if rows else None
+    return "\n".join(lines)[:3800] + "\n\nAyarlamak için bir bota dokun ya da yaz: günlük botadi", kb
+
+
+WD_HELP = (
+    "🌅 GÜNLÜK RUTİN (günlük ödül · check-in · claim · görev)\n"
+    "• günlük — liste + ayar butonları  ·  günlük rapor — bugünün raporu\n"
+    "• günlük ekle bot1 bot2  ·  günlük ekle hepsi  ·  günlük sil botadi\n"
+    "• günlük botadi — o botun ayar kartı (butonlarla değiştir)\n"
+    "• günlük botadi claim oto | 4  (oto = ekrandaki sayaca göre, sayı = saat)\n"
+    "• günlük botadi görev açık | kapalı | 10  ·  günlük botadi ödül açık | kapalı\n"
+    "• günlük botadi durdur | devam  ·  günlük şimdi botadi\n"
+    "• günlük aç | kapat  ·  günlük rapor sessiz | özet | detay\n"
+    "• günlük gece 2-7 (bu saatlerde çalışmaz) | günlük gece kapalı  ·  günlük saat 3 (gün dönümü)\n"
+    "• günlük oto açık | kapalı — sihirbazın açtığı yeni mini app'ler otomatik eklensin mi"
+)
+
+
+def wd_bot_names(raw_tokens: list) -> list:
+    out = []
+    for t in raw_tokens:
+        t = re.sub(r"^https?://t\.me/", "", t.strip().strip(",")).split("/")[0].split("?")[0].lstrip("@").lower()
+        if re.fullmatch(r"[a-z0-9_]{3,40}", t):
+            out.append(t)
+    return out
+
+
+async def wd_set(bot: str, key: str, val: str) -> str:
+    c = wd_cfg(bot)
+    if not c:
+        return f"@{bot} günlük listede yok. Önce: günlük ekle {bot}"
+    on = val in ("ac", "acik", "on", "evet", "1")
+    off = val in ("kapat", "kapali", "off", "hayir", "0")
+    if key in ("claim", "farm", "topla"):
+        if val in ("oto", "otomatik", "auto"):
+            c["claim"] = "oto"
+        else:
+            try:
+                h = float(val.replace(",", "."))
+            except ValueError:
+                return "Kullanım: günlük botadi claim oto | 4"
+            if h < 0.5 or h > 48:
+                return "Claim aralığı 0.5 ile 48 saat arasında olmalı."
+            c["claim"] = int(h) if h == int(h) else h
+            c["next"] = min(float(c.get("next") or 0) or time.time() + h * 3600, time.time() + h * 3600)
+    elif key in ("gorev", "gorevler", "task", "tasks"):
+        if on:
+            c["tasks"] = True
+        elif off:
+            c["tasks"] = False
+        elif val.isdigit():
+            c["tasks"], c["task_max"] = True, max(1, min(30, int(val)))
+        else:
+            return "Kullanım: günlük botadi görev açık | kapalı | 10"
+    elif key in ("odul", "daily", "gunluk", "checkin"):
+        if not (on or off):
+            return "Kullanım: günlük botadi ödül açık | kapalı"
+        c["daily"] = on
+    elif key in ("durdur", "dur", "kapat"):
+        c["on"] = False
+    elif key in ("devam", "baslat", "ac"):
+        c["on"], c["fails"], c["next"] = True, 0, time.time()
+    else:
+        return "Bilinmeyen ayar. " + WD_HELP
+    await wd_persist()
+    return wd_card(bot)[0]
+
+
+async def wd_start_now(bot: str) -> str:
+    c = wd_cfg(bot, create=True)
+    if WD_RUN.get("bot") or WIZ_QUEUE or (globals().get("WIZ_RUN_LOCK") is not None and WIZ_RUN_LOCK.locked()):
+        c["on"], c["now"] = True, True
+        await wd_persist()
+        return f"⏳ Şu an başka bir iş çalışıyor. @{bot} günlük sırasında en öne alındı, o bitince başlar."
+    c["on"] = True
+    c["next"] = 0
+    c["last"] = 0
+    await wd_persist()
+    spawn(wd_run(bot, "elle", manual=True))
+    return f"▶️ @{bot} günlük turu başladı (günlük ödül → claim → {'görevler' if c.get('tasks', True) else 'görev yok'}). Bitince rapor gelir."
+
+
+async def wiz_day_cmd(msg, text: str, low: str) -> bool:
+    toks = low.split()
+    if not toks or toks[0] not in ("gunluk", "gunlukler", "daily", "rutinler"):
+        return False
+    raw = text.split()
+    args = toks[1:]
+    if not args or args[0] in ("liste", "list"):
+        t, kb = wd_list()
+        await msg.reply_text(t, reply_markup=kb)
+        return True
+    a0 = args[0]
+    if a0 in ("ac", "acik", "on", "kapat", "kapali", "off") and len(args) == 1:
+        WIZ_DAY["on"] = a0 in ("ac", "acik", "on")
+        await wd_persist()
+        await msg.reply_text(f"🌅 Günlük rutin {'AÇIK' if WIZ_DAY['on'] else 'KAPALI'}."
+                             + (f" {len(WIZ_DAY['bots'])} bot takipte." if WIZ_DAY["on"] else ""))
+        return True
+    if a0 in ("yardim", "komutlar", "help"):
+        await msg.reply_text(WD_HELP)
+        return True
+    if a0 == "rapor":
+        if len(args) > 1 and args[1] in ("sessiz", "ozet", "detay"):
+            WIZ_DAY["report"] = args[1]
+            await wd_persist()
+            await msg.reply_text({"sessiz": "Rapor: sessiz — tur başına mesaj yok, sadece akşam gün raporu.",
+                                  "ozet": "Rapor: özet — sadece ödül alınınca / hata olunca mesaj.",
+                                  "detay": "Rapor: detay — her turdan sonra mesaj."}[args[1]])
+        else:
+            await msg.reply_text(wd_digest_text())
+        return True
+    if a0 in ("sessiz", "ozet", "detay"):
+        WIZ_DAY["report"] = a0
+        await wd_persist()
+        await msg.reply_text(f"Rapor modu: {a0}")
+        return True
+    if a0 == "gece":
+        if len(args) > 1 and args[1] in ("kapali", "kapat", "yok"):
+            WIZ_DAY["night"] = []
+        else:
+            m = re.match(r"(\d{1,2})\s*-\s*(\d{1,2})", " ".join(args[1:]))
+            if not m:
+                await msg.reply_text("Kullanım: günlük gece 2-7  (02:00–07:00 arası çalışmaz)  ·  günlük gece kapalı")
+                return True
+            WIZ_DAY["night"] = [int(m.group(1)) % 24, int(m.group(2)) % 24]
+        await wd_persist()
+        await msg.reply_text("Gece arası: " + (f"{WIZ_DAY['night'][0]}:00–{WIZ_DAY['night'][1]}:00 çalışmaz"
+                                               if WIZ_DAY["night"] else "kapalı (her saat çalışır)"))
+        return True
+    if a0 == "saat" and len(args) > 1 and args[1].isdigit():
+        WIZ_DAY["saat"] = int(args[1]) % 24
+        await wd_persist()
+        await msg.reply_text(f"Gün dönümü saati {WIZ_DAY['saat']:02d}:00 (bu saatten sonra yeni günün günlük ödülü alınır).")
+        return True
+    if a0 == "oto" and len(args) > 1:
+        WIZ_DAY["auto_add"] = args[1] in ("ac", "acik", "on", "evet")
+        await wd_persist()
+        await msg.reply_text("Yeni mini app'ler günlük listeye " + ("otomatik eklenecek." if WIZ_DAY["auto_add"] else "eklenmeyecek."))
+        return True
+    if a0 == "ekle":
+        names = wd_bot_names(raw[2:])
+        if args[1:2] == ["hepsi"]:
+            names = list(dict.fromkeys(
+                [b for b in v8_ap_bots()] +
+                [b for b, s in WIZ_SUM.items() if "Açılamadı" not in str(s.get("summary", ""))
+                 and "mini uygulama değil" not in str(s.get("summary", ""))]))
+        if not names:
+            await msg.reply_text("Kullanım: günlük ekle bot1 bot2  ·  günlük ekle hepsi")
+            return True
+        added = []
+        for i, b in enumerate(names):
+            if not wd_cfg(b):
+                c = wd_cfg(b, create=True)
+                c["next"] = time.time() + 60 + i * 300   # hepsi aynı anda açılmasın (5 dk arayla)
+                added.append(b)
+        await wd_persist()
+        await msg.reply_text((f"🌅 {len(added)} bot günlük rutine eklendi: " + ", ".join("@" + b for b in added[:30])
+                              if added else "Bunlar zaten listede.")
+                             + "\nİlk turlar sırayla, 5 dk arayla başlar. Ayar: günlük")
+        return True
+    if a0 in ("sil", "cikar"):
+        names = wd_bot_names(raw[2:])
+        n = sum(1 for b in names if WIZ_DAY["bots"].pop(b, None) is not None)
+        await wd_persist()
+        await msg.reply_text(f"{n} bot günlük listeden çıkarıldı." if n else "Bu bot listede yok. Bak: günlük")
+        return True
+    if a0 in ("simdi", "calistir", "baslat") and len(args) > 1:
+        await msg.reply_text(await wd_start_now(wd_bot_names(raw[2:3])[0] if wd_bot_names(raw[2:3]) else args[1]))
+        return True
+    names = wd_bot_names(raw[1:2])
+    if names:
+        b = names[0]
+        if len(args) == 1:
+            t, kb = wd_card(b)
+            await msg.reply_text(t, reply_markup=kb)
+            return True
+        if args[1] in ("simdi", "calistir"):
+            await msg.reply_text(await wd_start_now(b))
+            return True
+        await msg.reply_text(await wd_set(b, args[1], args[2] if len(args) > 2 else ""))
+        return True
+    await msg.reply_text(WD_HELP)
+    return True
+
+
+_wd_cb_base = on_callback
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not (q and q.data and q.data.startswith("gd:")):
+        return await _wd_cb_base(update, context)
+    if not update.effective_user or update.effective_user.id != ADMIN_USER_ID:
+        await q.answer("Yetkin yok.")
+        return
+    _, op, bot = (q.data.split(":", 2) + ["", ""])[:3]
+    c = wd_cfg(bot)
+    note = ""
+    if op == "r":
+        note = await wd_start_now(bot)
+        await q.answer("Başladı")
+        await bot_app.bot.send_message(ADMIN_USER_ID, note)
+        return
+    if op != "s" and not c:
+        await q.answer("Bu bot listede yok.")
+        return
+    if op == "c":
+        cur = c.get("claim")
+        i = WD_CLAIM_STEPS.index(cur) if cur in WD_CLAIM_STEPS else 0
+        c["claim"] = WD_CLAIM_STEPS[(i + 1) % len(WD_CLAIM_STEPS)]
+        if c["claim"] != "oto":
+            c["next"] = min(float(c.get("next") or 0) or 9e12, time.time() + c["claim"] * 3600)
+    elif op == "d":
+        c["daily"] = not c.get("daily", True)
+    elif op == "t":
+        c["tasks"] = not c.get("tasks", True)
+    elif op == "n":
+        cur = int(c.get("task_max") or 5)
+        nx = [v for v in WD_TASK_STEPS if v > cur]
+        c["task_max"] = nx[0] if nx else WD_TASK_STEPS[0]
+        c["tasks"] = True
+    elif op == "p":
+        c["on"] = not c.get("on", True)
+        if c["on"]:
+            c["fails"], c["next"] = 0, time.time() + 60
+    elif op == "x":
+        WIZ_DAY["bots"].pop(bot, None)
+        await wd_persist()
+        await q.answer("Çıkarıldı")
+        try:
+            await q.edit_message_text(f"🗑 @{bot} günlük listeden çıkarıldı.")
+        except Exception:
+            pass
+        return
+    if op != "s":
+        await wd_persist()
+    await q.answer()
+    t, kb = wd_card(bot)
+    try:
+        if op == "s":
+            await bot_app.bot.send_message(ADMIN_USER_ID, t, reply_markup=kb)
+        else:
+            await q.edit_message_text(t, reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def wd_tick():
+    now = time.time()
+    # akşam gün raporu (sessiz/özet modda tek mesaj)
+    lt = wd_now_local()
+    today = time.strftime("%Y-%m-%d", lt)
+    if WIZ_DAY.get("bots") and lt.tm_hour >= int(WIZ_DAY.get("digest_h", 21)) and WIZ_DAY.get("digest_day") != today:
+        WIZ_DAY["digest_day"] = today
+        await wd_persist()
+        try:
+            await bot_app.bot.send_message(ADMIN_USER_ID, wd_digest_text())
+        except Exception as e:
+            print("[GÜNLÜK RAPOR]", repr(e), flush=True)
+    if not WIZ_DAY.get("on") or WD_RUN.get("bot") or wd_in_night():
+        return
+    lock = globals().get("WIZ_RUN_LOCK")
+    if (lock is not None and lock.locked()) or WIZ_QUEUE:
+        return   # elle başlatılan / otopilot işi varsa beklenir, sıraya yığılmaz
+    try:
+        if wiz_mem_used_mb() > wiz_mem_limit_mb() * 0.8:
+            return
+    except Exception:
+        pass
+    due = wd_due_list(now)
+    if not due:
+        return
+    bot, why = due[0]
+    spawn(wd_run(bot, why))
+
+
+async def wd_loop():
+    await asyncio.sleep(120)
+    print("[GÜNLÜK] planlayıcı çalışıyor", flush=True)
+    while True:
+        try:
+            await wd_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("[GÜNLÜK LOOP]", repr(e), flush=True)
+        await asyncio.sleep(45)
+
+
+_wd_load_base = load_v8_ap
+
+
+async def load_v8_ap():
+    await _wd_load_base()
+    await wd_load()
+    if not WD_STARTED["on"]:
+        WD_STARTED["on"] = True
+        spawn(wd_loop())
+        # V8'de kapalı kalan eski döngüler: API ile otomatik toplama (/topla) ve buton rutinleri (/rutin)
+        if os.getenv("WIZ_API_CLAIMS", "1").strip() != "0":
+            spawn(claims_loop())
+        if ROUTINES_ON:
+            spawn(routine_loop())
+        print(f"[GÜNLÜK] başlatıldı · API toplama: {len(CLAIMS)} · buton rutini: {len(ROUTINES)}", flush=True)
+
+
 async def main():
     global tg_client, http_session, bot_app, TG_LOCK, INSPECT_LOCK, APP_LOCK
 
@@ -8372,7 +9243,7 @@ async def main():
     await load_v8_ap()
     spawn(v8_autopilot_loop())
     print("[V8] otopilot döngüsü hazır (kapalı; 'otopilot aç' ile çalışır)", flush=True)
-    print("[V8] eski routine/claims loop bu sürümde başlatılmadı", flush=True)
+    print("[V9.6] günlük rutin + API toplama + buton rutinleri load_v8_ap içinde başlatılıyor", flush=True)
 
     try:
         await bot_app.bot.send_message(
