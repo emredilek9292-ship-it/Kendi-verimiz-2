@@ -5616,6 +5616,11 @@ async def v8_browser(name, url, state):
                         nav_links.append(u)
                         await route.abort()
                         return
+                    # V9.6.4: bellek %65'i geçtiyse resim/medya/font/ağır dosya yükleme
+                    if wiz_mem_used_mb() > wiz_mem_limit_mb() * 0.65 and (
+                            req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
+                        await route.abort()
+                        return
                     if host not in cache:
                         cache[host] = await v8_public(u)
                     if cache[host] and urlparse(u).scheme == "https":
@@ -6802,11 +6807,15 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
 # Unity/Phaser gibi oyunlarda butonlar HTML değil, resim içinde. Bu modda ekran görüntüsü
 # Groq'un görüntü okuyabilen modeline gönderilir; model nereye dokunulacağını söyler.
 
+# V9.6.4: JS yığın limiti 256→128 MB (512 MB'lık sunucuda 256, tarayıcıyı doldurup
+# bekçinin devreye girmesinden ÖNCE belleği bitiriyordu; 128 ile sayfa içi bellek
+# erken durur, sunucu güvende kalır). WIZ_JS_HEAP_MB ile istenirse artırılabilir.
 WIZ_CHROME_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--mute-audio",
                    "--no-first-run", "--renderer-process-limit=1", "--disable-background-networking",
                    "--disable-site-isolation-trials", "--disable-features=site-per-process,IsolateOrigins,Translate",
                    "--disable-software-rasterizer", "--disable-breakpad", "--no-zygote",
-                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "256") or "256")]
+                   "--disable-remote-fonts",
+                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "128") or "128")]
 if os.getenv("WIZ_CHROME_SINGLE", "").strip() in ("1", "true", "evet"):
     WIZ_CHROME_ARGS.append("--single-process")   # ~30 MB daha az bellek, biraz daha kararsız
 
@@ -6960,7 +6969,12 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
     retry_needed = False
     async with async_playwright() as p:
         state["stage"] = "chromium_baslatma"
-        browser = await p.chromium.launch(headless=True, timeout=60000, args=WIZ_CHROME_ARGS)
+        # V9.6.4: hafif modda tarayıcı DAHA CİMRİ açılır: tek süreç (−30 MB) + resim motoru
+        # tamamen kapalı (CSS'le yüklenen resimler de engellenir).
+        lite_args = list(WIZ_CHROME_ARGS)
+        if WIZ_LITE.get("on"):
+            lite_args += ["--single-process", "--blink-settings=imagesEnabled=false"]
+        browser = await p.chromium.launch(headless=True, timeout=60000, args=lite_args)
         context = None
         try:
             context = await uni_new_context(browser, name)
@@ -6980,8 +6994,12 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
                             wiz_add_refs(u, "yönlendirme")
                         await route.abort()
                         return
-                    if WIZ_LITE.get("on") and (req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
-                        await route.abort()   # hafif mod: belleği dolduran dosyalar yüklenmez
+                    # V9.6.4: hafif mod VEYA bellek %65'i geçtiyse (otomatik sıkı mod)
+                    # resim/medya/font ve ağır oyun dosyaları yüklenmez — tarayıcı
+                    # dolmadan önce kısılır, bot çökmez.
+                    tight = WIZ_LITE.get("on") or wiz_mem_used_mb() > wiz_mem_limit_mb() * 0.65
+                    if tight and (req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
+                        await route.abort()
                         return
                     if host not in cache:
                         cache[host] = await v8_public(u)
