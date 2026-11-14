@@ -6392,7 +6392,11 @@ async def uni_screen(page) -> str:
 
 
 async def uni_click(page, c: dict) -> bool:
-    """DÜZELTME: 5 farklı yöntemle tıklar; hiçbiri olmazsa 'yapamadım' listesine yazar."""
+    """DÜZELTME: 7 farklı yöntemle tıklar; hiçbiri olmazsa 'yapamadım' listesine yazar.
+    V9.6.5: (1) koordinat tıklamaları ÖNCE elementFromPoint ile doğrulanır — butonun üstü
+    kapalıysa koordinat tıklaması örtüye gidiyordu (tıklandı sanılıyordu, uygulama almıyordu);
+    (2) tam pointer/touch olay zinciri doğrudan butona gönderilir — pointerdown dinleyen
+    uygulamalar ve örtü altındaki butonlar artık tepki verir."""
     loc = page.locator(f'[data-uni="{c["id"]}"]')
     try:
         cnt = await loc.count()
@@ -6403,24 +6407,79 @@ async def uni_click(page, c: dict) -> bool:
             await loc.first.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
+        # 1) gerçek tarayıcı tıklaması (en güvenilir)
         try:
             await loc.first.click(timeout=5000, no_wait_after=True)
             return True
         except Exception:
             pass
-        try:
-            await loc.first.click(timeout=3000, no_wait_after=True, force=True)
-            return True
-        except Exception:
-            pass
+        # V9.6.5: koordinatla tıklamadan ÖNCE üstü kapalı mı kontrol edilir
+        blocked = False
         try:
             box = await loc.first.bounding_box()
             if box and box["width"] > 0:
                 x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-                try:
-                    await page.touchscreen.tap(x, y)
-                except Exception:
-                    await page.mouse.click(x, y)
+                top = await page.evaluate(
+                    "(o) => {"
+                    "  const el = document.querySelector('[data-uni=' + JSON.stringify(o.id) + ']');"
+                    "  const t = document.elementFromPoint(o.xy[0], o.xy[1]);"
+                    "  if (!t) return 'none';"
+                    "  let n = t;"
+                    "  while (n) { if (n === el) return 'ok'; n = n.parentElement; }"
+                    "  return 'blocked';"
+                    "}", {"xy": [x, y], "id": c["id"]})
+                if top == "ok":
+                    # 2) üstü açık: koordinat tıklaması güvenli
+                    try:
+                        await page.touchscreen.tap(x, y)
+                    except Exception:
+                        await page.mouse.click(x, y)
+                    return True
+                blocked = (top == "blocked")
+        except Exception:
+            pass
+        # V9.6.5: tam pointer/touch zincri — DOĞRUDAN butona, koordinat/örtüden etkilenmez
+        ptr_js = (
+            "(id) => {"
+            "  const el = document.querySelector('[data-uni=' + JSON.stringify(id) + ']');"
+            "  if (!el) return false;"
+            "  const r = el.getBoundingClientRect();"
+            "  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;"
+            "  const base = {bubbles: true, cancelable: true, composed: true, view: window,"
+            "                clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0, buttons: 1};"
+            "  const pt = Object.assign({pointerId: 1, pointerType: 'touch', isPrimary: true,"
+            "                            width: 8, height: 8, pressure: 0.5}, base);"
+            "  try { el.dispatchEvent(new PointerEvent('pointerover', pt)); } catch (e) {}"
+            "  try { el.dispatchEvent(new PointerEvent('pointerenter', pt)); } catch (e) {}"
+            "  el.dispatchEvent(new PointerEvent('pointerdown', pt));"
+            "  try { if (window.TouchEvent) el.dispatchEvent(new TouchEvent('touchstart',"
+            "      {bubbles: true, cancelable: true, composed: true})); } catch (e) {}"
+            "  try { el.dispatchEvent(new PointerEvent('pointermove', pt)); } catch (e) {}"
+            "  el.dispatchEvent(new PointerEvent('pointerup', pt));"
+            "  try { if (window.TouchEvent) el.dispatchEvent(new TouchEvent('touchend',"
+            "      {bubbles: true, cancelable: true, composed: true})); } catch (e) {}"
+            "  el.dispatchEvent(new MouseEvent('mouseup', base));"
+            "  el.dispatchEvent(new MouseEvent('click', base));"
+            "  return true;"
+            "}"
+        )
+        if blocked:
+            # 3) butonun üstü KAPALI — koordinat tıklaması örtüye gider; zincri butona gönder
+            try:
+                if await page.evaluate(ptr_js, c["id"]):
+                    return True
+            except Exception:
+                pass
+        else:
+            # 4) koordinat bilgisi yoksa zorla tıkla
+            try:
+                await loc.first.click(timeout=3000, no_wait_after=True, force=True)
+                return True
+            except Exception:
+                pass
+        # 5) tam pointer zincri her durumda denenir
+        try:
+            if await page.evaluate(ptr_js, c["id"]):
                 return True
         except Exception:
             pass
@@ -6431,7 +6490,8 @@ async def uni_click(page, c: dict) -> bool:
             pass
     try:
         ok = await page.evaluate(
-            "(id) => { const el = document.querySelector('[data-uni=\"' + id + '\"]'); if (!el) return false; el.click(); return true; }",
+            "(id) => { const el = document.querySelector('[data-uni=' + JSON.stringify(id) + ']');"
+            " if (!el) return false; el.click(); return true; }",
             c["id"])
         if ok:
             return True
