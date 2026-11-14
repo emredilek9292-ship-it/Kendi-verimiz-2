@@ -2774,10 +2774,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🛑 Durdur", callback_data="ui:dur")],
     ])
     await update.effective_message.reply_text(
-        "🪄 Airdrop / oyun bot radarı (V9 AI merkezli)\n\n"
-        "👉 Link veya @bot gönder → giriş + referans + ödül toplamayı kendisi yapar.\n"
-        "Kararlar yapay zekaya bırakıldı (cüzdan/ödeme/davet güvenlik kodda kalır).\n\n"
-        "Aşağıdaki butonlarla yönet:",
+        "🪄 Airdrop radarı — AI otomatik mod\n\n"
+        "Mini-app'te claim, daily, farm, görev, kanal katılımı otomatik.\n"
+        "Sadece ödeme/cüzdan/Stars/TON/davet engelli.\n\n"
+        "Link veya @bot gönder → AI halleder. Butonlarla yönet:",
         reply_markup=kb,
     )
 
@@ -3072,31 +3072,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if op == "status":
             n_bots = sum(1 for k in seen if k.startswith("bot:"))
             await q.message.reply_text(
-                f"📊 Durum · AI merkezli\nDinlenen: {len(ACTIVE_SOURCES)} · bilinen bot: {n_bots}\n"
-                f"Günlük: {len(WIZ_DAY.get('bots') or {})} · Otopilot: {autopilot_short()}\n"
-                f"AI adım: {WIZ_AI_STEPS} · bütçe: {WIZ_AI_BUDGET_S}s · Groq: {'açık' if GROQ_API_KEY else 'kapalı'}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🌅 Günlük", callback_data="ui:gunluk"),
-                     InlineKeyboardButton("🧙 Sihirbaz", callback_data="ui:sihirbaz")],
-                ]))
+                f"📊 AI otomatik mod\nDinlenen: {len(ACTIVE_SOURCES)} · bot: {n_bots}\n"
+                f"AI adım: {WIZ_AI_STEPS} · bütçe: {WIZ_AI_BUDGET_S}s · join max: {UNI_JOIN_MAX}\n"
+                f"Groq: {'açık' if GROQ_API_KEY else 'kapalı'}")
         elif op == "gunluk":
             try:
                 t, kb = wd_list()
                 await q.message.reply_text(t, reply_markup=kb)
             except Exception as e:
-                await q.message.reply_text(f"Günlük listesi: {e}\nYaz: günlük")
+                await q.message.reply_text(f"Günlük: {e}\nYaz: günlük")
         elif op == "sihirbaz":
             await q.message.reply_text(
-                f"🧙 Sihirbaz (AI)\n@bot veya link gönder.\nAI: {'AÇIK' if V8_AP.get('wiz_ai') else 'kapalı'} · adım {WIZ_AI_STEPS}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Durum", callback_data="ui:status"),
-                     InlineKeyboardButton("🛑 Durdur", callback_data="ui:dur")],
-                ]))
+                f"🧙 Sihirbaz AI otomatik\n@bot veya link gönder.\nAdım {WIZ_AI_STEPS} · join açık")
         elif op == "otopilot":
             await q.message.reply_text(f"Otopilot: {autopilot_short()}")
         elif op == "refs":
             if not REFS:
-                await q.message.reply_text("Kayıtlı referans yok.")
+                await q.message.reply_text("Referans yok.")
             else:
                 lines = ["🔗 Referanslar:"] + [f"@{b}: {v.get('link')}" for b, v in list(REFS.items())[:40]]
                 await q.message.reply_text("\n".join(lines)[:3900])
@@ -3108,8 +3100,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text(list_sources_text()[:3900], reply_markup=build_list_keyboard())
         elif op == "ayar":
             await q.message.reply_text(
-                f"⚙️ Ayarlar\nGünlük: {'AÇIK' if WIZ_DAY.get('on') else 'kapalı'}\n"
-                f"AI görev: {'AÇIK' if V8_AP.get('wiz_ai') else 'kapalı'}\nAI adım: {WIZ_AI_STEPS}")
+                f"⚙️ AI otomatik\nJoin: {'açık' if UNI_JOIN else 'kapalı'} max {UNI_JOIN_MAX}\n"
+                f"AI adım: {WIZ_AI_STEPS} · bütçe {WIZ_AI_BUDGET_S}s\n"
+                f"Sadece ödeme/cüzdan engelli.")
         elif op == "dur":
             global AUTO_STOP
             AUTO_STOP = True
@@ -3279,7 +3272,8 @@ V8_AP = {
     "last_note": "",
     "cursor": 0,  # listedeki sıradaki bot
     # V8.33: yeniden başlatmada kaybolmasın
-    "auto_add": False,
+    "auto_add": True,
+    "wiz_ai": True,
     "per": {},
     "pxe_fb_t": 0,
     "blocked": [],     # 'otopilot sil' ile çıkarılan / sohbeti silinen botlar — bir daha açılmaz
@@ -4774,12 +4768,12 @@ async def cmd_start(update: Update,context: ContextTypes.DEFAULT_TYPE):
 #  - "otopilot tara": hesabındaki mini uygulamalı tüm botları bulup listeye ekler.
 # =====================================================================
 
-UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "80") or 80)      # bir turda en fazla tıklama
-UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "300") or 300)          # bir bot için tarayıcı süresi (sn)
-UNI_TABS = int(os.getenv("UNI_TABS", "8") or 8)                      # gezilecek en fazla sekme
+UNI_MAX_ACTIONS = int(os.getenv("UNI_MAX_ACTIONS", "120") or 120)    # bir turda en fazla tıklama
+UNI_BUDGET_S = int(os.getenv("UNI_BUDGET_S", "420") or 420)          # bir bot için tarayıcı süresi (sn)
+UNI_TABS = int(os.getenv("UNI_TABS", "12") or 12)                    # gezilecek en fazla sekme
 UNI_TAPS = int(os.getenv("UNI_TAPS", "30") or 30)                    # tapper oyunlarında dokunma (0 = kapalı)
-UNI_JOIN = os.getenv("UNI_JOIN", "1").strip() != "0"                 # görev kanallarına katıl
-UNI_JOIN_MAX = int(os.getenv("UNI_JOIN_MAX", "12") or 12)              # bir turda en fazla katılım
+UNI_JOIN = os.getenv("UNI_JOIN", "1").strip() != "0"                 # görev kanallarına katıl (AÇIK)
+UNI_JOIN_MAX = int(os.getenv("UNI_JOIN_MAX", "20") or 20)            # bir turda en fazla kanal katılımı
 UNI_ADS = os.getenv("UNI_ADS", "0").strip() == "1"                   # "reklam izle" görevleri
 UNI_BOT_START = os.getenv("UNI_BOT_START", "0").strip() == "1"       # görevdeki başka botlara /start
 UNI_FAIL_PAUSE = int(os.getenv("UNI_FAIL_PAUSE", "5") or 5)          # üst üste bu kadar hata → bot beklemeye
@@ -4788,7 +4782,7 @@ UNI_AFTER_PROFILE = os.getenv("UNI_AFTER_PROFILE", "1").strip() != "0"  # MyAge/
 V8_AP.setdefault("pxe_fb_t", 0)
 V8_JOB_TIMEOUT = int(os.getenv("V8_JOB_TIMEOUT", "600") or 600)
 
-V8_AP.setdefault("auto_add", False)   # radar yeni mini app bulunca listeye eklesin mi
+V8_AP.setdefault("auto_add", True)    # radar yeni mini app bulunca listeye eklesin (otomatik)
 V8_AP.setdefault("per", {})           # bot başına istatistik {bot: {ok,skip,err,fail,last}}
 
 UNI_RISK_RE = re.compile(
@@ -5190,7 +5184,6 @@ async def uni_drain(page) -> dict:
 
 
 def uni_classify(c: dict) -> str:
-    """Güvenlik (risk/skip) kodda kalır. Belirsiz öğeler 'maybe' olur → AI karar verir."""
     text = (c.get("text") or "").strip()
     ctx = c.get("ctx") or ""
     both = text + " " + ctx
@@ -5210,6 +5203,7 @@ def uni_classify(c: dict) -> str:
     if not UNI_ADS and (UNI_ADS_RE.search(text) or UNI_ADS_RE.search(ctx[:120])):
         return "skip"
     if c.get("overlay") and UNI_DISMISS_RE.match(text):
+        # pencerede riskli içerik varsa sadece "kapat/geç" türü butonlar
         if UNI_RISK_RE.search(ctx) and not UNI_SAFE_DISMISS_RE.match(text):
             return "risk"
         return "dismiss"
@@ -5222,17 +5216,18 @@ def uni_classify(c: dict) -> str:
     if UNI_NAV_RE.match(navtext) and len(navtext) <= 14:
         return "nav"
     if c.get("tab"):
-        return "tabx"
+        return "tabx"   # bilinmeyen sekme: ana menüde görev sekmesi bulunamazsa gezilir
+    # görev satırı: satırın kendisi, '+500' gibi ödül butonu ya da ok simgesi
     rowtxt = text if text != "[ikon]" else ""
     if UNI_DONE_RE.search(text) or (UNI_DONE_RE.search(ctx[:80]) and len(ctx) < 120):
-        return "skip"  # zaten alınmış → AI'ya bile gönderme
+        return ""
     if text == "[ikon]" and UNI_TASK_VERB_RE.search(ctx[:160]):
         return "task"
     if UNI_AMOUNT_RE.match(text) and UNI_TASK_VERB_RE.search(ctx[:160]) and len(ctx) < 160:
         return "task"
     if 8 <= len(rowtxt) <= 140 and UNI_TASK_VERB_RE.search(rowtxt):
         return "task"
-    # Belirsiz ama riskli olmayan her şey AI'ya gitsin
+    # Belirsiz ama riskli olmayan → AI karar versin
     if text and len(text) <= 80 and not UNI_RISK_RE.search(both[:200]):
         return "maybe"
     return ""
@@ -6022,11 +6017,11 @@ from urllib.parse import unquote as _wiz_unquote
 if not os.getenv("V8_JOB_TIMEOUT"):
     V8_JOB_TIMEOUT = 720  # sihirbaz adımları (AI + referans) için ek süre; tek bot en fazla ~12 dk
 
-WIZ_AI_STEPS = int(os.getenv("WIZ_AI_STEPS", "16") or 16)          # bir botta en fazla AI kararı (AI merkezli)
-WIZ_AI_BUDGET_S = int(os.getenv("WIZ_AI_BUDGET_S", "220") or 220)  # AI keşif süresi (sn)
+WIZ_AI_STEPS = int(os.getenv("WIZ_AI_STEPS", "18") or 18)          # bir botta en fazla AI kararı (AI merkezli)
+WIZ_AI_BUDGET_S = int(os.getenv("WIZ_AI_BUDGET_S", "260") or 260)  # AI keşif süresi (sn)
 WIZ_REF_BUDGET_S = int(os.getenv("WIZ_REF_BUDGET_S", "70") or 70)  # referans avı süresi (sn)
-WIZ_AI_GAP = float(os.getenv("WIZ_AI_GAP", "2.0") or 2.0)          # iki Groq isteği arası en az sn
-WIZ_AI_FIRST = os.getenv("WIZ_AI_FIRST", "1").strip() != "0"      # 1 = kural motorundan önce AI karar versin
+WIZ_AI_GAP = float(os.getenv("WIZ_AI_GAP", "1.8") or 1.8)          # iki Groq isteği arası en az sn
+WIZ_AI_FIRST = os.getenv("WIZ_AI_FIRST", "1").strip() != "0"      # AI öncelikli
 WIZ_SUM_KEY = os.getenv("WIZ_SUM_KEY", "radar:wiz_sum:v1").strip()
 WIZ_SUM_FILE = os.getenv("WIZ_SUM_FILE", "/tmp/radar_wiz_sum.json")
 WIZ_RESEND_H = int(os.getenv("WIZ_RESEND_H", "24") or 24)          # 'yeni' modda aynı bot özeti en az kaç saatte bir
@@ -6050,12 +6045,13 @@ WIZ_ME = {"id": None}
 GROQ_STATE = {"dead": {}, "cool": {}, "last": 0.0, "lock": None, "used": {}}
 
 WIZ_SYSTEM = (
-    "Sen Telegram mini uygulamaları (tap-to-earn, farm, airdrop, görev oyunları) konusunda uzman, "
-    "dikkatli bir asistansın. Metinler HANGİ DİLDE olursa olsun (İngilizce, Rusça, Çince...) okuyup "
-    "anlarsın ve HER ZAMAN TÜRKÇE cevap verirsin. Kurallar: 1) Sadece sana verilen bilgiyi kullan, "
-    "ASLA uydurma; bilmiyorsan 'belirsiz' de. 2) Cüzdan bağlama, ödeme, Stars, TON, USDT, satın alma, "
-    "yatırım, çekim, depozito, telefon numarası, arkadaş daveti, hikaye/paylaşım adımlarını ASLA önerme "
-    "ve seçme. 3) Kısa, net, maddeli yaz."
+    "Sen Telegram mini uygulamaları (tap-to-earn, farm, airdrop, görev) uzmanısın. "
+    "OTOMATİK MOD: claim, daily, farm, görev, kanal/gruba katılma — hepsini yap. "
+    "Metinler hangi dilde olursa olsun anla, HER ZAMAN TÜRKÇE cevap ver. "
+    "Kurallar: 1) Sadece verilen bilgiyi kullan, uydurma. "
+    "2) ASLA yapma: cüzdan, ödeme, Stars, TON, USDT, satın alma, çekim, depozito, telefon, "
+    "arkadaş daveti, hikaye/paylaşım. "
+    "3) Ücretsiz Join/Subscribe/kanal katılım görevlerini YAP. 4) Kısa net yaz."
 )
 
 WIZ_RISK_INPUT_RE = re.compile(
@@ -6596,26 +6592,25 @@ async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
 # ------------------------------------------------- yapay zeka ile görev ----
 
 WIZ_STEP_PROMPT = (
-    "Bir Telegram mini uygulamasının içindesin. SEN karar veriyorsun: ekranı oku, anla, "
-    "ödül kazandıran SIRADAKİ TEK güvenli adımı seç. Kural motoru yok; senin tercihin geçerli.\n"
-    "Aşağıda ekran yazısı, tıklanabilir öğeler (id [tür] yazı — bağlam) ve yazı kutuları var.\n"
-    "Öncelik sırası (sen uygula):\n"
-    "1) açık pencereyi kapat/onayla (OK, Close, Continue, Got it, ×)\n"
-    "2) ödül topla: Claim / Collect / Harvest / Daily / Check-in / Farm / Mine / Free spin / Open box\n"
-    "3) görev başlat: Join / Subscribe / Visit / Watch / Play / Start\n"
-    "4) görev doğrula: Check / Verify / Confirm\n"
-    "5) görev / ödül sekmesine git (Earn, Tasks, Daily, Rewards, Bonus)\n"
-    "Gizli kod / secret / keyword isteniyorsa ve kod ekranda AÇIKÇA yazıyorsa 'yaz' ile yaz. TAHMİN ETME.\n"
-    "Geri sayım görürsen (Claim in 03:12, 2h left) o butona BASMA; 'bekle' alanına süreyi yaz.\n"
-    "YASAK (asla seçme): cüzdan, connect wallet, deposit, withdraw, Stars, TON, USDT, satın alma, "
-    "ücretli yükseltme, davet/arkadaş/invite/refer, paylaş/hikaye, telefon, e-posta, reklam izle.\n"
-    "'Denendi' listesindeki işe yaramamış öğeleri tekrar seçme.\n"
-    "Yapacak güvenli bir şey kalmadıysa eylem='bitir'. Yapamadığın şey varsa 'sorun' alanına Türkçe yaz.\n"
-    "SADECE şu JSON'u döndür (başka metin yok):\n"
-    '{"ekran":"1 cümle Türkçe özet","eylem":"tikla|yaz|kaydir|geri|bitir",'
+    "Bir Telegram mini uygulamasının içindesin. OTOMATİK MOD: ödeme/cüzdan hariç HER ŞEYİ yap.\n"
+    "Ekranı oku, anla, SIRADAKİ TEK güvenli adımı seç. Amaç: tüm claim, daily, farm, görev ve kanal "
+    "katılımlarını bitirmek.\n"
+    "Öncelik (sen uygula):\n"
+    "1) pencere kapat/onayla (OK, Close, Continue, Got it, ×)\n"
+    "2) CLAIM / COLLECT / HARVEST / DAILY / CHECK-IN / FARM / MINE / FREE SPIN / OPEN BOX — al\n"
+    "3) görev başlat: Join / Subscribe / Visit / Watch / Play / Start / Go (kanal-gruba katıl görevleri DAHİL)\n"
+    "4) görev doğrula: Check / Verify / Confirm / Claim reward\n"
+    "5) görev/ödül sekmesine git: Earn, Tasks, Daily, Rewards, Bonus, Quests\n"
+    "Gizli kod ekranda açıksa 'yaz' ile yaz. TAHMİN ETME.\n"
+    "Geri sayım varsa (Claim in 03:12) BASMA; 'bekle' alanına yaz.\n"
+    "YASAK (asla): cüzdan, connect wallet, deposit, withdraw, Stars, TON, USDT, satın alma, "
+    "ücretli yükseltme, davet/arkadaş/invite/refer/share/story, telefon, e-posta, reklam izle (ücretli).\n"
+    "Kanal/gruba KATIL görevleri YAPILIR (ücretsiz join). 'Denendi' listesini tekrarlama.\n"
+    "Güvenli iş kalmadıysa eylem='bitir'. Yapamadıysan 'sorun'a Türkçe yaz.\n"
+    "SADECE şu JSON:\n"
+    '{"ekran":"1 cümle Türkçe","eylem":"tikla|yaz|kaydir|geri|bitir",'
     '"id":"u12 veya w1","metin":"yaz için","neden":"kısa","sorun":"",'
-    '"bekle":"sonraki claim/ödüle kalan süre (ör. 03:12:45 veya 2h 15m), yoksa boş",'
-    '"oncelik":"claim|gunluk|gorev|navigasyon|bitir"}\n\n'
+    '"bekle":"sonraki claim süresi veya boş","oncelik":"claim|gunluk|gorev|navigasyon|bitir"}\n\n'
 )
 
 
@@ -6648,7 +6643,8 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
             t = (c.get("text") or "").strip()
             if UNI_RISK_RE.search(t):
                 continue
-            if WIZ_REF_NAV_RE.search(t) and k not in ("reward", "check", "dismiss"):
+            # davet/refer sadece ödül değilse engelle; join/subscribe görevleri geçer
+            if WIZ_REF_NAV_RE.search(t) and k not in ("reward", "check", "dismiss", "go", "task", "maybe"):
                 continue
             if tried_bad.get(uni_norm(t), 0) >= 2:
                 continue
@@ -6656,7 +6652,7 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
             ctx = (c.get("ctx") or "")[:70].replace("\n", " ")
             flag = " (pencere)" if c.get("overlay") else (" (alt menü)" if c.get("navbar") else "")
             lines.append(f'{c["id"]} [{k}]{flag} "{t[:50]}" — {ctx}')
-            if len(lines) >= 55:
+            if len(lines) >= 60:
                 break
         in_lines, in_ok = [], {}
         for i in inputs:
@@ -6684,8 +6680,11 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
         bekle = str(dec.get("bekle") or dec.get("sayac") or "").strip()
         if bekle:
             WIZ_CUR.setdefault("ai_wait", []).append(bekle[:40])
-            if wd_active():
-                WD_RUN.setdefault("sayac", []).append(bekle[:40])
+            try:
+                if wd_active():
+                    WD_RUN.setdefault("sayac", []).append(bekle[:40])
+            except Exception:
+                pass
         oncelik = str(dec.get("oncelik") or "").strip().lower()
         if oncelik:
             WIZ_CUR["ai_priority"] = oncelik
@@ -8355,7 +8354,7 @@ WD_FILE = os.getenv("WIZ_DAY_FILE", "/tmp/radar_wiz_daily.json")
 WD_TZ_H = int(os.getenv("WIZ_TZ_OFFSET_H", "3") or 3)              # İstanbul = UTC+3
 WD_DEFAULT_H = float(os.getenv("WIZ_DAY_DEFAULT_H", "6") or 6)       # sayaç okunamazsa kaç saatte bir
 WD_MIN_GAP_MIN = int(os.getenv("WIZ_DAY_MIN_GAP_MIN", "20") or 20)   # aynı bota en az bu kadar dk arayla
-WD_AI_STEPS = int(os.getenv("WIZ_DAY_AI_STEPS", "18") or 18)         # günlük turda AI adım limiti (AI merkezli)
+WD_AI_STEPS = int(os.getenv("WIZ_DAY_AI_STEPS", "20") or 20)         # günlük AI adım (otomatik görev+claim)
 WD_CLAIM_STEPS = ["oto", 2, 4, 6, 8, 12, 24]
 WD_TASK_STEPS = [3, 5, 10, 20]
 WIZ_DAY = {"on": True, "bots": {}, "report": "ozet", "night": [], "saat": 3, "digest_h": 21,
@@ -8499,34 +8498,33 @@ def wd_due_list(now: float = None) -> list:
 # ---- tur içi ayarlar: sadece günlük turda geçerli, tur bitince eski haline döner ----
 
 WD_PROMPT_HEAD = (
-    "Bir Telegram mini uygulamasının içindesin. Bu GÜNLÜK RUTİN turu: bugünün ödüllerini kaçırma.\n"
-    "SEN karar veriyorsun. Ekranı oku, anla, SIRADAKİ TEK güvenli adımı seç.\n"
-    "Sıra (sen uygula):\n"
-    "1) açık pencereyi kapat/onayla (OK, Close, Continue, Got it)\n"
-    "2) GÜNLÜK ÖDÜL: Daily reward / Daily bonus / Check-in / Streak / Day N / Login bonus / Günlük ödül — al. "
-    "Takvim (Day 1..7) varsa bugünkü günü seç ve Claim'e bas. Gerekirse Daily/Rewards/Bonus/Earn sekmesine git.\n"
-    "3) FARM/MINING: Claim / Collect / Harvest → sonra 'Start farming / Start mining / Başlat' ile yeniden başlat.\n"
-    "4) ücretsiz günlük çark / kutu / hediye (Free spin, Free box, Gift) — SADECE ücretsiz olanlar.\n"
+    "Bir Telegram mini uygulamasının içindesin. GÜNLÜK RUTİN + OTOMATİK MOD.\n"
+    "Ödeme/cüzdan hariç her şeyi yap: daily, claim, farm, görev, kanal katılımı.\n"
+    "SIRADAKİ TEK güvenli adımı seç:\n"
+    "1) pencere kapat/onayla (OK, Close, Continue, Got it)\n"
+    "2) GÜNLÜK ÖDÜL: Daily / Check-in / Streak / Day N / Login bonus — al. Takvim varsa bugünü seç + Claim.\n"
+    "3) FARM/MINING: Claim / Collect / Harvest → sonra Start farming/mining ile yeniden başlat.\n"
+    "4) ücretsiz çark/kutu/hediye (Free spin, Free box, Gift)\n"
 )
 WD_PROMPT_TASKS_ON = (
-    "5) GÖREVLER: önce günlük (Daily tasks), sonra diğerleri: başlat (Join/Visit/Watch/Play) → "
-    "doğrula (Check/Verify/Claim). Bu turda en fazla {n} görev. Gizli kod ekranda açıksa 'yaz' ile yaz, TAHMİN ETME.\n"
+    "5) GÖREVLER (otomatik): Daily tasks + diğerleri. Join/Subscribe/Visit/Watch/Play başlat → "
+    "Check/Verify/Claim doğrula. Kanal/gruba katıl görevlerini YAP. Bu turda en fazla {n} görev. "
+    "Gizli kod ekranda açıksa 'yaz' ile yaz, TAHMİN ETME.\n"
 )
 WD_PROMPT_TASKS_OFF = (
     "5) GÖREV YAPMA: Join / Subscribe / Visit / Follow / Check görevlerine BASMA. Sadece ödül topla.\n"
 )
 WD_PROMPT_TAIL = (
-    "Geri sayım görürsen (Claim in 03:12:45, 3h 12m, 2 saat sonra) o butona BASMA; 'sayac' alanına yaz.\n"
+    "Ödül butonu yerine bir geri sayım görüyorsan (ör. 'Claim in 03:12:45', '3h 12m', '2 saat sonra') "
+    "o ödül hazır değildir: üstüne basma, 'sayac' alanına yaz, sıradakine geç.\n"
     "YASAK: cüzdan, ödeme, Stars, TON, satın alma, ücretli yükseltme, davet/arkadaş, paylaş/hikaye, telefon, e-posta. "
     "'Denendi' listesindeki işe yaramamış öğeleri tekrar seçme.\n"
-    "Yapacak güvenli şey kalmadıysa eylem='bitir'. Yapamadığın şey varsa 'sorun' alanına Türkçe yaz.\n"
+    "Yapacak güvenli bir şey kalmadıysa eylem='bitir'. Yapamadığın bir şey varsa 'sorun' alanına Türkçe nedenini yaz.\n"
     "SADECE şu JSON'u döndür:\n"
-    '{"ekran":"1 cümle Türkçe özet","eylem":"tikla|yaz|kaydir|geri|bitir",'
-    '"id":"u12 veya w1","metin":"yaz için","neden":"kısa","sorun":"",'
-    '"sayac":"sonraki ödül/claim süresi (ör. 03:12:45 veya 3h 12m), yoksa boş",'
-    '"gunluk":"alindi|zaten|yok|bilinmiyor",'
-    '"oncelik":"gunluk|claim|gorev|bitir",'
-    '"sonraki_saat":"bir sonraki tur için önerdiğin saat aralığı (ör. 4), yoksa boş"}\n\n'
+    '{"ekran":"ekranın 1 cümle Türkçe özeti","eylem":"tikla|yaz|kaydir|geri|bitir",'
+    '"id":"u12 veya w1","metin":"yaz eylemi için","neden":"kısa","sorun":"",'
+    '"sayac":"bir sonraki ödüle/claim\'e kalan süre ekranda yazıyorsa (ör. 03:12:45 veya 3h 12m), yoksa boş",'
+    '"gunluk":"alindi|zaten|yok|bilinmiyor (günlük ödül durumu)"}\n\n'
 )
 WD_CANVAS_HEAD = (
     "GÜNLÜK RUTİN TURU: önce günlük ödül / check-in / daily bonus, sonra farm-mining Claim ve yeniden Start, "
@@ -8559,11 +8557,13 @@ async def v8_browser(name, url, state, _retry: bool = False):
         if not str(saved["WIZ_CANVAS_PROMPT"]).startswith("GÜNLÜK"):
             g["WIZ_CANVAS_PROMPT"] = WD_CANVAS_HEAD + saved["WIZ_CANVAS_PROMPT"]
         if c.get("tasks", True):
-            g["UNI_JOIN_MAX"] = min(int(saved["UNI_JOIN_MAX"] or 12), int(c.get("task_max") or 5))
+            # Otomatik mod: görev + kanal katılımı bol olsun
+            g["UNI_JOIN_MAX"] = max(int(saved["UNI_JOIN_MAX"] or 20), int(c.get("task_max") or 10))
+            g["UNI_TAB_MAX"] = max(int(saved["UNI_TAB_MAX"] or 40), 50)
         else:
             g["UNI_JOIN"] = False
             g["UNI_TAB_MAX"] = min(int(saved["UNI_TAB_MAX"] or 40), 8)
-        g["UNI_BUDGET_S"] = min(int(saved["UNI_BUDGET_S"] or 300), 240)
+        g["UNI_BUDGET_S"] = max(int(saved["UNI_BUDGET_S"] or 300), 360)
         return await _wd_browser_base(name, url, state, _retry)
     finally:
         for k, v in saved.items():
