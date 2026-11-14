@@ -1778,18 +1778,11 @@ REF_BTN_WORDS = tuple(fold(w) for w in (
     "davet", "invite", "referral", "referans", "arkadaş", "friends", "partner", "ortak", "affiliate",
     "реферал", "пригласи", "друзь", "партнер",
 ))
-# V9.6.1: referans kodu taraması genişletildi — refId/referral_id/promo_code gibi anahtar adları,
-# URL alt (sub) referans alanları (code/id/link/url) ve daha uzun kod değerleri artık TAM okunuyor.
 REF_KEY_RE = re.compile(
-    r"(^|[_\-.])(ref|refs|referral|referer|referrer|invite|inviter|startapp|share|partner|affiliate|promo)([_\-.]|$)"
-    r"|refcode|refid|invitecode|inviterid|referralcode|referralid|reflink|invitelink|referrallink"
-    r"|sharelink|shareurl|refurl|myref|promocode|affiliatecode|partnercode|referrer",
+    r"(^|[_\-.])(ref|referral|referer|invite|inviter|startapp|share)([_\-.]|$)"
+    r"|refcode|invitecode|referralcode|reflink|invitelink|referrallink|sharelink|refurl",
     re.I,
 )
-# Alt (sub) referans: "referral": {"code": ..., "id": ..., "link": ...} gibi iç içe nesnelerde
-# üst yol referansa benziyorsa bu alt anahtarlar da kişisel referans olarak yakalanır.
-REF_PATH_RE = re.compile(r"ref|invite|referral|friend|davet|partner|affiliate|share|promo", re.I)
-SUBREF_KEY_RE = re.compile(r"^(code|id|url|link|value|param|key)$|code|link|url", re.I)
 # GET ile bile cagirmayacagimiz, islem yapan yollar
 ACTION_PATH_RE = re.compile(
     r"claim|collect|start|play|spin|buy|purchase|shop|burn|forge|withdraw|deposit|transfer|swap|stake|"
@@ -1826,10 +1819,8 @@ async def load_refs():
 
 def find_ref_links(msgs, bot: str) -> list:
     """Mesaj metni, gomulu linkler ve butonlardaki 't.me/<bot>...?start|startapp=...' linkleri."""
-    # V9.6.1: + / : ~ ! * karakterli kodlar artık kesilmiyor; start/startapp linkin
-    # ortasındaki (başka parametrelerden sonraki) yerde de yakalanıyor.
     rx = re.compile(
-        r"(?:https?://)?t\.me/" + re.escape(bot) + r"(?:/[A-Za-z0-9_]+)?\?(?:[^\s\"'&#]*&)?(?:start|startapp)=[A-Za-z0-9_\-%=.+~/:!*]{2,200}",
+        r"(?:https?://)?t\.me/" + re.escape(bot) + r"(?:/[A-Za-z0-9_]+)?\?(?:start|startapp)=[A-Za-z0-9_\-%=.]+",
         re.I,
     )
     out = []
@@ -1935,28 +1926,24 @@ def find_token(data, depth: int = 0):
 
 
 def scan_json(obj, path, links, codes, keys, depth: int = 0):
-    """JSON icinde referans linki / kodu (ve alt/ici referans alanlarini) arar; alan adlarini toplar."""
-    # V9.6.1: derinlik 6->8, alan limiti 60->80, deger limiti 80->200;
-    # üst yolu referansa benzeyen nesnelerin alt alanlari (code/id/link/url) da okunuyor.
-    if depth > 8:
+    """JSON icinde referans linki / kodu arar; alan adlarini (deger degil) toplar."""
+    if depth > 6:
         return
     if isinstance(obj, dict):
-        for k, v in list(obj.items())[:80]:
+        for k, v in list(obj.items())[:60]:
             p = f"{path}.{k}" if path else str(k)
             if depth <= 2 and len(keys) < 25:
                 keys.append(p)
-            if isinstance(v, (str, int)) and not isinstance(v, bool) and (
-                    REF_KEY_RE.search(str(k))
-                    or (REF_PATH_RE.search(path or "") and SUBREF_KEY_RE.search(str(k)))):
+            if isinstance(v, (str, int)) and not isinstance(v, bool) and REF_KEY_RE.search(str(k)):
                 s = str(v)
-                if 0 < len(s) <= 200 and not s.startswith("eyJ"):
+                if 0 < len(s) <= 80 and not s.startswith("eyJ"):
                     codes.append((p, s))
             scan_json(v, p, links, codes, keys, depth + 1)
     elif isinstance(obj, list):
-        for v in obj[:5]:
+        for v in obj[:3]:
             scan_json(v, f"{path}[]", links, codes, keys, depth + 1)
     elif isinstance(obj, str):
-        if "t.me/" in obj and ("start=" in obj or "startapp=" in obj) and len(obj) < 500:
+        if "t.me/" in obj and ("start=" in obj or "startapp=" in obj) and len(obj) < 300:
             links.append(obj)
 
 
@@ -2128,12 +2115,11 @@ def analyze_ctx(ctx: dict) -> dict:
            "hosts": ctx["hosts"][:10], "paths": ctx["paths"][:25]}
 
     for t in ctx["blobs"]:
-        # V9.6.1: kalip uzunlugu 60->120 (uzun kodlar tam okunuyor)
-        found_tpl = re.findall(r"""[A-Za-z0-9_./:?&%=~\-]{0,120}startapp=[^\s"'`]{0,120}""", t)[:3]
+        found_tpl = re.findall(r"""[A-Za-z0-9_./:?&%\-]{0,80}startapp=[^\s"'`]{0,60}""", t)[:3]
         if not found_tpl:
-            found_tpl = re.findall(r".{0,100}startapp=.{0,150}", t)[:2]
+            found_tpl = re.findall(r".{0,70}startapp=.{0,90}", t)[:2]
         for s_ in found_tpl:
-            tpl = re.sub(r"\s+", " ", s_).strip()[:250]
+            tpl = re.sub(r"\s+", " ", s_).strip()[:150]
             if tpl and tpl not in res["templates"]:
                 res["templates"].append(tpl)
     res["templates"] = res["templates"][:3]
@@ -2145,8 +2131,8 @@ def analyze_ctx(ctx: dict) -> dict:
         res["codes"] += codes
         if keys:
             res["api"].append(f"GET {urlparse(u).path} → {', '.join(keys[:8])}")
-    res["links"] = list(dict.fromkeys(res["links"]))[:8]   # V9.6.1: 5->8
-    res["codes"] = list(dict.fromkeys(res["codes"]))[:12]  # V9.6.1: 6->12
+    res["links"] = list(dict.fromkeys(res["links"]))[:5]
+    res["codes"] = list(dict.fromkeys(res["codes"]))[:6]
     res["api"] = list(dict.fromkeys(res["api"]))[:8]
     if ctx["got"]:
         res["notes"].append(f"API yoklaması başarılı ({ctx['mode']} yöntemi, {len(ctx['got'])} yanıt).")
@@ -2179,14 +2165,9 @@ async def ref_finder(bot: str):
 
         found = [(l, "bot sohbeti") for l in chat_links]
         probe = None
-        extra = []  # V9.6.2: başka botların linkleri — asla kaydedilmez, sadece bilgi
         if url:
             probe = await probe_miniapp(bot, url, how)
-            for l in probe["links"]:
-                if re.search(r"t\.me/" + re.escape(bot) + r"(?:[/?#]|$)", l, re.I):
-                    found.append((l, "mini uygulama API"))
-                else:
-                    extra.append(l)
+            found += [(l, "mini uygulama API") for l in probe["links"]]
 
         lines = [f"🔗 REFERANS ARAMA: @{bot}"]
         if found:
@@ -2196,8 +2177,6 @@ async def ref_finder(bot: str):
             lines += ["", f"✅ Bulundu ve kaydedildi ({src}):", link]
             for l, s in found[1:4]:
                 lines.append(f"Diğer aday: {l}")
-            for l in extra[:3]:  # V9.6.2: yanlış kaydı önlemek için ayrı ve açıkça işaretli
-                lines.append(f"⚠️ Başka botun linki (senin referansın DEĞİL): {l}")
         else:
             lines += ["", "❌ Tam referans linkini bulamadım."]
             if not url:
@@ -2597,19 +2576,12 @@ async def auto_link(name: str, short: str = "", start: str = ""):
         out.append("📱 " + how)
         ctx = await app_context(url)
         res = analyze_ctx(ctx)
-        # V9.6.2: yalnızca bu botun kendi linki kaydedilir; başka botların linkleri
-        # (partner görev/reklam) asla 'senin referansın' olarak kaydedilmez.
-        res_mine = [l for l in res["links"] if re.search(r"t\.me/" + re.escape(name) + r"(?:[/?#]|$)", l, re.I)]
-        res_extra = [l for l in res["links"] if l not in res_mine]
-        if res_mine:
-            REFS[name] = {"link": res_mine[0], "src": "mini uygulama API", "t": time.time()}
+        if res["links"]:
+            REFS[name] = {"link": res["links"][0], "src": "mini uygulama API", "t": time.time()}
             await persist_refs()
-            out.append(f"🔗 Referans linkin kaydedildi: {res_mine[0]}")
-        elif res_extra:
-            out.append("⚠️ Başka botlara ait linkler buldum ama senin referans linkin değil: "
-                       + ", ".join(res_extra[:2]))
+            out.append(f"🔗 Referans linkin kaydedildi: {res['links'][0]}")
         elif res["codes"]:
-            out.append("🔑 Referansa benzeyen alanlar: " + ", ".join(f"{p}={v}" for p, v in res["codes"][:5]))
+            out.append("🔑 Referansa benzeyen alanlar: " + ", ".join(f"{p}={v}" for p, v in res["codes"][:3]))
         else:
             out.append("🔗 Referans linkini bulamadım.")
 
@@ -4870,9 +4842,6 @@ UNI_SHIM_JS = r"""
     U.events.push({ type: type, t: Date.now() });
     switch (type) {
       case 'web_app_open_tg_link': link('https://t.me' + (d.path_full || ''), 'tg_link'); break;
-      // V9.6.3: 'Arkadaş davet et' butonu shareURL çağırınca gelen olay — link yakalanır,
-      // paylaşımla ilgili HİÇBİR şey açılmaz/gönderilmez (yalnızca okunur).
-      case 'web_app_share_url': link(d.url || '', 'share_url'); break;
       case 'web_app_open_link': link(d.url || '', 'open_link'); break;
       case 'web_app_open_invoice': U.blocked.push('invoice'); respond('invoice_closed', { slug: d.slug, status: 'cancelled' }); break;
       case 'web_app_request_phone': U.blocked.push('phone'); respond('phone_requested', { status: 'cancelled' }); break;
@@ -5616,11 +5585,6 @@ async def v8_browser(name, url, state):
                         nav_links.append(u)
                         await route.abort()
                         return
-                    # V9.6.4: bellek %65'i geçtiyse resim/medya/font/ağır dosya yükleme
-                    if wiz_mem_used_mb() > wiz_mem_limit_mb() * 0.65 and (
-                            req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
-                        await route.abort()
-                        return
                     if host not in cache:
                         cache[host] = await v8_public(u)
                     if cache[host] and urlparse(u).scheme == "https":
@@ -6048,23 +6012,13 @@ WIZ_SYSTEM = (
 WIZ_RISK_INPUT_RE = re.compile(
     r"wallet|address|adres|e-?mail|phone|telefon|card|kart|password|şifre|sifre|seed|mnemonic|private|"
     r"amount|miktar|tutar|iban|\b0x|\bUQ|\bEQ|кошел|адрес|телефон|пароль", re.I)
-# V9.6.1: referans kodu TAM okunuyor — + / : ~ ! * karakterleri kesilmiyor, uzun kodlar (200)
-# destekleniyor ve start/startapp linkin ortasindaki yerde de yakalaniyor.
 WIZ_REF_RE = re.compile(
-    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})(?:/([A-Za-z0-9_]{1,64}))?/?\?(?:[^\s\"'&#]*&)?(start|startapp)="
-    r"([A-Za-z0-9_\-%=.+~/:!*]{2,200})", re.I)
-# V9.6.1: refId/referral_id/promo_code gibi anahtar adlari, JS atama bicimi (refCode = 'x')
-# ve tek tirnakli degerler de okunuyor.
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})(?:/([A-Za-z0-9_]{1,64}))?/?\?(start|startapp)="
+    r"([A-Za-z0-9_\-%=.]{2,160})", re.I)
 WIZ_CODE_RE = re.compile(
-    r'[\'"]?(ref(?:erral)?_?id|ref(?:erral)?_?code|invite_?id|invite_?code|refCode|inviteCode|referralCode|'
-    r'ref_?link|referral_?link|invite_?link|inviteLink|referralLink|refLink|ref_?url|invite_?url|share_?link|'
-    r'shareLink|share_?url|startParam|start_param|my_?ref|promo_?code|promoCode|partner_?code|affiliate_?code|'
-    r'referral|inviter_?code)[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9_\-%=.+~/:!*]{2,200})', re.I)
-# Alt (sub) referans: "referral": {"code": "x", "id": 123, "link": "..."} gibi ic ice nesneler.
-WIZ_SUBOBJ_RE = re.compile(
-    r'(?:ref(?:erral)?|invite|friend|davet|partner|promo)[^{}]{0,40}\{([^{}]{0,500})\}', re.I)
-WIZ_SUBFIELD_RE = re.compile(
-    r'[\'"]?(code|id|link|url|value|param)[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9_\-%=.+~/:!*]{2,200})', re.I)
+    r'"(ref(?:erral)?_?code|invite_?code|refCode|inviteCode|referralCode|ref_?link|referral_?link|invite_?link|'
+    r'inviteLink|referralLink|refLink|ref_?url|invite_?url|share_?link|shareLink|startParam|start_param)"\s*:\s*"([^"]{2,200})"',
+    re.I)
 WIZ_REF_NAV_RE = re.compile(
     r"friend|frens|fren\b|invite|refer|referral|affiliate|squad|team\b|партн|друз|приглас|реферал|davet|arkada[şs]|ekip|tak[ıi]m|ortakl",
     re.I)
@@ -6392,11 +6346,7 @@ async def uni_screen(page) -> str:
 
 
 async def uni_click(page, c: dict) -> bool:
-    """DÜZELTME: 7 farklı yöntemle tıklar; hiçbiri olmazsa 'yapamadım' listesine yazar.
-    V9.6.5: (1) koordinat tıklamaları ÖNCE elementFromPoint ile doğrulanır — butonun üstü
-    kapalıysa koordinat tıklaması örtüye gidiyordu (tıklandı sanılıyordu, uygulama almıyordu);
-    (2) tam pointer/touch olay zinciri doğrudan butona gönderilir — pointerdown dinleyen
-    uygulamalar ve örtü altındaki butonlar artık tepki verir."""
+    """DÜZELTME: 5 farklı yöntemle tıklar; hiçbiri olmazsa 'yapamadım' listesine yazar."""
     loc = page.locator(f'[data-uni="{c["id"]}"]')
     try:
         cnt = await loc.count()
@@ -6407,136 +6357,24 @@ async def uni_click(page, c: dict) -> bool:
             await loc.first.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
-        # 1) gerçek tarayıcı tıklaması (en güvenilir)
         try:
             await loc.first.click(timeout=5000, no_wait_after=True)
             return True
         except Exception:
             pass
-        # V9.6.5: koordinatla tıklamadan ÖNCE üstü kapalı mı kontrol edilir
-        blocked = False
+        try:
+            await loc.first.click(timeout=3000, no_wait_after=True, force=True)
+            return True
+        except Exception:
+            pass
         try:
             box = await loc.first.bounding_box()
             if box and box["width"] > 0:
                 x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-                top = await page.evaluate(
-                    "(o) => {"
-                    "  const el = document.querySelector('[data-uni=' + JSON.stringify(o.id) + ']');"
-                    "  const t = document.elementFromPoint(o.xy[0], o.xy[1]);"
-                    "  if (!t) return 'none';"
-                    "  let n = t;"
-                    "  while (n) { if (n === el) return 'ok'; n = n.parentElement; }"
-                    "  return 'blocked';"
-                    "}", {"xy": [x, y], "id": c["id"]})
-                if top == "ok":
-                    # 2) üstü açık: koordinat tıklaması güvenli
-                    try:
-                        await page.touchscreen.tap(x, y)
-                    except Exception:
-                        await page.mouse.click(x, y)
-                    return True
-                blocked = (top == "blocked")
-        except Exception:
-            pass
-        # V9.6.5: tam pointer/touch zincri — DOĞRUDAN butona, koordinat/örtüden etkilenmez
-        ptr_js = (
-            "(id) => {"
-            "  const el = document.querySelector('[data-uni=' + JSON.stringify(id) + ']');"
-            "  if (!el) return false;"
-            "  const r = el.getBoundingClientRect();"
-            "  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;"
-            "  const base = {bubbles: true, cancelable: true, composed: true, view: window,"
-            "                clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0, buttons: 1};"
-            "  const pt = Object.assign({pointerId: 1, pointerType: 'touch', isPrimary: true,"
-            "                            width: 8, height: 8, pressure: 0.5}, base);"
-            "  try { el.dispatchEvent(new PointerEvent('pointerover', pt)); } catch (e) {}"
-            "  try { el.dispatchEvent(new PointerEvent('pointerenter', pt)); } catch (e) {}"
-            "  el.dispatchEvent(new PointerEvent('pointerdown', pt));"
-            "  try { if (window.TouchEvent) el.dispatchEvent(new TouchEvent('touchstart',"
-            "      {bubbles: true, cancelable: true, composed: true})); } catch (e) {}"
-            "  try { el.dispatchEvent(new PointerEvent('pointermove', pt)); } catch (e) {}"
-            "  el.dispatchEvent(new PointerEvent('pointerup', pt));"
-            "  try { if (window.TouchEvent) el.dispatchEvent(new TouchEvent('touchend',"
-            "      {bubbles: true, cancelable: true, composed: true})); } catch (e) {}"
-            "  el.dispatchEvent(new MouseEvent('mouseup', base));"
-            "  el.dispatchEvent(new MouseEvent('click', base));"
-            "  return true;"
-            "}"
-        )
-        if blocked:
-            # 3) V9.6.6: butonun üstü KAPALI — önce ÖRTÜYÜ GÜVENLE KAPATMAYI dene
-            # (sadece güvenli kapat/skip/later/x/kapat tuşları; onay isteyen tuşlar ASLA)
-            try:
-                closed = await page.evaluate(
-                    "(o) => {"
-                    "  const el = document.querySelector('[data-uni=' + JSON.stringify(o.id) + ']');"
-                    "  if (!el) return false;"
-                    "  const t = document.elementFromPoint(o.xy[0], o.xy[1]);"
-                    "  if (!t) return false;"
-                    "  let root = t;"
-                    "  for (let i = 0; root.parentElement && i < 12; i++, root = root.parentElement) {"
-                    "    const st = getComputedStyle(root);"
-                    "    if (st.position === 'fixed' || st.position === 'absolute') break;"
-                    "  }"
-                    "  const SAFE = /^(?:close|skip|later|not now|maybe later|\u00d7|\u2715|\u2716|x|kapat|ge\u00e7|atla|kapat|gec|tamam|ok|got it|okay|devam|continue|next|anlad\u0131m|anladim|закрыть|пропустить|понятно|далее)$/i;"
-                    "  const cands = [];"
-                    "  for (const e of root.querySelectorAll('button, a, [role=button], [onclick], div, span, svg, img')) {"
-                    "    const r = e.getBoundingClientRect();"
-                    "    if (r.width < 4 || r.height < 4 || r.width > 200) continue;"
-                    "    const txt = ((e.innerText || '') + ' ' + (e.getAttribute('aria-label') || '')).replace(/\\s+/g, ' ').trim();"
-                    "    const cls = String(e.className && e.className.baseVal !== undefined ? e.className.baseVal : e.className || '');"
-                    "    if (SAFE.test(txt) || /(?:^|[\\s_-])(?:close|dismiss)(?:[\\s_-]|$)/i.test(cls)) {"
-                    "      cands.push(e);"
-                    "      if (cands.length >= 3) break;"
-                    "    }"
-                    "  }"
-                    "  if (!cands.length) return false;"
-                    "  const pick = cands[0];"
-                    "  pick.click();"
-                    "  return true;"
-                    "}", {"xy": [x, y], "id": c["id"]})
-                if closed:
-                    await page.wait_for_timeout(900)
-                    # örtü kapanınca buton artık açıksa NORMAL tıkla (en sağlıklısı)
-                    try:
-                        box2 = await loc.first.bounding_box()
-                        if box2 and box2["width"] > 0:
-                            x2, y2 = box2["x"] + box2["width"] / 2, box2["y"] + box2["height"] / 2
-                            top2 = await page.evaluate(
-                                "(o) => {"
-                                "  const el = document.querySelector('[data-uni=' + JSON.stringify(o.id) + ']');"
-                                "  const t = document.elementFromPoint(o.xy[0], o.xy[1]);"
-                                "  if (!t) return 'none';"
-                                "  let n = t;"
-                                "  while (n) { if (n === el) return 'ok'; n = n.parentElement; }"
-                                "  return 'blocked';"
-                                "}", {"xy": [x2, y2], "id": c["id"]})
-                            if top2 == "ok":
-                                try:
-                                    await page.touchscreen.tap(x2, y2)
-                                except Exception:
-                                    await page.mouse.click(x2, y2)
-                                return True
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            # 3b) örtü kapanmadıysa: zincri DOĞRUDAN butona gönder (örtüye rağmen çalışır)
-            try:
-                if await page.evaluate(ptr_js, c["id"]):
-                    return True
-            except Exception:
-                pass
-        else:
-            # 4) koordinat bilgisi yoksa zorla tıkla
-            try:
-                await loc.first.click(timeout=3000, no_wait_after=True, force=True)
-                return True
-            except Exception:
-                pass
-        # 5) tam pointer zincri her durumda denenir
-        try:
-            if await page.evaluate(ptr_js, c["id"]):
+                try:
+                    await page.touchscreen.tap(x, y)
+                except Exception:
+                    await page.mouse.click(x, y)
                 return True
         except Exception:
             pass
@@ -6547,8 +6385,7 @@ async def uni_click(page, c: dict) -> bool:
             pass
     try:
         ok = await page.evaluate(
-            "(id) => { const el = document.querySelector('[data-uni=' + JSON.stringify(id) + ']');"
-            " if (!el) return false; el.click(); return true; }",
+            "(id) => { const el = document.querySelector('[data-uni=\"' + id + '\"]'); if (!el) return false; el.click(); return true; }",
             c["id"])
         if ok:
             return True
@@ -6569,17 +6406,11 @@ def wiz_add_refs(blob: str, src: str):
         return 0
     blob = blob.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
     n = 0
-    # V9.6.3: paylaş linkleri: t.me/share/url?url=<kodlu ref> — eskiden parse_qs ÇİFT çözüyordu
-    # ve '+' karakterini boşluğa çeviriyordu (base64 kodlar bozuluyordu, link çıkamıyordu).
-    # Artık tek çözüm yapılır: unquote '+'ya dokunmaz, kod bozulmadan TAM okunur.
+    # paylaş linkleri: t.me/share/url?url=<kodlu ref>
     for m in re.finditer(r"(?:t\.me|telegram\.me)/share/url\?([^\s\"'<>]+)", blob, re.I):
-        qs_raw = m.group(1)
-        vm = re.search(r"(?:^|[?&])url=([^&]*)", qs_raw)
-        if vm:
-            n += wiz_add_refs(_wiz_unquote(vm.group(1)), src + "/paylaş")
-        tm = re.search(r"(?:^|[?&])text=([^&]*)", qs_raw)
-        if tm:
-            n += wiz_add_refs(_wiz_unquote(tm.group(1)), src + "/paylaş/metin")
+        qs = parse_qs(m.group(1))
+        for v in (qs.get("url") or []) + (qs.get("text") or []):
+            n += wiz_add_refs(_wiz_unquote(v), src + "/paylaş")
     for m in WIZ_REF_RE.finditer(blob):
         bot_n, short, kind, param = m.group(1), m.group(2) or "", m.group(3), m.group(4)
         low = bot_n.lower()
@@ -6591,14 +6422,9 @@ def wiz_add_refs(blob: str, src: str):
         if re.fullmatch(r"[a-z]+(?:_[a-z]+)+", param):
             continue  # botun kendi eylem parametresi
         link = f"https://t.me/{bot_n}" + (f"/{short}" if short else "") + f"?{kind}={param}"
-        cur = (WIZ_CUR.get("bot") or "").lower()
-        if low != cur:
-            # V9.6.2: BU botun linki degil (ör: uygulama icindeki partner/görev reklami).
-            # Baska bir botun linki ASLA 'senin referansin' olamaz: 0 puanla yalnizca
-            # bilgi amacli tutulur, esigi (3) gecemz.
-            WIZ_CUR["refs"].setdefault(link, (0, src + " (başka bot)"))
-            continue
-        score = 4  # V9.6.2: dogru botun linki taban 4 ile baslar
+        score = 1
+        if low == (WIZ_CUR.get("bot") or "").lower():
+            score += 3
         me = WIZ_ME.get("id") or 0
         if me and str(me) in param:
             score += 4
@@ -6614,18 +6440,9 @@ def wiz_add_refs(blob: str, src: str):
         k, v = m.group(1), m.group(2)
         if "t.me/" in v:
             n += wiz_add_refs(v, src + "/api")
-        elif 2 <= len(v) <= 200 and not v.startswith("eyJ") and (k, v) not in WIZ_CUR["codes"] and len(WIZ_CUR["codes"]) < 12:
+        elif 2 <= len(v) <= 64 and not v.startswith("eyJ") and (k, v) not in WIZ_CUR["codes"] and len(WIZ_CUR["codes"]) < 8:
             if not (WIZ_CUR.get("start") and v == WIZ_CUR["start"]):
                 WIZ_CUR["codes"].append((k, v))
-    # V9.6.1: alt (sub) referans — "referral": {"code": "x", "id": 123, "link": "..."} ic ice nesneleri
-    for m in WIZ_SUBOBJ_RE.finditer(blob):
-        for sm in WIZ_SUBFIELD_RE.finditer(m.group(1)):
-            k, v = sm.group(1), sm.group(2)
-            if "t.me/" in v:
-                n += wiz_add_refs(v, src + "/api")
-            elif 2 <= len(v) <= 200 and not v.startswith("eyJ") and (k, v) not in WIZ_CUR["codes"] and len(WIZ_CUR["codes"]) < 12:
-                if not (WIZ_CUR.get("start") and v == WIZ_CUR["start"]):
-                    WIZ_CUR["codes"].append(("sub_" + k, v))
     return n
 
 
@@ -6633,19 +6450,9 @@ WIZ_REF_MIN_SCORE = 3  # başka botların (partner görev) linkleri yanlışlık
 
 
 def wiz_best_ref():
-    """V9.6.2: yalnizca SU AN calisan botun kendi linki 'senin referansin' olabilir;
-    baska botlarin linkleri (partner görev/reklam) asla secilmez."""
     if not WIZ_CUR or not WIZ_CUR.get("refs"):
         return None, ""
-    cur = (WIZ_CUR.get("bot") or "").lower()
-    mine = {}
-    for l, v in WIZ_CUR["refs"].items():
-        m = re.search(r"t\.me/([^/?#]+)", l, re.I)
-        if m and m.group(1).lower() == cur:
-            mine[l] = v
-    if not mine:
-        return None, ""
-    link, (score, src) = max(mine.items(), key=lambda kv: kv[1][0])
+    link, (score, src) = max(WIZ_CUR["refs"].items(), key=lambda kv: kv[1][0])
     if score < WIZ_REF_MIN_SCORE:
         return None, ""
     return link, src
@@ -6714,11 +6521,7 @@ async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
             if time.time() > deadline:
                 break
             if await uni_click(page, c):
-                # V9.6.3: kod çoğu uygulamada buton tıklamasından SONRA API'den geliyor;
-                # iki kez toplanıyor (geç gelen pano yazmaları da yakalanır).
-                await page.wait_for_timeout(1500)
-                await wiz_collect_dom(page, "pano (kopyala)")
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(1200)
                 await wiz_collect_dom(page, "pano (kopyala)")
         link, _ = wiz_best_ref()
         if link:
@@ -6730,11 +6533,7 @@ async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
             if time.time() > deadline:
                 break
             if await uni_click(page, c):
-                # V9.6.3: 'Arkadaş davet et' tıklaması önce API'den kodu çeker, sonra paylaşır;
-                # iki kez toplanıyor (geç gelen paylaşım olayı da yakalanır).
-                await page.wait_for_timeout(2000)
-                await wiz_collect_dom(page, "davet butonu (paylaşılmadı)")
-                await page.wait_for_timeout(1200)
+                await page.wait_for_timeout(1500)
                 await wiz_collect_dom(page, "davet butonu (paylaşılmadı)")
         link, _ = wiz_best_ref()
         if link:
@@ -6742,7 +6541,7 @@ async def wiz_ref_hunt(page, name: str, notes: list, state: dict):
     if link:
         notes.append(f"Referans linki bulundu ({WIZ_CUR['refs'][link][1]}).")
     elif WIZ_CUR["codes"]:
-        notes.append("Referans kodu benzeri alan bulundu: " + ", ".join(f"{k}={v}" for k, v in WIZ_CUR["codes"][:5]))
+        notes.append("Referans kodu benzeri alan bulundu: " + ", ".join(f"{k}={v}" for k, v in WIZ_CUR["codes"][:3]))
 
 
 # ------------------------------------------------- yapay zeka ile görev ----
@@ -6924,15 +6723,11 @@ async def wiz_ai_explore(page, name: str, notes: list, state: dict):
 # Unity/Phaser gibi oyunlarda butonlar HTML değil, resim içinde. Bu modda ekran görüntüsü
 # Groq'un görüntü okuyabilen modeline gönderilir; model nereye dokunulacağını söyler.
 
-# V9.6.4: JS yığın limiti 256→128 MB (512 MB'lık sunucuda 256, tarayıcıyı doldurup
-# bekçinin devreye girmesinden ÖNCE belleği bitiriyordu; 128 ile sayfa içi bellek
-# erken durur, sunucu güvende kalır). WIZ_JS_HEAP_MB ile istenirse artırılabilir.
 WIZ_CHROME_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--mute-audio",
                    "--no-first-run", "--renderer-process-limit=1", "--disable-background-networking",
                    "--disable-site-isolation-trials", "--disable-features=site-per-process,IsolateOrigins,Translate",
                    "--disable-software-rasterizer", "--disable-breakpad", "--no-zygote",
-                   "--disable-remote-fonts",
-                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "128") or "128")]
+                   "--js-flags=--max-old-space-size=" + (os.getenv("WIZ_JS_HEAP_MB", "256") or "256")]
 if os.getenv("WIZ_CHROME_SINGLE", "").strip() in ("1", "true", "evet"):
     WIZ_CHROME_ARGS.append("--single-process")   # ~30 MB daha az bellek, biraz daha kararsız
 
@@ -7086,12 +6881,7 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
     retry_needed = False
     async with async_playwright() as p:
         state["stage"] = "chromium_baslatma"
-        # V9.6.4: hafif modda tarayıcı DAHA CİMRİ açılır: tek süreç (−30 MB) + resim motoru
-        # tamamen kapalı (CSS'le yüklenen resimler de engellenir).
-        lite_args = list(WIZ_CHROME_ARGS)
-        if WIZ_LITE.get("on"):
-            lite_args += ["--single-process", "--blink-settings=imagesEnabled=false"]
-        browser = await p.chromium.launch(headless=True, timeout=60000, args=lite_args)
+        browser = await p.chromium.launch(headless=True, timeout=60000, args=WIZ_CHROME_ARGS)
         context = None
         try:
             context = await uni_new_context(browser, name)
@@ -7111,12 +6901,8 @@ async def _wiz_browser_once(name, url, state, _retry: bool = False):
                             wiz_add_refs(u, "yönlendirme")
                         await route.abort()
                         return
-                    # V9.6.4: hafif mod VEYA bellek %65'i geçtiyse (otomatik sıkı mod)
-                    # resim/medya/font ve ağır oyun dosyaları yüklenmez — tarayıcı
-                    # dolmadan önce kısılır, bot çökmez.
-                    tight = WIZ_LITE.get("on") or wiz_mem_used_mb() > wiz_mem_limit_mb() * 0.65
-                    if tight and (req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
-                        await route.abort()
+                    if WIZ_LITE.get("on") and (req.resource_type in ("image", "media", "font") or WIZ_HEAVY_RE.search(u)):
+                        await route.abort()   # hafif mod: belleği dolduran dosyalar yüklenmez
                         return
                     if host not in cache:
                         cache[host] = await v8_public(u)
